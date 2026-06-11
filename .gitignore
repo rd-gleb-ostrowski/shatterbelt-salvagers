@@ -1,0 +1,11 @@
+*
+!AGENTS.md
+!.gitignore
+!README.md
+!.github/
+!.github/**
+!.vscode
+!.vscode/**
+!.devcontainer
+!.devcontainer/**
+!REQUEST.md
