@@ -66,11 +66,13 @@ RUN ARCH=$(dpkg --print-architecture) && \
   sudo dpkg -i "git-delta_${GIT_DELTA_VERSION}_${ARCH}.deb" && \
   rm "git-delta_${GIT_DELTA_VERSION}_${ARCH}.deb"
 
-  # Install Copilot CLI
 USER node
-RUN npm install -g @github/copilot@${COPILOT_VERSION}
-USER root
-
+RUN sh -c "curl -LsSf https://astral.sh/uv/install.sh | sh"
+RUN sh -c "echo 'eval \"$(uvx --generate-shell-completion zsh)\"' >> ~/.zshrc"
+RUN sh -c "echo 'eval \"$(uv generate-shell-completion zsh)\"' >> ~/.zshrc"
+# Install Copilot CLI
+# RUN npm install -g @github/copilot@${COPILOT_VERSION}
+# USER root
 # # Copy and set up firewall script
 # COPY init-firewall.sh /usr/local/bin/
 # COPY allowed-domains.txt /tmp/
@@ -78,3 +80,6 @@ USER root
 #   echo "node ALL=(root) NOPASSWD: /usr/local/bin/init-firewall.sh" > /etc/sudoers.d/node-firewall && \
 #   chmod 0440 /etc/sudoers.d/node-firewall
 # USER node
+
+# TODO
+# serena + config mount

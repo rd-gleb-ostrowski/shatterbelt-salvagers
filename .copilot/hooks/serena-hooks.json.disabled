@@ -1,0 +1,22 @@
+{
+    "hooks": {
+        "PreToolUse": [
+            {
+                "type": "command",
+                "command": "uvx --from git+https://github.com/oraios/serena serena-hooks remind --client=vscode"
+            }
+        ],
+        "SessionStart": [
+            {
+                "type": "command",
+                "command": "uvx --from git+https://github.com/oraios/serena serena-hooks activate --client=vscode"
+            }
+        ],
+        "Stop": [
+            {
+                "type": "command",
+                "command": "uvx --from git+https://github.com/oraios/serena serena-hooks cleanup --client=vscode"
+            }
+        ]
+    }
+}

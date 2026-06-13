@@ -41,14 +41,30 @@
   "mounts": [
     "source=agent-bashhistory-${devcontainerId},target=/commandhistory,type=volume",
     "source=copilot-config-${devcontainerId},target=/home/node/.copilot,type=volume",
-    "source=${localEnv:HOME}/.config/gh,target=/home/node/.config/gh,type=bind"
+    "source=${localEnv:HOME}/.config/gh,target=/home/node/.config/gh,type=bind",
+    "source=${localEnv:SSH_AUTH_SOCK},target=/ssh-agent,type=bind",
+    "source=${localEnv:HOME}/.ssh/id_ed25519.pub,target=/home/vscode/.ssh/id_ed25519.pub,type=bind"
   ],
+  "remoteEnv": {
+    "SSH_AUTH_SOCK": "/ssh-agent"
+  },
   "containerEnv": {
     "NODE_OPTIONS": "--max-old-space-size=4096",
     "POWERLEVEL9K_DISABLE_GITSTATUS": "true"
   },
   "workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind,consistency=delegated",
-  "workspaceFolder": "/workspace"
+  "workspaceFolder": "/workspace",
+  "features": {
+    "ghcr.io/devcontainers/features/copilot-cli:1": {
+      "version": "latest"
+    },
+    "ghcr.io/devcontainers/features/rust:1": {
+      "version": "latest",
+      "profile": "default",
+      "targets": "x86_64-unknown-linux-gnu",
+      "components": "rust-analyzer,rust-src,rustfmt,clippy"
+    }
+  }
   // "postStartCommand": "sudo /usr/local/bin/init-firewall.sh",
   // "waitFor": "postStartCommand"
 }

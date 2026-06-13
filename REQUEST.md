@@ -7,8 +7,8 @@ or have only basic knowledge, though.
 For those specifically, I want to provide an example project to work on and
 sharpen their skills.
 The general agenda should also support working on this project and
-give opportunity for short 'what went good, what went bad' talks after each session,
-similar to how a regular code retreat is structured.
+give opportunity for short 'what went good, what went bad' talks after each
+coding session, similar to how a regular code retreat is structured.
 As beginners have no idea, it would also be important to not overwhelm them with
 infomation; maybe start just by telling them to have a go with the prompt,
 before introducing the plan mode 1 hour later, and then skills & mcp 1 hour after that
