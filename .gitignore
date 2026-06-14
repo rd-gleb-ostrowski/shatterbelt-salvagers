@@ -15,3 +15,9 @@
 !.scratch/**
 !.agents/
 !.agents/**
+!CONTEXT-MAP.md
+!CONTEXT.md
+!src/
+!src/**
+!retreat/
+!retreat/**
