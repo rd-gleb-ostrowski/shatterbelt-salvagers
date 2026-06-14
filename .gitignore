@@ -9,3 +9,5 @@
 !.devcontainer
 !.devcontainer/**
 !REQUEST.md
+!.agents/
+!.agents/**
