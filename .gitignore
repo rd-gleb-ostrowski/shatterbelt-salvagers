@@ -9,5 +9,9 @@
 !.devcontainer
 !.devcontainer/**
 !REQUEST.md
+!docs/
+!docs/**
+!.scratch/
+!.scratch/**
 !.agents/
 !.agents/**
