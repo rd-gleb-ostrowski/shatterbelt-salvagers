@@ -78,6 +78,21 @@ One discrete step of a match. Each tick the Arena sends every bot the current st
 collects one action back.
 _Avoid_: turn, frame, step
 
+**Observation**:
+The per-tick JSON snapshot of the Drift the Arena sends a bot (its own ship in full, plus the
+world it can see). The same shape for WS and WASM bots. See `PROTOCOL.md`.
+_Avoid_: state, world, snapshot
+
+**Intent** (also **Action**):
+The per-tick command a bot returns — rate-first (turn, thrust, fire, sigil), not absolute state.
+Omitted fields keep their previous value.
+_Avoid_: command, move, order
+
+**Viewer**:
+A read-only client that receives the full "god-mode" stream of a match for the projector and
+for recording replays. Bots never receive it.
+_Avoid_: observer, spectator, renderer
+
 **WS Bot**:
 A bot that runs as a process on a participant's machine and connects _outbound_ over
 WebSocket to the Arena. The preferred connection: the bot initiates, so it works from behind
