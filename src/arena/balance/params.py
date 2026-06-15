@@ -72,5 +72,8 @@ class Params:
     lance_speed: float = 40.0
     lance_damage: float = 50.0
 
+    # --- harness toggle ---
+    enable_sigils: bool = True
+
 
 DEFAULT = Params()

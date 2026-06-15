@@ -111,10 +111,13 @@ def norm_angle(a):
     return a
 
 
+SIGILS = ["Afterburner", "Bulwark", "Singularity", "AetherMine", "ArcLance"]
+
+
 class Ship:
     __slots__ = ("id", "policy", "p", "x", "y", "vx", "vy", "heading", "hull", "shield",
                  "aether", "cd", "unhit", "alive", "respawn", "carry", "score",
-                 "kills", "deaths", "ax", "ay")
+                 "kills", "deaths", "ax", "ay", "sigil", "ab", "immune")
 
     def __init__(self, id, policy, ax, ay, p):
         self.id, self.policy, self.p = id, policy, p
@@ -135,13 +138,18 @@ class Ship:
         self.aether = p.aether_max
         self.cd = p.cannon_start_hot
         self.unhit = p.shield_regen_delay
+        self.sigil = None      # held sigil name or None
+        self.ab = 0            # afterburner ticks remaining
+        self.immune = 0        # bulwark immunity ticks remaining
 
 
 class Proj:
-    __slots__ = ("x", "y", "vx", "vy", "owner", "dist")
+    __slots__ = ("x", "y", "vx", "vy", "owner", "dist", "kind", "hitset")
 
-    def __init__(self, x, y, vx, vy, owner):
+    def __init__(self, x, y, vx, vy, owner, kind="cannon"):
         self.x, self.y, self.vx, self.vy, self.owner, self.dist = x, y, vx, vy, owner, 0.0
+        self.kind = kind          # "cannon" or "lance"
+        self.hitset = set()       # ship ids a lance has already pierced
 
 
 class World:
@@ -159,6 +167,10 @@ class World:
         self.projs = []
         self.relics = []
         self.asteroids = []
+        self.mines = []           # [x, y, owner_id, arm_timer]
+        self.singularities = []   # [x, y, ticks_left]
+        self.sigil_uses = {s: 0 for s in SIGILS}
+        self.sigil_kills = {s: 0 for s in SIGILS}
         for _ in range(p.n_asteroids):
             self.asteroids.append([
                 self.rng.uniform(0, p.arena_w), self.rng.uniform(0, p.arena_h),
@@ -208,28 +220,85 @@ class World:
                 fire = True
         return turn, thrust, fire
 
-    def damage(self, s: Ship, dmg, attacker=None, tick=0):
-        if dmg <= 0 or not s.alive:
+    def damage(self, s: Ship, dmg, attacker=None, tick=0, bypass=False, sigil=None):
+        if dmg <= 0 or not s.alive or s.immune > 0:
             return
         s.unhit = 0
-        if s.shield >= dmg:
-            s.shield -= dmg
-            return
-        dmg -= s.shield
-        s.shield = 0.0
+        if not bypass:
+            if s.shield >= dmg:
+                s.shield -= dmg
+                return
+            dmg -= s.shield
+            s.shield = 0.0
         s.hull -= dmg
         if s.hull <= 0:
             s.alive = False
             s.respawn = self.p.respawn_delay
             s.deaths += 1
+            s.sigil = None
             for _ in range(s.carry):
                 self.relics.append([s.x + self.rng.uniform(-30, 30), s.y + self.rng.uniform(-30, 30)])
             s.carry = 0
-            if attacker is not None:
+            if attacker is not None and attacker is not s:
                 attacker.kills += 1
                 attacker.score += self.p.kill_bounty
+                if sigil is not None:
+                    self.sigil_kills[sigil] += 1
                 if self.first_kill is None:
                     self.first_kill = tick
+
+    def decide_sigil(self, s: Ship):
+        """Return (use: bool, target: (x,y)|None) for the held sigil."""
+        p = self.p
+        if not p.enable_sigils or s.sigil is None:
+            return False, None
+        enemies = [o for o in self.ships if o is not s and o.alive]
+        ne = min(enemies, key=lambda o: (o.x - s.x) ** 2 + (o.y - s.y) ** 2, default=None)
+        d = math.hypot(ne.x - s.x, ne.y - s.y) if ne else 1e9
+        name = s.sigil
+        if name == "Afterburner":
+            if (s.carry > 0 and d < 300) or (s.policy == "aggressor" and d > 500):
+                return True, None
+        elif name == "Bulwark":
+            if s.shield <= 0 and d < 450:
+                return True, None
+        elif name == "ArcLance":
+            if ne and d < p.proj_range:
+                err = abs(norm_angle(math.atan2(ne.y - s.y, ne.x - s.x) - s.heading))
+                if err < 0.2:
+                    return True, (ne.x, ne.y)
+        elif name == "AetherMine":
+            if s.carry > 0 and d < 200:
+                return True, None
+        elif name == "Singularity":
+            near = [r for r in self.relics if (r[0] - s.x) ** 2 + (r[1] - s.y) ** 2 < 250 ** 2]
+            if len(near) >= 3:
+                cx = sum(r[0] for r in near) / len(near)
+                cy = sum(r[1] for r in near) / len(near)
+                return True, (cx, cy)
+            if ne and d < 250:
+                return True, (ne.x, ne.y)
+        return False, None
+
+    def apply_sigil(self, s: Ship, target, tick):
+        p = self.p
+        name = s.sigil
+        self.sigil_uses[name] += 1
+        s.sigil = None
+        if name == "Afterburner":
+            s.ab = p.afterburner_dur
+        elif name == "Bulwark":
+            s.shield = p.shield_max
+            s.immune = p.bulwark_immunity
+        elif name == "Singularity":
+            tx, ty = target if target else (s.x, s.y)
+            self.singularities.append([tx, ty, p.singularity_dur])
+        elif name == "AetherMine":
+            self.mines.append([s.x, s.y, s.id, p.mine_arm])
+        elif name == "ArcLance":
+            ang = math.atan2(target[1] - s.y, target[0] - s.x) if target else s.heading
+            self.projs.append(Proj(s.x, s.y, math.cos(ang) * p.lance_speed,
+                                   math.sin(ang) * p.lance_speed, s.id, kind="lance"))
 
     def step(self, tick):
         p = self.p
@@ -250,20 +319,32 @@ class World:
                     s.unhit = p.shield_regen_delay
                 continue
             turn, thrust, fire = self.decide(s)
+            use_sig, sig_target = self.decide_sigil(s)
+            if use_sig:
+                self.apply_sigil(s, sig_target, tick)
+            if s.immune > 0:
+                s.immune -= 1
+            ab_active = s.ab > 0
+            if ab_active:
+                s.ab -= 1
             s.heading = (s.heading + turn * p.max_turn) % TAU
-            acc = (thrust * p.thrust_accel) if thrust >= 0 else (thrust * p.reverse_accel)
+            base_acc = p.thrust_accel if thrust >= 0 else p.reverse_accel
+            mult = p.afterburner_thrust_mult if ab_active else 1.0
+            acc = thrust * base_acc * mult
             s.vx += math.cos(s.heading) * acc
             s.vy += math.sin(s.heading) * acc
             s.vx *= p.lin_damping
             s.vy *= p.lin_damping
+            cap = p.max_speed * (p.afterburner_speed_mult if ab_active else 1.0)
             sp = math.hypot(s.vx, s.vy)
-            if sp > p.max_speed:
-                s.vx *= p.max_speed / sp
-                s.vy *= p.max_speed / sp
+            if sp > cap:
+                s.vx *= cap / sp
+                s.vy *= cap / sp
             s.x += s.vx
             s.y += s.vy
-            # aether
-            s.aether = clampf(s.aether + p.aether_regen - abs(thrust) * p.thrust_cost_full, 0, p.aether_max)
+            # aether (afterburner thrust is free)
+            cost = 0.0 if ab_active else abs(thrust) * p.thrust_cost_full
+            s.aether = clampf(s.aether + p.aether_regen - cost, 0, p.aether_max)
             # shield regen
             s.unhit += 1
             if s.unhit >= p.shield_regen_delay:
@@ -301,6 +382,8 @@ class World:
                 for r in list(self.relics):
                     if (r[0] - s.x) ** 2 + (r[1] - s.y) ** 2 < (p.ship_radius + 12) ** 2:
                         self.relics.remove(r); s.carry += 1
+                        if p.enable_sigils and s.sigil is None:
+                            s.sigil = self.rng.choice(SIGILS)
                         if s.carry >= p.carry_cap:
                             break
             if s.carry > 0 and (s.x - s.ax) ** 2 + (s.y - s.ay) ** 2 < 60 ** 2:
@@ -322,25 +405,75 @@ class World:
                     a.vx -= closing * nx; a.vy -= closing * ny
                     b.vx += closing * nx; b.vy += closing * ny
 
-        # projectiles
+        # singularities: pull ships and relics toward the well
+        alive_sings = []
+        for sg in self.singularities:
+            sg[2] -= 1
+            if sg[2] <= 0:
+                continue
+            cx, cy = sg[0], sg[1]
+            for s in self.ships:
+                if not s.alive:
+                    continue
+                dx, dy = cx - s.x, cy - s.y
+                d = math.hypot(dx, dy)
+                if 1 < d < p.singularity_radius:
+                    f = p.singularity_pull * (1 - d / p.singularity_radius)
+                    s.vx += dx / d * f; s.vy += dy / d * f
+            for r in self.relics:
+                dx, dy = cx - r[0], cy - r[1]
+                d = math.hypot(dx, dy)
+                if 1 < d < p.singularity_radius:
+                    stepd = min(p.singularity_pull * 3, d)
+                    r[0] += dx / d * stepd; r[1] += dy / d * stepd
+            alive_sings.append(sg)
+        self.singularities = alive_sings
+
+        # mines: arm, then detonate on the nearest enemy in range
+        alive_mines = []
+        for m in self.mines:
+            m[3] -= 1
+            det = False
+            if m[3] <= 0:
+                for s in self.ships:
+                    if s.alive and s.id != m[2] and (s.x - m[0]) ** 2 + (s.y - m[1]) ** 2 < p.mine_radius ** 2:
+                        owner = next((o for o in self.ships if o.id == m[2]), None)
+                        self.damage(s, p.mine_damage, owner, tick, sigil="AetherMine")
+                        det = True
+                        break
+            if not det:
+                alive_mines.append(m)
+        self.mines = alive_mines
+
+        # projectiles (cannon = single hit; lance = piercing, shield-bypassing)
         alive_projs = []
         for pr in self.projs:
-            pr.x += pr.vx; pr.y += pr.vy; pr.dist += p.proj_speed
+            pr.x += pr.vx; pr.y += pr.vy; pr.dist += math.hypot(pr.vx, pr.vy)
             if pr.dist > p.proj_range or not (0 <= pr.x <= p.arena_w and 0 <= pr.y <= p.arena_h):
                 continue
-            hit = False
-            for s in self.ships:
-                if s.alive and s.id != pr.owner and (s.x - pr.x) ** 2 + (s.y - pr.y) ** 2 < p.ship_radius ** 2:
-                    owner = next((o for o in self.ships if o.id == pr.owner), None)
-                    self.damage(s, p.cannon_damage, owner, tick)
-                    hit = True
-                    break
-            if not hit:
-                for a in self.asteroids:
-                    if (a[0] - pr.x) ** 2 + (a[1] - pr.y) ** 2 < a[2] ** 2:
-                        hit = True; break
-            if not hit:
-                alive_projs.append(pr)
+            owner = next((o for o in self.ships if o.id == pr.owner), None)
+            if pr.kind == "lance":
+                for s in self.ships:
+                    if s.alive and s.id != pr.owner and s.id not in pr.hitset and \
+                       (s.x - pr.x) ** 2 + (s.y - pr.y) ** 2 < p.ship_radius ** 2:
+                        pr.hitset.add(s.id)
+                        self.damage(s, p.lance_damage, owner, tick, bypass=True, sigil="ArcLance")
+                blocked = any((a[0] - pr.x) ** 2 + (a[1] - pr.y) ** 2 < a[2] ** 2 for a in self.asteroids)
+                if not blocked:
+                    alive_projs.append(pr)
+            else:
+                hit = False
+                for s in self.ships:
+                    if s.alive and s.id != pr.owner and (s.x - pr.x) ** 2 + (s.y - pr.y) ** 2 < p.ship_radius ** 2:
+                        self.damage(s, p.cannon_damage, owner, tick)
+                        hit = True
+                        break
+                if not hit:
+                    for a in self.asteroids:
+                        if (a[0] - pr.x) ** 2 + (a[1] - pr.y) ** 2 < a[2] ** 2:
+                            hit = True; break
+                if not hit:
+                    alive_projs.append(pr)
         self.projs = alive_projs
 
         if tick % p.relic_spawn_period == 0:
@@ -358,7 +491,7 @@ def run_match(p: Params, policies, seed):
     return dict(
         scores=scores, leader=leader, margin=leader - second,
         kills=sum(s.kills for s in ships), deaths=sum(s.deaths for s in ships),
-        first_kill=w.first_kill,
+        first_kill=w.first_kill, sigil_uses=w.sigil_uses, sigil_kills=w.sigil_kills,
     )
 
 
@@ -370,12 +503,15 @@ def run_batch(p: Params, policies, n=60, seed0=0):
     fk = [r["first_kill"] for r in rows if r["first_kill"] is not None]
     decisive = sum(1 for r in rows if r["leader"] > 0 and r["margin"] >= max(1, 0.2 * r["leader"]))
     shutout = sum(1 for r in rows if r["leader"] == 0)
+    uses = {s: sum(r["sigil_uses"][s] for r in rows) / n for s in SIGILS}
+    skills = {s: sum(r["sigil_kills"][s] for r in rows) / n for s in SIGILS}
     return dict(
         n=n, leader_mean=statistics.mean(leaders), leader_max=max(leaders),
         margin_mean=statistics.mean(margins), kills_mean=statistics.mean(kills),
         first_kill_mean=(statistics.mean(fk) if fk else None),
         no_kill_matches=n - len(fk),
         decisive_pct=100 * decisive / n, shutout_pct=100 * shutout / n,
+        sigil_uses=uses, sigil_kills=skills,
     )
 
 
@@ -443,6 +579,19 @@ def report(p: Params):
               f"no-kill matches {b['no_kill_matches']}/{b['n']}"
               + flag(b["shutout_pct"] > 25, "many 0-score matches — relics too sparse / banking too hard")
               + flag(b["kills_mean"] < 1, "almost no kills — combat irrelevant"))
+
+    print("\n[SIGILS IN MATCHES]  (4-FFA: 3 salvager + 1 aggressor, 50 matches)")
+    pol = ["salvager", "salvager", "salvager", "aggressor"]
+    on = run_batch(p, pol, n=50)
+    off = run_batch(replace(p, enable_sigils=False), pol, n=50)
+    print(f"  sigils OFF:  leader ~{off['leader_mean']:.1f}, kills/match ~{off['kills_mean']:.1f}")
+    print(f"  sigils ON :  leader ~{on['leader_mean']:.1f}, kills/match ~{on['kills_mean']:.1f}")
+    print("  per-sigil   uses/match  &  kills/match (Mine + Lance deal direct damage):")
+    for sg in SIGILS:
+        u, kk = on["sigil_uses"][sg], on["sigil_kills"][sg]
+        kp = (f", {kk:.2f} kills" if sg in ("AetherMine", "ArcLance") else "")
+        print(f"     {sg:<12} {u:.2f} uses{kp}"
+              + flag(u < 0.05, "almost never used by the heuristic bots"))
     print("\n" + "=" * 70)
 
 

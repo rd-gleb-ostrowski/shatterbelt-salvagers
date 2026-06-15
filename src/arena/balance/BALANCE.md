@@ -42,19 +42,23 @@ document explains the design rules and what the harness tells us.
   fire, so ships are killable; ~96 aether per kill.
 - **Sigils (as a fraction of a 160-EHP target):** Mine ~38% EHP, Arc Lance 50% of hull
   (shield-bypassing), Bulwark restores ~138% of base EHP + immunity, Afterburner 12 → 18 speed.
-- **Match sims (heuristic bots, no sigils):** leaders bank ~20–30 over 2 min, matches are mostly
+- **Match sims (heuristic bots):** leaders bank ~20–30 over 2 min, matches are mostly
   decisive with **no shutouts**; with a kill bounty, an aggressor policy scores via denial and
-  FFA sees ~2.7 kills/match. Two pure-salvager bots barely fight (expected — neither tries to).
+  FFA sees ~3–4 kills/match. Two pure-salvager bots barely fight (expected — neither tries to).
+- **Sigils in matches (simulated):** enabling Sigils raises FFA kills/match by ~50% (≈2.8 → 4.2)
+  and nudges leader score up. All five see use; **Arc Lance** is the top direct-damage sigil
+  (~1.1 kills/match — shield-bypassing, piercing), **Aether Mine** is situational (~0.4). No
+  sigil is dead weight.
 
 ## Caveats & open questions (need real playtests)
 
-- The match sim is **approximate**: simplified point physics, no Sigils, and deliberately simple
-  bots. Use it for *magnitudes* (drift, TTK, aether tension, sigil ratios), not for fine
-  emergent balance.
+- The match sim is **approximate**: simplified point physics and deliberately simple bots that
+  use Sigils **greedily** (whenever a trigger condition holds). Use it for *magnitudes* (drift,
+  TTK, aether tension, sigil impact/usage), not for fine emergent balance or optimal play.
 - How much combat actually happens depends heavily on **bot intelligence** — smart agent bots
-  will fight far more than the heuristics here.
-- Still unvalidated by simulation: Sigil interactions, asteroid-cover tactics, the carry-cap vs
-  banking-trip risk/reward, and multi-ship (5–6) FFA crowding.
+  will fight more (and use Sigils far more strategically) than the heuristics here.
+- Still unvalidated by simulation: multi-Sigil combos and counters, asteroid-cover tactics, the
+  carry-cap vs banking-trip risk/reward, and multi-ship (5–6) FFA crowding.
 
 ## Running the harness
 
