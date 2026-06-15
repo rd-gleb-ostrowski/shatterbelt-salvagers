@@ -178,7 +178,7 @@ class World:
                 self.rng.uniform(-1, 1) * p.asteroid_drift,
                 self.rng.uniform(-1, 1) * p.asteroid_drift,
             ])
-        for _ in range(6):
+        for _ in range(max(2, p.relic_field_cap // 2)):
             self.spawn_relic()
         self.first_kill = None
 
@@ -480,7 +480,20 @@ class World:
             self.spawn_relic()
 
 
+def scale_for(p: Params, n: int) -> Params:
+    """Scale the Drift and entity counts to keep a constant density for n ships."""
+    f = math.sqrt(n / 4)
+    return replace(
+        p,
+        arena_w=p.arena_w * f, arena_h=p.arena_h * f,
+        n_asteroids=max(1, round(p.n_asteroids * n / 4)),
+        relic_field_cap=max(2, round(p.relic_field_cap * n / 4)),
+        relic_spawn_period=max(15, round(p.relic_spawn_period * 4 / n)),
+    )
+
+
 def run_match(p: Params, policies, seed):
+    p = scale_for(p, len(policies))
     w = World(p, policies, seed)
     for t in range(1, p.max_ticks + 1):
         w.step(t)
@@ -563,11 +576,12 @@ def report(p: Params):
     print(f"  Bulwark       restores to {s['bulwark_ehp_swing']*100:.0f}% of base EHP + immunity")
     print(f"  Afterburner   speed {p.max_speed:.0f} -> {s['afterburner_speed']:.0f}")
 
-    print("\n[MATCH SIMS]  (heuristic bots, no sigils)")
+    print("\n[MATCH SIMS]  (heuristic bots; Drift scales with field size)")
     for label, pol in [
-        ("1v1  salvager vs salvager", ["salvager", "salvager"]),
-        ("1v1  salvager vs aggressor", ["salvager", "aggressor"]),
+        ("2-FFA  salvager vs aggressor", ["salvager", "aggressor"]),
         ("4-FFA  3 salvager + 1 aggressor", ["salvager", "salvager", "salvager", "aggressor"]),
+        ("8-FFA  6 salvager + 2 aggressor (all-bots)",
+         ["salvager"] * 6 + ["aggressor"] * 2),
     ]:
         b = run_batch(p, pol, n=40)
         fk = f"{b['first_kill_mean']/p.tick_rate:.1f}s" if b["first_kill_mean"] else "—"
@@ -580,8 +594,8 @@ def report(p: Params):
               + flag(b["shutout_pct"] > 25, "many 0-score matches — relics too sparse / banking too hard")
               + flag(b["kills_mean"] < 1, "almost no kills — combat irrelevant"))
 
-    print("\n[SIGILS IN MATCHES]  (4-FFA: 3 salvager + 1 aggressor, 50 matches)")
-    pol = ["salvager", "salvager", "salvager", "aggressor"]
+    print("\n[SIGILS IN MATCHES]  (8-FFA all-bots: 6 salvager + 2 aggressor, 50 matches)")
+    pol = ["salvager"] * 6 + ["aggressor"] * 2
     on = run_batch(p, pol, n=50)
     off = run_batch(replace(p, enable_sigils=False), pol, n=50)
     print(f"  sigils OFF:  leader ~{off['leader_mean']:.1f}, kills/match ~{off['kills_mean']:.1f}")

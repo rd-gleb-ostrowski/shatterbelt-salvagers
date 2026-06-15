@@ -93,6 +93,11 @@ A read-only client that receives the full "god-mode" stream of a match for the p
 for recording replays. Bots never receive it.
 _Avoid_: observer, spectator, renderer
 
+**Ladder**:
+The continuously-updated TrueSkill ranking of all bots, fed by headless-fast matches running in
+the background. There is no scheduled tournament — just the ladder and on-demand live matches.
+_Avoid_: leaderboard, tournament, ranking
+
 **WS Bot**:
 A bot that runs as a process on a participant's machine and connects _outbound_ over
 WebSocket to the Arena. The preferred connection: the bot initiates, so it works from behind

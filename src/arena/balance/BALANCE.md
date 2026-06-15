@@ -7,6 +7,11 @@ document explains the design rules and what the harness tells us.
 
 ## Locked design rules
 
+- **Matches:** all bots play **one free-for-all** per match (≤6–8 teams), **2 minutes** (3600
+  ticks). The Drift **scales with the field** (`√(N/4)` per dimension off 2000×1200, area ∝ N;
+  asteroids/relics scale too) to keep density constant. Run three ways — **live** (projector),
+  **headless-fast** (ladder), **replay**; WS bots are live-only, WASM bots enable fast headless
+  runs. Ranking is a continuous **TrueSkill** ladder (see ADR-0005).
 - **Scoring:** economic + respawn. Score = **relic value banked** at your Anchor, **plus a kill
   bounty** per kill (no extra relic drop — a destroyed ship only drops what it was carrying).
   Most score at `maxTicks` wins. (ADR-style decision; supersedes the deck's old "last fleet
@@ -42,9 +47,10 @@ document explains the design rules and what the harness tells us.
   fire, so ships are killable; ~96 aether per kill.
 - **Sigils (as a fraction of a 160-EHP target):** Mine ~38% EHP, Arc Lance 50% of hull
   (shield-bypassing), Bulwark restores ~138% of base EHP + immunity, Afterburner 12 → 18 speed.
-- **Match sims (heuristic bots):** leaders bank ~20–30 over 2 min, matches are mostly
-  decisive with **no shutouts**; with a kill bounty, an aggressor policy scores via denial and
-  FFA sees ~3–4 kills/match. Two pure-salvager bots barely fight (expected — neither tries to).
+- **Match sims (heuristic bots, Drift scales with field):** leaders bank ~22–26 over 2 min
+  across 2/4/8-ship fields with **no shutouts** at any size; combat scales naturally with the
+  field (~1.8 → 4.2 → 10 kills/match) thanks to constant-density scaling. A kill bounty makes an
+  aggressor's denial pay off.
 - **Sigils in matches (simulated):** enabling Sigils raises FFA kills/match by ~50% (≈2.8 → 4.2)
   and nudges leader score up. All five see use; **Arc Lance** is the top direct-damage sigil
   (~1.1 kills/match — shield-bypassing, piercing), **Aether Mine** is situational (~0.4). No
