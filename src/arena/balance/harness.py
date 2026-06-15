@@ -317,6 +317,7 @@ class World:
                     s.aether = p.aether_max
                     s.cd = p.cannon_start_hot
                     s.unhit = p.shield_regen_delay
+                    s.immune = p.respawn_invuln      # spawn protection (anti-gank)
                 continue
             turn, thrust, fire = self.decide(s)
             use_sig, sig_target = self.decide_sigil(s)

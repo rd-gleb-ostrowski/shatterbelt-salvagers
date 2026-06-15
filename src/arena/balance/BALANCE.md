@@ -33,7 +33,7 @@ document explains the design rules and what the harness tells us.
 | Combat | cannon 20 dmg, proj 25/tick (~1500 range), cooldown 15 (starts hot), shield 60 (+2/tick after 30t unhit), hull 100 |
 | Collisions | damage = (impactSpeed − 4) × k: asteroid 5, ram 3, wall 3 |
 | Relics | value 1, carry cap 5, +1 every 60t (cap 12 on field), **kill bounty 2** |
-| Respawn | drop carried relics, respawn at Anchor after 90t |
+| Respawn | drop carried relics; respawn at Anchor after 90t with **45t spawn protection** |
 | Sigils | Afterburner 30t ×3 thrust/+50% speed; Bulwark full shield +45t immunity; Singularity r200 pull 0.6 for 60t; Mine arms 15t, r40, 60 dmg; Arc Lance 40/tick, 50 dmg, shield-bypassing |
 
 ## What the harness reports at these values

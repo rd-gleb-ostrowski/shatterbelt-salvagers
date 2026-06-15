@@ -57,6 +57,7 @@ class Params:
     relic_spawn_period: int = 60
     relic_field_cap: int = 12
     respawn_delay: int = 90
+    respawn_invuln: int = 45        # ticks of immunity after respawning (anti-gank)
 
     # --- sigils (analytic only for now) ---
     afterburner_dur: int = 30

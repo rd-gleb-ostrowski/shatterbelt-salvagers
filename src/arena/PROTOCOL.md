@@ -80,7 +80,7 @@ and `asteroids`. The **fog-eligible** classes (restricted in a future mode) are 
   "arena": { "width": 2000, "height": 1200 },
 
   "self": {
-    "id": "ship-3", "class": "skiff", "alive": true,
+    "id": "ship-3", "class": "skiff", "alive": true, "invuln": false,
     "pos": { "x": 812.5, "y": 410.0 }, "vel": { "x": 12.0, "y": -3.5 },
     "heading": 1.57, "angVel": 0.0,
     "hull":   { "cur": 80,  "max": 100 },
@@ -97,7 +97,7 @@ and `asteroids`. The **fog-eligible** classes (restricted in a future mode) are 
   ],
 
   "ships": [                       // OTHER ships only; no aether or sigil (hidden)
-    { "id": "ship-7", "class": "skiff", "alive": true,
+    { "id": "ship-7", "class": "skiff", "alive": true, "invuln": false,
       "pos": {…}, "vel": {…}, "heading": 3.0,
       "hull": { "cur": 100, "max": 100 }, "shield": { "cur": 50, "max": 60 },
       "relicsCarried": 0 }
@@ -123,6 +123,9 @@ Notes:
 - `hull`, `shield`, `aether` are `{cur,max}`; `class` is present on every ship — both so new ship
   types slot in with no schema change.
 - Enemy ships never expose `aether` or `sigil` (bluff room).
+- `invuln` is `true` while a ship has **spawn protection** — a freshly respawned ship is immune
+  to damage for a short window (anti-gank), and Bulwark also sets it. Don't waste shots on an
+  `invuln` ship.
 - Enemy `mines` appear only when your ship is within the detection radius (~120 units — *balance*);
   your own mines are always listed (`own:true`).
 
