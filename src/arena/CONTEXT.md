@@ -98,6 +98,12 @@ The continuously-updated TrueSkill ranking of all bots, fed by headless-fast mat
 the background. There is no scheduled tournament — just the ladder and on-demand live matches.
 _Avoid_: leaderboard, tournament, ranking
 
+**Admin**:
+The facilitator's controller console (a web app gated by a pre-shared password) for managing
+bots/teams, starting and controlling matches, running the ladder, and replays. Distinct from a
+Bot and the Viewer. See `FRONTEND.md`.
+_Avoid_: dashboard, console, controller (use the full term)
+
 **WS Bot**:
 A bot that runs as a process on a participant's machine and connects _outbound_ over
 WebSocket to the Arena. The preferred connection: the bot initiates, so it works from behind

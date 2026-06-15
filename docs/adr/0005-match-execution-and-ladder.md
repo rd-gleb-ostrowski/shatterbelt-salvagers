@@ -17,6 +17,10 @@ updated **TrueSkill** ladder rather than a scheduled tournament.
 - **Ladder, not tournament.** Headless-fast matches run continuously and feed a **TrueSkill**
   rating (it natively rates FFA: rank all bots by score each match → one rating update, with
   uncertainty, converging fast with few players). Plus **on-demand** live matches.
+- **Always a live match.** The Arena always keeps **one live (paced) exhibition match** running
+  for the projector Viewer, alongside the fast headless ladder matches — so the screen is never
+  blank. On-demand matches simply take over the live slot; between them, exhibition matches loop.
+  Both live and headless matches feed the ladder.
 - **Canonical match length: 2 minutes (3600 ticks @ 30 Hz)** for both live and ladder, so ratings
   compare like-with-like. (Robocode uses elimination rounds; that doesn't fit our economic +
   respawn model, so a fixed time limit is the natural choice.) Headless, a match runs in

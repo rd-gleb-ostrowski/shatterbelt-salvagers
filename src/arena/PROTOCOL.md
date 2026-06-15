@@ -42,13 +42,25 @@ so one bot's decision logic targets either path unchanged.
 - **Angles are radians**, `0 = +x` (East), increasing **counter-clockwise**.
 - **Velocities are units per tick**; angular rates are radians per tick.
 
-## 4. WS connection handshake
+## 4. Registration & auth
+
+Auth is intentionally simple — pre-shared passwords, no accounts.
+
+- **Register (REST):** `POST /register` with the shared **event password** and a team name →
+  returns a **token** for that team. The token authorizes the two bot paths:
+  - **Upload a WASM bot:** `POST /bots` with the token + the `.wasm` artifact (replaces the
+    team's current WASM Bot).
+  - **Connect a WS bot:** include the token in the `join` message (below).
+- **Admin** endpoints (match control, ladder control, kicks) are gated by a separate
+  **facilitator password**.
+
+## 5. WS connection handshake
 
 ```
 Bot                              Arena
  |──── WebSocket connect ────────▶|
  |◀──── welcome ──────────────────|  { type:"welcome", protocolVersion, sessionId, gameType }
- |──── join ─────────────────────▶|  { type:"join", sessionId (echo), name, authors?, preferredClass? }
+ |──── join ─────────────────────▶|  { type:"join", sessionId (echo), token, name, preferredClass? }
  |◀──── assigned ─────────────────|  { type:"assigned", shipId }
  |              ... lobby ...      |
  |◀──── matchStart ───────────────|  (followed immediately by the first tick)
@@ -57,14 +69,15 @@ Bot                              Arena
  |◀──── matchEnd ─────────────────|  { type:"matchEnd", results }
 ```
 
-The `sessionId` is a UUID the Arena issues in `welcome`; the bot must echo it in `join`
-(lightweight auth). The bot learns *everything else* about the world from the observations
-themselves (each one is self-describing — see `self.id`, `seed`, `arena`, `maxTicks`).
+The `sessionId` is a UUID the Arena issues in `welcome`; the bot echoes it in `join` (connection
+challenge) along with its **token** from registration (identity → which team's ship it gets). The
+bot learns *everything else* about the world from the observations themselves (each one is
+self-describing — see `self.id`, `seed`, `arena`, `maxTicks`).
 
 WASM bots skip the handshake: the Arena instantiates the module, calls `init` with the tick-0
-observation, then calls `tick` each tick (see §8).
+observation, then calls `tick` each tick (see §9).
 
-## 5. Observation (Arena → bot, each tick)
+## 6. Observation (Arena → bot, each tick)
 
 Full observability in v1. The schema is structured so visibility can later be restricted per
 entity class; the **always-known** classes are `arena`, `maxTicks`, `seed`, `self`, `anchors`,
@@ -115,7 +128,7 @@ and `asteroids`. The **fog-eligible** classes (restricted in a future mode) are 
 
   "scores": { "ship-3": 5, "ship-7": 3 },   // v1 is free-for-all (teams later)
 
-  "events": [ … ]                  // things that happened to you last tick — see §6
+  "events": [ … ]                  // things that happened to you last tick — see §7
 }
 ```
 
@@ -129,7 +142,7 @@ Notes:
 - Enemy `mines` appear only when your ship is within the detection radius (~120 units — *balance*);
   your own mines are always listed (`own:true`).
 
-## 6. Events (in each observation)
+## 7. Events (in each observation)
 
 A list of what happened to **you** since the last tick, so reactive bots don't have to diff
 state. Indicative set (extensible):
@@ -147,7 +160,7 @@ state. Indicative set (extensible):
 | `died`          | `{ by }`                                  | your ship was destroyed |
 | `matchOver`     | `{ results }`                             | match ended |
 
-## 7. Action / intent (bot → Arena, each tick)
+## 8. Action / intent (bot → Arena, each tick)
 
 Rate-first intent, inspired by Robocode. **All fields optional; an omitted field keeps its
 previous value.** The Arena applies physics and clamps to limits.
@@ -175,14 +188,14 @@ previous value.** The Arena applies physics and clamps to limits.
   - **Aether Mine** — none (drops at the ship's position).
   - **Arc Lance** — `sigilTarget` (direction of the bolt).
 
-## 8. WASM ABI
+## 9. WASM ABI
 
 A WASM Bot is a **core-wasm** module (ADR-0004). It exports:
 
 - `memory` — its linear memory.
 - `alloc(len: i32) -> i32` — the host allocates a buffer in the module and writes JSON into it.
 - `init(ptr: i32, len: i32)` — called once before the match with the **tick-0 observation**
-  (same shape as §5), so the bot can precompute/allocate.
+  (same shape as §6), so the bot can precompute/allocate.
 - `tick(ptr: i32, len: i32) -> i64` — reads the observation JSON at `[ptr,len)`, writes its action
   JSON into its own memory, and returns `(out_ptr << 32) | out_len`.
 
@@ -192,14 +205,14 @@ action this tick". Modules are instantiated and `init`-ed before the match to pa
 front. There are no clock/random host imports — a bot derives any randomness from the `seed` and
 `tick` in the observation.
 
-## 9. SDKs & starters
+## 10. SDKs & starters
 
 - **WASM SDKs (templates hiding the alloc/`tick` glue — author writes `tick(obs) -> action`):**
   Rust, AssemblyScript, TinyGo, C/C++, Zig.
 - **WS starters (connect, read JSON, write JSON):** Python, TypeScript on **Deno**, Kotlin (JVM).
 - **Kotlin/Wasm:** experimental stretch only; Kotlin users take the WS path in v1.
 
-## 10. Out of scope for this document (decide separately)
+## 11. Out of scope for this document (decide separately)
 
 - Exact physics constants and gameplay numbers (the balance pass).
 - The scoring/`results` formula (how banking relics, kills, and survival combine).
