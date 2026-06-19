@@ -101,7 +101,8 @@ and `asteroids`. The **fog-eligible** classes (restricted in a future mode) are 
     "aether": { "cur": 60,  "max": 100 },
     "sigil": "Bulwark",            // held Sigil name, or null
     "cannonCooldown": 0,           // ticks until the rune-cannon can fire again
-    "relicsCarried": 2
+    "relicsCarried": 2,
+    "afterburnerTicksLeft": 0      // remaining ticks of Afterburner boost; 0 = inactive
   },
 
   "anchors": [
@@ -145,20 +146,57 @@ Notes:
 ## 7. Events (in each observation)
 
 A list of what happened to **you** since the last tick, so reactive bots don't have to diff
-state. Indicative set (extensible):
+state. Extensible — new variants are added without breaking existing bots.
 
-| event           | payload                                  | meaning |
-|-----------------|------------------------------------------|---------|
-| `tookHull`      | `{ amount, by }`                         | hull damage taken |
-| `tookShield`    | `{ amount, by }`                         | shield damage absorbed |
-| `shieldDown`    | `{}`                                      | shield reached 0 |
-| `relicTaken`    | `{ relicId, value }`                      | you picked up a relic |
-| `relicBanked`   | `{ value, total }`                        | you banked relics at your Anchor |
-| `sigilGranted`  | `{ sigil }`                               | a relic granted you a Sigil |
-| `mineHit`       | `{ mineId, amount }`                       | a mine detonated on you |
-| `killedShip`    | `{ shipId }`                              | you destroyed another ship |
-| `died`          | `{ by }`                                  | your ship was destroyed |
-| `matchOver`     | `{ results }`                             | match ended |
+**Projectile / cannon damage**
+
+| event                 | payload              | meaning |
+|-----------------------|----------------------|---------|
+| `tookShield`          | `{ amount, by }`     | your Shield absorbed a cannon hit from ship `by` |
+| `tookHull`            | `{ amount, by }`     | after Shield was depleted (or overflow), your Hull took cannon damage from `by` |
+| `shieldDown`          | `{}`                 | your Shield reached 0 this tick |
+| `lanceTookHull`       | `{ amount, by }`     | an Arc Lance bolt from `by` hit your Hull directly (bypasses Shield) |
+
+**Collision damage** (wall / asteroid / ship-ram — no kill attribution)
+
+| event                 | payload              | meaning |
+|-----------------------|----------------------|---------|
+| `collisionTookShield` | `{ amount }`         | your Shield absorbed collision damage |
+| `collisionTookHull`   | `{ amount }`         | your Hull took collision damage (Shield already depleted or overflow) |
+
+**Relics & Sigils**
+
+| event              | payload                | meaning |
+|--------------------|------------------------|---------|
+| `relicTaken`       | `{ relicId, value }`   | you picked up a Relic |
+| `relicBanked`      | `{ value, total }`     | you banked Relics at your Anchor |
+| `relicDropped`     | `{ relicId, pos }`     | a carried Relic was dropped into the Drift when your ship was destroyed (one event per Relic) |
+| `sigilGranted`     | `{ which }`            | a Relic granted you a Sigil (only emitted when you held none before pickup) |
+| `sigilDischarged`  | `{ which }`            | your held Sigil was consumed via a discharge intent |
+
+**Sigil effects**
+
+| event                  | payload        | meaning |
+|------------------------|----------------|---------|
+| `afterburnerExpired`   | `{}`           | Afterburner boost window ended; thrust cap reverts to normal |
+| `bulwarkExpired`       | `{}`           | Bulwark immunity ended; `invuln` is now `false` |
+| `singularityDeployed`  | `{ id, pos }`  | you deployed a Singularity gravity well at `pos` |
+| `mineDeployed`         | `{ id, pos }`  | you dropped an Aether Mine at `pos` |
+| `mineDetonated`        | `{ mineId, pos }` | an Aether Mine at `pos` detonated and you took the blast |
+
+**Ship lifecycle**
+
+| event         | payload          | meaning |
+|---------------|------------------|---------|
+| `killedShip`  | `{ victim }`     | your rune-cannon round delivered the lethal blow to ship `victim` |
+| `died`        | `{ by }`         | your ship was destroyed; `by` is the killer's `shipId`, or `null` for environmental / self-inflicted death (collision, Singularity, own mine) |
+| `respawned`   | `{}`             | your ship has respawned at its Anchor after the respawn delay |
+
+**Match**
+
+| event       | payload        | meaning |
+|-------------|----------------|---------|
+| `matchOver` | `{ results }`  | match ended |
 
 ## 8. Action / intent (bot → Arena, each tick)
 
