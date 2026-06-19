@@ -32,6 +32,7 @@ version = "0.1.0"
 dependencies = [
  "arena-engine",
  "axum",
+ "bytes",
  "futures-util",
  "http",
  "http-body-util",

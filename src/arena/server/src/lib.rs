@@ -22,10 +22,12 @@
 //! | Tick pacing | [`runner::TickPacer`] trait | already used by [`pacer::LivePacer`] |
 //! | Engine state | `runner.engine()` | 07 (observer god_view), 08 (intent_log) |
 //! | Match outcome | [`runner::MatchOutcome`] | 14 (ladder) |
+//! | WASM artifact storage | [`store::WasmBotStore`] | 04 (this issue), 05 (wasmtime host), 06 (resolver), 11 (admin) |
 
 pub mod auth;
 pub mod bot;
 pub mod pacer;
 pub mod routes;
 pub mod runner;
+pub mod store;
 pub mod ws;

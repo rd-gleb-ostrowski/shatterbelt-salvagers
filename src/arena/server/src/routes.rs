@@ -6,31 +6,35 @@
 //! |--------|------|------|-------------|
 //! | `POST` | `/register` | event password in body | Register a team → token |
 //! | `GET`  | `/ws`       | token in `join` message | WS Bot connect & play |
+//! | `POST` | `/bots`     | `Authorization: Bearer <token>` | Upload a WASM Bot artifact |
 //!
 //! ## Seams for future issues
 //!
-//! - **Issue 04 (WASM upload):** mount `POST /bots` here; extract the Bearer
-//!   token from the `Authorization` header and call `registry.resolve` to
-//!   identify the team before storing the WASM artifact.
+//! - **Issue 05 (wasmtime host):** call `state.wasm_store.get(team)` to fetch
+//!   the stored bytes and instantiate the WASM module before a match.
+//! - **Issue 06 (connection resolver):** `state.wasm_store.get(team).is_some()`
+//!   drives the WS → WASM → Default priority decision (ADR-0001).
 //! - **Issue 11 (facilitator / Admin):** add a `facilitator_password: String`
-//!   field to [`AppState`] and gate Admin-only routes on it. The event password
-//!   and facilitator password remain separate credentials.
+//!   field to [`AppState`] and gate Admin-only routes on it. The Admin can call
+//!   `state.wasm_store.store(team, bytes)` to upload/replace on behalf of a team.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use axum::{
     extract::State,
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::IntoResponse,
     routing::{any, post},
     Json, Router,
 };
+use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
 use arena_engine::Params;
 
 use crate::auth::TokenRegistry;
+use crate::store::WasmBotStore;
 use crate::ws::ws_bot_handler;
 
 // ── App state ─────────────────────────────────────────────────────────────────
@@ -38,7 +42,7 @@ use crate::ws::ws_bot_handler;
 /// Shared application state threaded through all handlers via [`axum::extract::State`].
 ///
 /// Constructed via [`RouterConfig`] / [`build_router`]; cloned cheaply per
-/// request (the registry is `Arc<TokenRegistry>`; all other fields are cheap
+/// request (the registry and store are `Arc<…>`; all other fields are cheap
 /// clones).
 ///
 /// ## Adding future state
@@ -56,6 +60,10 @@ pub struct AppState {
 
     /// Token registry — shared with WS-join (issue 03) and WASM-upload (issue 04).
     pub registry: Arc<TokenRegistry>,
+
+    /// WASM Bot artifact store — shared with the wasmtime host (issue 05),
+    /// connection resolver (issue 06), and Admin (issue 11).
+    pub wasm_store: Arc<WasmBotStore>,
 
     /// Per-tick deadline for receiving an action from a WS bot.
     ///
@@ -81,6 +89,9 @@ pub struct AppState {
 pub struct RouterConfig {
     pub event_password: String,
     pub registry: Arc<TokenRegistry>,
+    /// WASM Bot artifact store.  Create with [`WasmBotStore::new`] and retain
+    /// the `Arc` if tests need to inspect the store after requests.
+    pub wasm_store: Arc<WasmBotStore>,
     /// Per-tick deadline. Defaults to 33 ms in [`build_router`].
     pub tick_deadline: Duration,
     /// Match RNG seed. Defaults to 42 in [`build_router`].
@@ -133,6 +144,89 @@ async fn post_register(
     (StatusCode::OK, Json(RegisterOk { token })).into_response()
 }
 
+/// `POST /bots` — upload (or replace) the WASM Bot artifact for a team.
+///
+/// # Auth
+///
+/// The participant's token (obtained from `POST /register`) must be supplied as:
+/// ```text
+/// Authorization: Bearer <token>
+/// ```
+/// This is consistent with the WS `join` path — both use the token issued at
+/// registration to identify the team.
+///
+/// # Request body
+///
+/// Raw bytes of a compiled `.wasm` artifact.  The first four bytes must be the
+/// WASM magic header (`\0asm` = `[0x00, 0x61, 0x73, 0x6d]`); anything else is
+/// rejected as a bad request.
+///
+/// # Responses
+///
+/// | Status | Meaning |
+/// |--------|---------|
+/// | **200 OK** | Artifact stored (or replaced) for the team. |
+/// | **400 Bad Request** | Body is empty or does not start with the WASM magic bytes. |
+/// | **401 Unauthorized** | `Authorization` header absent, malformed, or token unknown/revoked. |
+async fn post_bots(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> impl IntoResponse {
+    // ── 1. Extract token from `Authorization: Bearer <token>` ─────────────────
+    let token = match extract_bearer_token(&headers) {
+        Some(t) => t,
+        None => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"error": "missing or malformed Authorization header; expected: Bearer <token>"})),
+            )
+                .into_response();
+        }
+    };
+
+    // ── 2. Resolve token → team identity ──────────────────────────────────────
+    let team = match state.registry.resolve(&token) {
+        Some(t) => t,
+        None => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"error": "invalid or revoked token"})),
+            )
+                .into_response();
+        }
+    };
+
+    // ── 3. Validate WASM magic bytes ───────────────────────────────────────────
+    // The first four bytes of every valid WebAssembly module are `\0asm`.
+    // Reject anything that doesn't look like a WASM artifact so teams get an
+    // early signal rather than a cryptic error later at instantiation time.
+    if body.len() < 4 || &body[..4] != b"\0asm" {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "body must be a valid WASM artifact (missing magic bytes \\0asm)"})),
+        )
+            .into_response();
+    }
+
+    // ── 4. Store the artifact ──────────────────────────────────────────────────
+    state.wasm_store.store(&team, body.to_vec());
+
+    StatusCode::OK.into_response()
+}
+
+/// Extract a Bearer token from the `Authorization` header.
+///
+/// Returns `None` if the header is absent, not valid UTF-8, or not of the form
+/// `Bearer <token>`.
+fn extract_bearer_token(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+        .map(str::to_owned)
+}
+
 // ── Router constructors ───────────────────────────────────────────────────────
 
 /// Build the axum [`Router`] for the Arena server with default WS match settings.
@@ -146,6 +240,11 @@ async fn post_register(
 ///   Pass the same `Arc<TokenRegistry>` to the WS-join (issue 03) and
 ///   WASM-upload (issue 04) handlers so they can validate incoming tokens.
 ///
+/// A fresh [`WasmBotStore`] is created internally. If you need to retain a
+/// reference to the store (e.g. in tests that inspect stored artifacts), use
+/// [`build_router_config`] with a [`RouterConfig`] that carries a pre-created
+/// store.
+///
 /// ## Testing
 ///
 /// In tests for HTTP-only behavior, call `build_router(known_password,
@@ -158,6 +257,7 @@ pub fn build_router(event_password: String, registry: Arc<TokenRegistry>) -> Rou
     build_router_config(RouterConfig {
         event_password,
         registry,
+        wasm_store: WasmBotStore::new(),
         tick_deadline: Duration::from_millis(33),
         match_seed: 42,
         match_params: Params::default(),
@@ -172,12 +272,15 @@ pub fn build_router_config(config: RouterConfig) -> Router {
     let state = AppState {
         event_password: config.event_password,
         registry: config.registry,
+        wasm_store: config.wasm_store,
         tick_deadline: config.tick_deadline,
         match_seed: config.match_seed,
         match_params: config.match_params,
     };
     Router::new()
         .route("/register", post(post_register))
+        .route("/bots", post(post_bots))
         .route("/ws", any(ws_bot_handler))
         .with_state(state)
 }
+
