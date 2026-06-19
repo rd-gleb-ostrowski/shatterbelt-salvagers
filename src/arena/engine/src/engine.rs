@@ -1,12 +1,94 @@
 use std::collections::HashMap;
+use std::f32::consts::TAU;
 
 use rand::SeedableRng;
 use rand_pcg::Pcg64;
+use rapier2d::prelude::*;
 
 use crate::intent::Intent;
 use crate::observation::{GodShipView, GodView, Observation, OtherShipView, SelfView};
 use crate::params::Params;
 use crate::types::*;
+
+// ─── Physics world ────────────────────────────────────────────────────────────
+
+/// All rapier2d state for one match.
+///
+/// Ships are `Dynamic` rigid bodies with gravity disabled and zero rapier
+/// damping — we apply our own linear‑damping multiplication each tick to
+/// exactly match the harness formula:
+///   vel = (vel + accel) * lin_damping  →  clamped  →  pos += vel
+///
+/// The `dt = 1.0` integration parameter means one rapier step = one game tick.
+/// No colliders are added in issue 02; they land in issue 07 (collisions).
+struct PhysicsWorld {
+    bodies: RigidBodySet,
+    colliders: ColliderSet,
+    integration_params: IntegrationParameters,
+    pipeline: PhysicsPipeline,
+    islands: IslandManager,
+    broad_phase: DefaultBroadPhase,
+    narrow_phase: NarrowPhase,
+    impulse_joints: ImpulseJointSet,
+    multibody_joints: MultibodyJointSet,
+    ccd_solver: CCDSolver,
+}
+
+impl PhysicsWorld {
+    fn new() -> Self {
+        let mut integration_params = IntegrationParameters::default();
+        // 1 time unit per step = 1 game tick; pos += vel * 1.0 each step.
+        integration_params.dt = 1.0;
+        Self {
+            bodies: RigidBodySet::new(),
+            colliders: ColliderSet::new(),
+            integration_params,
+            pipeline: PhysicsPipeline::new(),
+            islands: IslandManager::new(),
+            broad_phase: DefaultBroadPhase::new(),
+            narrow_phase: NarrowPhase::new(),
+            impulse_joints: ImpulseJointSet::new(),
+            multibody_joints: MultibodyJointSet::new(),
+            ccd_solver: CCDSolver::new(),
+        }
+    }
+
+    /// Add a ship rigid body at `pos`; return its handle for later lookup.
+    fn add_ship_body(&mut self, pos: Vec2) -> RigidBodyHandle {
+        let rb = RigidBodyBuilder::dynamic()
+            .translation(vector![pos.x, pos.y])
+            .gravity_scale(0.0)
+            .linear_damping(0.0)   // manual damping; see PhysicsWorld docs
+            .angular_damping(0.0)
+            .can_sleep(false)
+            .build();
+        self.bodies.insert(rb)
+    }
+
+    /// Advance the simulation one tick.
+    ///
+    /// Pre‑condition: all body velocities have been set by the caller to the
+    /// post‑damping, post‑cap values for this tick.  rapier then integrates
+    /// `pos += vel * dt` (dt = 1.0), so `pos += vel`.
+    fn step(&mut self) {
+        let gravity = vector![0.0_f32, 0.0_f32];
+        self.pipeline.step(
+            &gravity,
+            &self.integration_params,
+            &mut self.islands,
+            &mut self.broad_phase as &mut dyn BroadPhase,
+            &mut self.narrow_phase,
+            &mut self.bodies,
+            &mut self.colliders,
+            &mut self.impulse_joints,
+            &mut self.multibody_joints,
+            &mut self.ccd_solver,
+            None,
+            &(),
+            &(),
+        );
+    }
+}
 
 // ─── Persisted intent state ───────────────────────────────────────────────────
 
@@ -38,6 +120,10 @@ struct ShipState {
     relics_carried: u32,
     anchor_pos: Vec2,
     persisted: PersistedIntent,
+    /// Handle into the rapier `PhysicsWorld::bodies` set.
+    /// Position and velocity are the source of truth in rapier;
+    /// `ship.pos` / `ship.vel` are synced back after each physics step.
+    body_handle: RigidBodyHandle,
 }
 
 impl ShipState {
@@ -146,6 +232,8 @@ pub struct Engine {
     intent_log: Vec<IntentFrame>,
     /// Seeded RNG — used for spawning/Sigil assignment in later issues.
     rng: Pcg64,
+    /// rapier2d physics world — position/velocity source of truth for ships.
+    physics: PhysicsWorld,
 }
 
 impl Engine {
@@ -153,28 +241,37 @@ impl Engine {
     ///
     /// Each ship starts at its `anchor_pos` with zero velocity, full Hull /
     /// Shield / Aether, no Sigil, and the cannon on its start-hot cooldown.
+    ///
+    /// `params.arena_w` / `params.arena_h` are used as-is; call
+    /// `scale_drift(&params, n_ships)` before construction if you want
+    /// Dynamic-Drift scaling.
     pub fn new(seed: u64, params: Params, specs: Vec<ShipSpec>) -> Self {
         let rng = Pcg64::seed_from_u64(seed);
+        let mut physics = PhysicsWorld::new();
 
         let ships: Vec<ShipState> = specs
             .into_iter()
-            .map(|spec| ShipState {
-                id: spec.id,
-                class: spec.class,
-                alive: true,
-                invuln: false,
-                pos: spec.anchor_pos,
-                vel: Vec2::zero(),
-                heading: 0.0,
-                ang_vel: 0.0,
-                hull: Resource::full(params.hull_max),
-                shield: Resource::full(params.shield_max),
-                aether: Resource::full(params.aether_max),
-                sigil: None,
-                cannon_cooldown: params.cannon_start_hot,
-                relics_carried: 0,
-                anchor_pos: spec.anchor_pos,
-                persisted: PersistedIntent::default(),
+            .map(|spec| {
+                let body_handle = physics.add_ship_body(spec.anchor_pos);
+                ShipState {
+                    id: spec.id,
+                    class: spec.class,
+                    alive: true,
+                    invuln: false,
+                    pos: spec.anchor_pos,
+                    vel: Vec2::zero(),
+                    heading: 0.0,
+                    ang_vel: 0.0,
+                    hull: Resource::full(params.hull_max),
+                    shield: Resource::full(params.shield_max),
+                    aether: Resource::full(params.aether_max),
+                    sigil: None,
+                    cannon_cooldown: params.cannon_start_hot,
+                    relics_carried: 0,
+                    anchor_pos: spec.anchor_pos,
+                    persisted: PersistedIntent::default(),
+                    body_handle,
+                }
             })
             .collect();
 
@@ -189,6 +286,7 @@ impl Engine {
             scores,
             intent_log: Vec::new(),
             rng,
+            physics,
         }
     }
 
@@ -199,12 +297,19 @@ impl Engine {
 
     /// Advance the simulation exactly one tick.
     ///
-    /// For each ship: merge the supplied `Intent` into the persisted state, then
-    /// apply gameplay rules.  In issue 01 (skeleton) there are no physics or
-    /// combat rules — the function records intents and increments the tick.
-    ///
-    /// Returns a per-ship event list (empty in this skeleton; populated in
-    /// later issues as combat/economy rules land).
+    /// Per-tick sequence (matches harness.py):
+    ///   1. Merge incoming intents into each ship's persisted state.
+    ///   2. For each alive ship:
+    ///      a. Rotate heading by `turn * max_turn`.
+    ///      b. Compute thrust acceleration (zero when aether is empty).
+    ///      c. Apply:  vel = (vel + accel_vec) * lin_damping
+    ///      d. Clamp speed to max_speed.
+    ///      e. Deduct aether cost; apply aether regen.
+    ///   3. Set the computed velocity on each ship's rapier body.
+    ///   4. Step rapier (moves bodies by `vel * dt`, dt = 1.0).
+    ///   5. Sync positions back from rapier bodies into `ship.pos`.
+    ///   6. Record applied intents.
+    ///   7. Advance tick.
     pub fn step(&mut self, intents: Vec<(ShipId, Intent)>) -> Vec<(ShipId, Vec<Event>)> {
         // 1. Merge incoming intents into each ship's persisted state.
         for (id, intent) in &intents {
@@ -213,9 +318,85 @@ impl Engine {
             }
         }
 
-        // 2. Record the applied (persisted) intent for every ship this tick.
-        //    Using the fully-resolved state ensures replays don't need to
-        //    re-run the merge logic.
+        // 2 & 3. Physics: compute new velocities, store them for rapier.
+        //
+        // We read velocity from ship.vel (kept in sync with rapier after every
+        // step) to avoid a borrowing conflict between &mut self.ships and
+        // &mut self.physics.bodies in the same loop body.
+        let mut vel_updates: Vec<(RigidBodyHandle, f32, f32)> = Vec::new();
+
+        for ship in &mut self.ships {
+            if !ship.alive {
+                vel_updates.push((ship.body_handle, 0.0, 0.0));
+                continue;
+            }
+
+            let p = &self.params;
+            let turn   = ship.persisted.turn;
+            let thrust = ship.persisted.thrust;
+
+            // a. Rotate heading (rate-first; clamped via max_turn).
+            ship.heading = (ship.heading + turn * p.max_turn).rem_euclid(TAU);
+            ship.ang_vel = turn * p.max_turn;
+
+            // b. Thrust is ineffective at zero aether.
+            let effective_thrust = if ship.aether.cur > 0.0 { thrust } else { 0.0 };
+
+            // c. Accelerate along heading, then damp.
+            let base_accel = if effective_thrust >= 0.0 {
+                p.thrust_accel
+            } else {
+                p.reverse_accel
+            };
+            let accel_mag = effective_thrust * base_accel;
+            let ax = ship.heading.cos() * accel_mag;
+            let ay = ship.heading.sin() * accel_mag;
+
+            let mut nvx = (ship.vel.x + ax) * p.lin_damping;
+            let mut nvy = (ship.vel.y + ay) * p.lin_damping;
+
+            // d. Cap speed.
+            let spd = (nvx * nvx + nvy * nvy).sqrt();
+            if spd > p.max_speed {
+                let scale = p.max_speed / spd;
+                nvx *= scale;
+                nvy *= scale;
+            }
+
+            // Store new velocity in ship state.
+            ship.vel = Vec2::new(nvx, nvy);
+
+            // e. Aether: deduct thrust cost, then regen (clamped).
+            let aether_cost = effective_thrust.abs() * p.thrust_cost_full;
+            ship.aether.cur =
+                (ship.aether.cur - aether_cost + p.aether_regen).clamp(0.0, ship.aether.max);
+
+            vel_updates.push((ship.body_handle, nvx, nvy));
+        }
+
+        // 3. Push computed velocities into rapier bodies.
+        for (handle, vx, vy) in &vel_updates {
+            if let Some(body) = self.physics.bodies.get_mut(*handle) {
+                body.set_linvel(vector![*vx, *vy], true);
+            }
+        }
+
+        // 4. Step rapier: pos += vel * dt (dt = 1.0).
+        self.physics.step();
+
+        // 5. Sync positions back from rapier.
+        for i in 0..self.ships.len() {
+            let handle = self.ships[i].body_handle;
+            let (px, py) = if let Some(body) = self.physics.bodies.get(handle) {
+                let t = body.translation();
+                (t[0], t[1])
+            } else {
+                continue;
+            };
+            self.ships[i].pos = Vec2::new(px, py);
+        }
+
+        // 6. Record the applied (persisted) intent for every ship this tick.
         let frame: IntentFrame = self
             .ships
             .iter()
@@ -223,14 +404,13 @@ impl Engine {
             .collect();
         self.intent_log.push(frame);
 
-        // 3. TODO (issue 02+): apply physics, combat, scoring, spawning, etc.
-        //    The RNG (`self.rng`) is available here for any stochastic rules.
-        let _ = &mut self.rng; // suppress unused warning until physics lands
+        // RNG is available for stochastic rules in later issues.
+        let _ = &mut self.rng;
 
-        // 4. Advance tick.
+        // 7. Advance tick.
         self.tick += 1;
 
-        // 5. Return empty events per ship (populated by later issues).
+        // 8. Return empty events per ship (populated by later issues).
         self.ships
             .iter()
             .map(|s| (s.id.clone(), Vec::<Event>::new()))
@@ -324,4 +504,36 @@ impl Engine {
     pub fn intent_log(&self) -> &[IntentFrame] {
         &self.intent_log
     }
+}
+
+// ─── Dynamic Drift scaling ────────────────────────────────────────────────────
+
+/// Scale Drift (arena) dimensions for `n_ships` ships.
+///
+/// Area scales proportionally to ship count off the 2000×1200 baseline for 4
+/// ships, keeping density constant:
+///
+///   scale = √(n / 4)
+///   width  = base_params.arena_w × scale
+///   height = base_params.arena_h × scale
+///
+/// The Arena Server calls this before constructing the engine so that
+/// `Observation::arena` reports the correct match-specific dimensions.
+///
+/// Asteroid / relic entity counts (added in later issues) also scale with N;
+/// this function updates the relevant Params fields so the engine gets them all
+/// from one call.
+pub fn scale_drift(base: &Params, n_ships: usize) -> Params {
+    let f = ((n_ships as f32) / 4.0_f32).sqrt();
+    let mut p = base.clone();
+    p.arena_w = base.arena_w * f;
+    p.arena_h = base.arena_h * f;
+    // Entity counts scale linearly with N; relic spawn period scales inversely.
+    // (Asteroid/relic placement uses these in issues 03+.)
+    p.n_asteroids = ((base.n_asteroids as f32) * (n_ships as f32) / 4.0).round().max(1.0) as u32;
+    p.relic_field_cap =
+        ((base.relic_field_cap as f32) * (n_ships as f32) / 4.0).round().max(2.0) as u32;
+    p.relic_spawn_period =
+        ((base.relic_spawn_period as f32) * 4.0 / (n_ships as f32)).round().max(15.0) as u32;
+    p
 }

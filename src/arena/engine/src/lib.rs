@@ -17,7 +17,7 @@ mod observation;
 mod params;
 mod types;
 
-pub use engine::{Engine, IntentFrame};
+pub use engine::{scale_drift, Engine, IntentFrame};
 pub use intent::Intent;
 pub use observation::{GodShipView, GodView, Observation, OtherShipView, SelfView};
 pub use params::Params;
