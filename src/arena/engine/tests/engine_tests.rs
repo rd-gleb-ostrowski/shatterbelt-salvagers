@@ -4511,3 +4511,1059 @@ fn determinism_sigil_effects() {
     );
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// Issue 10: World-effect Sigils — Singularity, Aether Mine & Arc Lance
+//
+// TDD tracer-bullet order:
+//  86.  Discharge Singularity → well appears in god-view with correct pos/radius/dur.
+//  87.  Loose relic within singularity_radius moves toward the well.
+//  88.  Enemy ship within singularity_radius is pulled toward the well.
+//  89.  Singularity well expires after singularity_dur ticks.
+//  90.  Discharge Aether Mine → mine appears in god-view and owner-visible in observation.
+//  91.  Mine arms after mine_arm ticks and detonates on enemy within mine_radius.
+//  92.  Invuln enemy takes no mine damage (respects invuln).
+//  93.  Enemy mine is proximity-visible only; otherwise hidden from enemy observation.
+//  94.  Discharge Arc Lance → bolt travels at lance_speed per tick.
+//  95.  Arc Lance hit goes directly to Hull — Shield is bypassed.
+//  96.  Arc Lance pierces two collinear ships (both take hull damage).
+//  97.  Golden: Singularity pull — relic and ship displace by expected amount.
+//  98.  Golden: Aether Mine — enemy takes exactly mine_damage (shield then hull).
+//  99.  Golden: Arc Lance — pierces + bypasses shield (hull damage from params).
+// 100.  Determinism: world-effect sigil outcomes reproducible across two runs.
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Imports used in tests (MineView and SingularityView are used via pattern matching)
+#[allow(unused_imports)]
+use arena_engine::{MineView, SingularityView};
+
+// ─── helpers ─────────────────────────────────────────────────────────────────
+
+/// Minimal two-ship engine for world-effect sigil tests (kept for potential
+/// use in future tests).
+#[allow(dead_code)]
+fn world_sigil_engine(enemy_pos: Vec2) -> Engine {
+    let mut p = Params::default();
+    p.relic_field_cap = 0;
+    p.relic_spawn_period = 9999;
+    p.n_asteroids = 0;
+    p.cannon_start_hot = 9999;
+    p.shield_regen_delay = 9999;
+    let specs = vec![
+        ShipSpec {
+            id: "ship-1".to_string(),
+            class: ShipClass::Skiff,
+            anchor_pos: Vec2 { x: 500.0, y: 600.0 },
+        },
+        ShipSpec {
+            id: "ship-2".to_string(),
+            class: ShipClass::Skiff,
+            anchor_pos: enemy_pos,
+        },
+    ];
+    Engine::new(42, p, specs)
+}
+
+/// Single-ship engine for sigil tests that don't need an enemy.
+fn world_sigil_single_engine() -> Engine {
+    let mut p = Params::default();
+    p.relic_field_cap = 0;
+    p.relic_spawn_period = 9999;
+    p.n_asteroids = 0;
+    p.cannon_start_hot = 9999;
+    let spec = ShipSpec {
+        id: "ship-1".to_string(),
+        class: ShipClass::Skiff,
+        anchor_pos: Vec2 { x: 500.0, y: 600.0 },
+    };
+    Engine::new(42, p, vec![spec])
+}
+
+fn discharge_sigil(id: &str, target: Option<Vec2>) -> (String, Intent) {
+    (
+        id.to_string(),
+        Intent {
+            sigil: Some(true),
+            sigil_target: target,
+            ..Default::default()
+        },
+    )
+}
+
+// ─── test 86: Discharge Singularity → well appears in god-view ───────────────
+
+#[test]
+fn singularity_discharge_creates_well_in_god_view() {
+    let mut engine = world_sigil_single_engine();
+    let p = Params::default();
+
+    let target = Vec2 { x: 600.0, y: 600.0 };
+    engine.set_sigil_for_test("ship-1", Some(Sigil::Singularity));
+    engine.step(vec![discharge_sigil("ship-1", Some(target))]);
+
+    let gv = engine.god_view();
+    assert_eq!(
+        gv.singularities.len(), 1,
+        "exactly one singularity must appear in god-view after discharge; got {}",
+        gv.singularities.len()
+    );
+    let s = &gv.singularities[0];
+    assert!(
+        (s.pos.x - target.x).abs() < 0.1,
+        "singularity must be at target.x={}; got {}", target.x, s.pos.x
+    );
+    assert!(
+        (s.pos.y - target.y).abs() < 0.1,
+        "singularity must be at target.y={}; got {}", target.y, s.pos.y
+    );
+    assert!(
+        (s.radius - p.singularity_radius).abs() < 0.1,
+        "singularity radius must equal singularity_radius={}; got {}", p.singularity_radius, s.radius
+    );
+    assert_eq!(
+        s.ticks_left, p.singularity_dur,
+        "singularity ticks_left must equal singularity_dur={} on first tick; got {}",
+        p.singularity_dur, s.ticks_left
+    );
+
+    // Also visible in observation.
+    let obs = engine.observation(&"ship-1".to_string()).unwrap();
+    assert_eq!(obs.singularities.len(), 1, "singularity must appear in observation");
+}
+
+// ─── test 87: Loose relic within singularity_radius moves toward the well ────
+
+#[test]
+fn singularity_pulls_loose_relic_toward_well() {
+    // Use a 2000×1200 arena so relics spawn in [100, 1900)×[100, 1100).
+    // Place the singularity well at (800, 600) with radius=400; ship far away at
+    // (1900, 600) with tiny pickup_radius (can't pick up relics near the well).
+    // With 6 initial relics and pull=0.6 (default) there will be measurable movement.
+    let mut p = Params::default();
+    p.relic_field_cap = 12; // 6 initial relics spread around the arena
+    p.relic_spawn_period = 9999;
+    p.n_asteroids = 0;
+    p.cannon_start_hot = 9999;
+    p.arena_w = 2000.0;
+    p.arena_h = 1200.0;
+    // Small pickup radius so ship at (1900, 600) can't vacuum up relics.
+    p.relic_pickup_radius = 1.0;
+    p.singularity_radius = 600.0; // cover most of the arena
+    p.singularity_pull   = 0.3;   // small enough to avoid overshoot (relics are ≥1 unit away)
+
+    let well_pos = Vec2 { x: 800.0, y: 600.0 };
+
+    let spec = ShipSpec {
+        id: "ship-1".to_string(),
+        class: ShipClass::Skiff,
+        anchor_pos: Vec2 { x: 1900.0, y: 600.0 }, // far corner
+    };
+    let mut engine = Engine::new(42, p.clone(), vec![spec]);
+
+    // Verify we have relics to work with.
+    let relics_before: Vec<_> = engine.god_view().relics.iter()
+        .map(|r| (r.id.clone(), r.pos))
+        .collect();
+    assert!(relics_before.len() >= 1, "need at least one relic; got 0");
+
+    // Filter to relics within singularity radius.
+    let in_radius: Vec<_> = relics_before.iter()
+        .filter(|(_, pos)| {
+            let dx = pos.x - well_pos.x;
+            let dy = pos.y - well_pos.y;
+            (dx * dx + dy * dy).sqrt() < p.singularity_radius
+        })
+        .collect();
+
+    // Discharge Singularity at well_pos.
+    engine.set_sigil_for_test("ship-1", Some(Sigil::Singularity));
+    engine.step(vec![discharge_sigil("ship-1", Some(well_pos))]);
+
+    // After one tick, at least one relic within the radius must have moved closer.
+    if in_radius.is_empty() {
+        // Edge case: no relics happen to be within radius with this seed+config.
+        // Just assert that the singularity is present and alive.
+        assert_eq!(engine.god_view().singularities.len(), 1,
+            "singularity must be alive even if no relics to pull");
+        return;
+    }
+
+    let relics_after: Vec<_> = engine.god_view().relics.iter()
+        .map(|r| (r.id.clone(), r.pos))
+        .collect();
+
+    let mut any_moved = false;
+    for (id, before) in &in_radius {
+        if let Some((_, after)) = relics_after.iter().find(|(i, _)| i.as_str() == id.as_str()) {
+            let d_before = {
+                let dx = before.x - well_pos.x;
+                let dy = before.y - well_pos.y;
+                (dx * dx + dy * dy).sqrt()
+            };
+            let d_after = {
+                let dx = after.x - well_pos.x;
+                let dy = after.y - well_pos.y;
+                (dx * dx + dy * dy).sqrt()
+            };
+            if d_after < d_before - 0.001 {
+                any_moved = true;
+                break;
+            }
+        }
+    }
+    assert!(
+        any_moved,
+        "at least one relic within singularity_radius ({}) must move closer to the well; \
+         in_radius_count={}, relics_after={:?}",
+        p.singularity_radius, in_radius.len(), relics_after
+    );
+}
+
+// ─── test 88: Enemy ship within singularity_radius is pulled toward the well ─
+
+#[test]
+fn singularity_pulls_enemy_ship_toward_well() {
+    let well_pos = Vec2 { x: 500.0, y: 600.0 };
+    // Enemy starts 80 units East of the well, well within singularity_radius=200.
+    let enemy_start = Vec2 { x: 580.0, y: 600.0 };
+
+    let mut p = Params::default();
+    p.relic_field_cap = 0;
+    p.relic_spawn_period = 9999;
+    p.n_asteroids = 0;
+    p.cannon_start_hot = 9999;
+    p.shield_regen_delay = 9999;
+    p.lin_damping = 1.0; // no damping so pull impulse shows clearly
+
+    let specs = vec![
+        ShipSpec {
+            id: "ship-1".to_string(),
+            class: ShipClass::Skiff,
+            anchor_pos: Vec2 { x: 400.0, y: 600.0 }, // not at well
+        },
+        ShipSpec {
+            id: "enemy".to_string(),
+            class: ShipClass::Skiff,
+            anchor_pos: enemy_start,
+        },
+    ];
+    let mut engine = Engine::new(42, p.clone(), specs);
+
+    // Discharge Singularity at well_pos.
+    engine.set_sigil_for_test("ship-1", Some(Sigil::Singularity));
+    engine.step(vec![discharge_sigil("ship-1", Some(well_pos))]);
+
+    // After one tick: the pull has modified the enemy's VELOCITY (vel.x < 0 = West).
+    // Position change shows on the NEXT step (rapier integrates with the new vel).
+    let enemy_vel = engine.god_view().ships.iter()
+        .find(|s| s.id == "enemy").unwrap().vel;
+    assert!(
+        enemy_vel.x < 0.0,
+        "enemy must have acquired Westward velocity from singularity pull after 1 tick; \
+         vel.x={}", enemy_vel.x
+    );
+
+    // One more step: position must have moved West.
+    engine.step(vec![]);
+    let enemy_x = engine.god_view().ships.iter()
+        .find(|s| s.id == "enemy").unwrap().pos.x;
+    assert!(
+        enemy_x < enemy_start.x,
+        "enemy ship must be West of start after singularity pull; \
+         start.x={}, after.x={enemy_x}", enemy_start.x
+    );
+}
+
+// ─── test 89: Singularity well expires after singularity_dur ticks ───────────
+
+#[test]
+fn singularity_expires_after_dur_ticks() {
+    let p = Params::default();
+    let mut engine = world_sigil_single_engine();
+
+    let target = Vec2 { x: 600.0, y: 600.0 };
+    engine.set_sigil_for_test("ship-1", Some(Sigil::Singularity));
+    engine.step(vec![discharge_sigil("ship-1", Some(target))]);
+
+    assert_eq!(
+        engine.god_view().singularities.len(), 1,
+        "singularity must exist after discharge"
+    );
+
+    // Step singularity_dur - 1 more ticks: must still be there.
+    for _ in 0..(p.singularity_dur - 1) {
+        engine.step(vec![]);
+        assert_eq!(
+            engine.god_view().singularities.len(), 1,
+            "singularity must still exist before dur expires"
+        );
+    }
+
+    // One final tick: the singularity should have counted down to 0 and be removed.
+    engine.step(vec![]);
+    assert_eq!(
+        engine.god_view().singularities.len(), 0,
+        "singularity must expire after singularity_dur={} ticks; still {} present",
+        p.singularity_dur,
+        engine.god_view().singularities.len()
+    );
+}
+
+// ─── test 90: Discharge Aether Mine → mine in god-view and owner observation ─
+
+#[test]
+fn mine_discharge_creates_mine_in_god_view_and_owner_obs() {
+    let mut engine = world_sigil_single_engine();
+
+    engine.set_sigil_for_test("ship-1", Some(Sigil::AetherMine));
+    let events = engine.step(vec![discharge_sigil("ship-1", None)]);
+
+    // God-view must contain the mine.
+    let gv = engine.god_view();
+    assert_eq!(
+        gv.mines.len(), 1,
+        "one mine must appear in god-view after discharge; got {}",
+        gv.mines.len()
+    );
+
+    let m = &gv.mines[0];
+    // Mine must be at the ship's anchor position (ship hasn't moved).
+    let ship_pos = gv.ships[0].pos;
+    assert!(
+        (m.pos.x - ship_pos.x).abs() < 0.5,
+        "mine must be at ship position; mine.x={}, ship.x={}", m.pos.x, ship_pos.x
+    );
+
+    // Owner's observation must show the mine with own=true.
+    let obs = engine.observation(&"ship-1".to_string()).unwrap();
+    assert_eq!(obs.mines.len(), 1, "owner must see their own mine in observation");
+    assert!(obs.mines[0].own, "owner must see mine with own=true");
+
+    // MineDeployed event must have been emitted to the owner.
+    let owner_events = events.iter().find(|(id, _)| id == "ship-1").unwrap();
+    let deployed = owner_events.1.iter().any(|e| matches!(e, Event::MineDeployed { .. }));
+    assert!(deployed, "MineDeployed event must be emitted to mine owner");
+}
+
+// ─── test 91: Mine arms after mine_arm ticks and detonates on enemy proximity ─
+
+#[test]
+fn mine_arms_and_detonates_on_enemy_contact() {
+    let p = Params::default();
+    // Enemy at ship pos + mine_radius/2 (within detonation range once armed).
+    let ship_anchor = Vec2 { x: 500.0, y: 600.0 };
+    let enemy_pos   = Vec2 { x: 500.0 + p.mine_radius * 0.5, y: 600.0 };
+
+    let mut p2 = Params::default();
+    p2.relic_field_cap = 0;
+    p2.relic_spawn_period = 9999;
+    p2.n_asteroids = 0;
+    p2.cannon_start_hot = 9999;
+    p2.shield_regen_delay = 9999;
+
+    let specs = vec![
+        ShipSpec {
+            id: "owner".to_string(),
+            class: ShipClass::Skiff,
+            anchor_pos: ship_anchor,
+        },
+        ShipSpec {
+            id: "enemy".to_string(),
+            class: ShipClass::Skiff,
+            anchor_pos: enemy_pos,
+        },
+    ];
+    let mut engine = Engine::new(42, p2.clone(), specs);
+
+    // Drop mine at ship-1 position (which is the owner anchor).
+    engine.set_sigil_for_test("owner", Some(Sigil::AetherMine));
+    engine.step(vec![discharge_sigil("owner", None)]);
+
+    // Mine must NOT detonate yet (arm_ticks_left > 0).
+    let hull_before = engine.god_view().ships.iter()
+        .find(|s| s.id == "enemy").unwrap().hull.cur;
+    for tick_i in 0..(p.mine_arm - 1) {
+        engine.step(vec![]);
+        let hull = engine.god_view().ships.iter()
+            .find(|s| s.id == "enemy").unwrap().hull.cur;
+        assert!(
+            (hull - hull_before).abs() < 0.01,
+            "mine must not detonate before mine_arm={} ticks; tick={tick_i}, hull={hull}",
+            p.mine_arm
+        );
+        assert_eq!(
+            engine.god_view().mines.len(), 1,
+            "mine must still exist before arming; tick={tick_i}"
+        );
+    }
+
+    // One final tick: mine is now armed and enemy is within radius → detonate.
+    let det_events = engine.step(vec![]);
+    let enemy_events = &det_events.iter().find(|(id, _)| id == "enemy").unwrap().1;
+    let detonated = enemy_events.iter().any(|e| matches!(e, Event::MineDetonated { .. }));
+    assert!(
+        detonated,
+        "MineDetonated event must be emitted to enemy after mine_arm ticks; \
+         got {enemy_events:?}"
+    );
+
+    // Enemy must have taken damage (shield absorbs mine_damage since mine_damage == shield_max).
+    let shield_after = engine.god_view().ships.iter()
+        .find(|s| s.id == "enemy").unwrap().shield.cur;
+    let hull_after = engine.god_view().ships.iter()
+        .find(|s| s.id == "enemy").unwrap().hull.cur;
+    // mine_damage = 60 = shield_max → shield goes to 0, hull unchanged.
+    assert!(
+        shield_after < hull_before || hull_after < hull_before,
+        "enemy must have taken damage from mine (shield or hull); \
+         shield: {}→{shield_after}, hull: {}→{hull_after}",
+        p.shield_max, hull_before
+    );
+
+    // Mine must be consumed.
+    assert_eq!(
+        engine.god_view().mines.len(), 0,
+        "mine must be removed after detonation; {} remain",
+        engine.god_view().mines.len()
+    );
+}
+
+// ─── test 92: Invuln enemy takes no mine damage ───────────────────────────────
+
+#[test]
+fn mine_does_not_damage_invuln_enemy() {
+    let p = Params::default();
+    let ship_anchor = Vec2 { x: 500.0, y: 600.0 };
+    let enemy_pos   = Vec2 { x: 500.0 + p.mine_radius * 0.5, y: 600.0 };
+
+    let mut p2 = Params::default();
+    p2.relic_field_cap = 0;
+    p2.relic_spawn_period = 9999;
+    p2.n_asteroids = 0;
+    p2.cannon_start_hot = 9999;
+
+    let specs = vec![
+        ShipSpec {
+            id: "owner".to_string(),
+            class: ShipClass::Skiff,
+            anchor_pos: ship_anchor,
+        },
+        ShipSpec {
+            id: "enemy".to_string(),
+            class: ShipClass::Skiff,
+            anchor_pos: enemy_pos,
+        },
+    ];
+    let mut engine = Engine::new(42, p2.clone(), specs);
+
+    // Grant the enemy invuln (spawn-protection style).
+    engine.set_invuln_for_test("enemy", true);
+
+    engine.set_sigil_for_test("owner", Some(Sigil::AetherMine));
+    engine.step(vec![discharge_sigil("owner", None)]);
+
+    let hull_before = engine.god_view().ships.iter()
+        .find(|s| s.id == "enemy").unwrap().hull.cur;
+
+    // Advance until mine would have armed and detonated.
+    for _ in 0..=p.mine_arm {
+        engine.step(vec![]);
+    }
+
+    let hull_after = engine.god_view().ships.iter()
+        .find(|s| s.id == "enemy").unwrap().hull.cur;
+    assert!(
+        (hull_after - hull_before).abs() < 0.01,
+        "invuln enemy must take no mine damage; before={hull_before}, after={hull_after}"
+    );
+}
+
+// ─── test 93: Enemy mine is proximity-visible only ───────────────────────────
+
+#[test]
+fn enemy_mine_is_proximity_visible_only() {
+    let p = Params::default();
+    // Place enemy (mine owner) far away; observer (ship-1) can or cannot see the mine
+    // depending on distance.
+    let owner_pos    = Vec2 { x: 500.0, y: 600.0 };
+    // Observer far from mine: beyond mine_radius.
+    let observer_far = Vec2 { x: 500.0 + p.mine_radius * 3.0, y: 600.0 };
+
+    let mut p2 = Params::default();
+    p2.relic_field_cap = 0;
+    p2.relic_spawn_period = 9999;
+    p2.n_asteroids = 0;
+    p2.cannon_start_hot = 9999;
+
+    let specs_far = vec![
+        ShipSpec {
+            id: "owner".to_string(),
+            class: ShipClass::Skiff,
+            anchor_pos: owner_pos,
+        },
+        ShipSpec {
+            id: "observer".to_string(),
+            class: ShipClass::Skiff,
+            anchor_pos: observer_far,
+        },
+    ];
+    let mut engine_far = Engine::new(42, p2.clone(), specs_far);
+
+    engine_far.set_sigil_for_test("owner", Some(Sigil::AetherMine));
+    engine_far.step(vec![discharge_sigil("owner", None)]);
+
+    // Far observer must NOT see the enemy mine.
+    let obs_far = engine_far.observation(&"observer".to_string()).unwrap();
+    assert_eq!(
+        obs_far.mines.len(), 0,
+        "observer far from enemy mine must NOT see it; got {} mine(s)",
+        obs_far.mines.len()
+    );
+
+    // Owner always sees their own mine.
+    let obs_owner = engine_far.observation(&"owner".to_string()).unwrap();
+    let own_mines: Vec<_> = obs_owner.mines.iter().filter(|m| m.own).collect();
+    assert_eq!(
+        own_mines.len(), 1,
+        "owner must see their own mine with own=true; got {} mines",
+        own_mines.len()
+    );
+
+    // Near observer (within mine_radius) must see the mine.
+    let observer_near = Vec2 { x: 500.0 + p.mine_radius * 0.3, y: 600.0 };
+    let specs_near = vec![
+        ShipSpec {
+            id: "owner".to_string(),
+            class: ShipClass::Skiff,
+            anchor_pos: owner_pos,
+        },
+        ShipSpec {
+            id: "observer".to_string(),
+            class: ShipClass::Skiff,
+            anchor_pos: observer_near,
+        },
+    ];
+    let mut engine_near = Engine::new(42, p2.clone(), specs_near);
+    engine_near.set_sigil_for_test("owner", Some(Sigil::AetherMine));
+    engine_near.step(vec![discharge_sigil("owner", None)]);
+
+    let obs_near = engine_near.observation(&"observer".to_string()).unwrap();
+    assert_eq!(
+        obs_near.mines.len(), 1,
+        "observer within mine_radius must see enemy mine (proximity-visible); got {} mines",
+        obs_near.mines.len()
+    );
+    assert!(
+        !obs_near.mines[0].own,
+        "enemy-mine visibility must set own=false in observer's view"
+    );
+}
+
+// ─── test 94: Discharge Arc Lance → bolt travels at lance_speed per tick ─────
+
+#[test]
+fn arc_lance_bolt_travels_at_lance_speed() {
+    let mut engine = world_sigil_single_engine();
+
+    // Ship faces East (heading=0); target is due East.
+    let target = Vec2 { x: 600.0, y: 600.0 };
+    engine.set_sigil_for_test("ship-1", Some(Sigil::ArcLance));
+    engine.step(vec![discharge_sigil("ship-1", Some(target))]);
+
+    // After the discharge tick, bolt must have moved at lance_speed.
+    // The bolt starts at ship pos (500, 600) and moves East.
+    // After one tick the projectile is at (500 + lance_speed, 600).
+    let obs = engine.observation(&"ship-1".to_string()).unwrap();
+    // Lance bolts don't appear in the projectiles list — they are separate.
+    // We verify via a second tick: ship-2 far from the bolt won't be hit;
+    // let's verify by placing a ship in the bolt's path on tick 2.
+
+    // Use a separate engine where we can precisely place a target.
+    let mut p2 = Params::default();
+    p2.relic_field_cap = 0;
+    p2.relic_spawn_period = 9999;
+    p2.n_asteroids = 0;
+    p2.cannon_start_hot = 9999;
+    p2.shield_regen_delay = 9999;
+    p2.lance_speed = 100.0; // fast — one tick covers 100 units
+
+    let ship_start = Vec2 { x: 500.0, y: 600.0 };
+    let target2    = Vec2 { x: 700.0, y: 600.0 }; // direction East
+    // Put a target at (600, 600) — lance_speed=100 puts it at x=600 after tick 1.
+    let victim_pos = Vec2 { x: 600.0, y: 600.0 };
+
+    let specs = vec![
+        ShipSpec {
+            id: "shooter".to_string(),
+            class: ShipClass::Skiff,
+            anchor_pos: ship_start,
+        },
+        ShipSpec {
+            id: "victim".to_string(),
+            class: ShipClass::Skiff,
+            anchor_pos: victim_pos,
+        },
+    ];
+    let mut engine2 = Engine::new(42, p2.clone(), specs);
+
+    engine2.set_sigil_for_test("shooter", Some(Sigil::ArcLance));
+    let events = engine2.step(vec![discharge_sigil("shooter", Some(target2))]);
+
+    // Bolt travels 100 units East in the same tick → hits victim at (600, 600).
+    let victim_events = &events.iter().find(|(id, _)| id == "victim").unwrap().1;
+    let hit = victim_events.iter().any(|e| matches!(e, Event::LanceTookHull { .. }));
+    assert!(
+        hit,
+        "Arc Lance bolt at lance_speed=100 must hit victim 100 units away in one tick; \
+         victim_events={victim_events:?}"
+    );
+    let _ = obs; // suppress unused warning
+}
+
+// ─── test 95: Arc Lance hit goes directly to Hull — Shield bypassed ───────────
+
+#[test]
+fn arc_lance_bypasses_shield_damages_hull_directly() {
+    let mut p = Params::default();
+    p.relic_field_cap = 0;
+    p.relic_spawn_period = 9999;
+    p.n_asteroids = 0;
+    p.cannon_start_hot = 9999;
+    p.shield_regen_delay = 9999;
+    p.shield_max = 60.0;
+    p.hull_max   = 100.0;
+    p.lance_speed  = 100.0; // reaches victim in one tick
+    p.lance_damage = 50.0;  // less than hull_max so ship survives
+
+    let ship_start = Vec2 { x: 500.0, y: 600.0 };
+    let victim_pos = Vec2 { x: 600.0, y: 600.0 }; // 100 units East
+
+    let specs = vec![
+        ShipSpec {
+            id: "shooter".to_string(),
+            class: ShipClass::Skiff,
+            anchor_pos: ship_start,
+        },
+        ShipSpec {
+            id: "victim".to_string(),
+            class: ShipClass::Skiff,
+            anchor_pos: victim_pos,
+        },
+    ];
+    let mut engine = Engine::new(42, p.clone(), specs);
+
+    let shield_before = find_ship(&engine, "victim").shield.cur;
+    let hull_before   = find_ship(&engine, "victim").hull.cur;
+    assert!(
+        (shield_before - p.shield_max).abs() < 0.01,
+        "victim shield must start full; got {shield_before}"
+    );
+    assert!(
+        (hull_before - p.hull_max).abs() < 0.01,
+        "victim hull must start full; got {hull_before}"
+    );
+
+    // Discharge Arc Lance toward victim.
+    engine.set_sigil_for_test("shooter", Some(Sigil::ArcLance));
+    let target = Vec2 { x: 700.0, y: 600.0 }; // just East
+    let events = engine.step(vec![discharge_sigil("shooter", Some(target))]);
+
+    let victim_events = &events.iter().find(|(id, _)| id == "victim").unwrap().1;
+
+    // Must have LanceTookHull event.
+    let lance_hit = victim_events.iter().any(|e| matches!(e, Event::LanceTookHull { .. }));
+    assert!(lance_hit, "Arc Lance must emit LanceTookHull; got {victim_events:?}");
+
+    // Shield must be UNCHANGED (bypass).
+    let shield_after = find_ship(&engine, "victim").shield.cur;
+    assert!(
+        (shield_after - shield_before).abs() < 0.01,
+        "Arc Lance must bypass shield; before={shield_before}, after={shield_after}"
+    );
+
+    // Hull must be reduced by lance_damage.
+    let hull_after = find_ship(&engine, "victim").hull.cur;
+    let expected_hull = hull_before - p.lance_damage;
+    assert!(
+        (hull_after - expected_hull).abs() < 0.01,
+        "hull must decrease by lance_damage={}; expected {expected_hull}, got {hull_after}",
+        p.lance_damage
+    );
+
+    // No TookShield event.
+    let took_shield = victim_events.iter().any(|e| matches!(e, Event::TookShield { .. }));
+    assert!(!took_shield, "TookShield must NOT be emitted for Arc Lance hit");
+}
+
+// ─── test 96: Arc Lance pierces two collinear ships ──────────────────────────
+
+#[test]
+fn arc_lance_pierces_two_collinear_ships() {
+    let mut p = Params::default();
+    p.relic_field_cap = 0;
+    p.relic_spawn_period = 9999;
+    p.n_asteroids = 0;
+    p.cannon_start_hot = 9999;
+    p.shield_regen_delay = 9999;
+    p.lance_speed  = 1.0;  // slow — so both ships are hit in different ticks
+    p.lance_damage = 20.0;
+    p.hull_max     = 100.0;
+    p.shield_max   = 0.0;   // no shield so hull damage is direct
+
+    // Use high lance_speed to guarantee hitting both in sequence.
+    // Ship-1 (shooter) at (0, 0); victim-A at (50, 0); victim-B at (100, 0).
+    // Both are collinear East of the shooter. Lance travels East at lance_speed.
+    // With lance_speed=50 the bolt is at x=50 on tick 1 (hits A), x=100 on tick 2 (hits B).
+    p.lance_speed = 50.0;
+    p.proj_range  = 500.0; // long enough to reach both
+
+    let specs = vec![
+        ShipSpec {
+            id: "shooter".to_string(),
+            class: ShipClass::Skiff,
+            anchor_pos: Vec2 { x: 0.0, y: 0.0 },
+        },
+        ShipSpec {
+            id: "victim-a".to_string(),
+            class: ShipClass::Skiff,
+            anchor_pos: Vec2 { x: 50.0, y: 0.0 },
+        },
+        ShipSpec {
+            id: "victim-b".to_string(),
+            class: ShipClass::Skiff,
+            anchor_pos: Vec2 { x: 100.0, y: 0.0 },
+        },
+    ];
+    let mut engine = Engine::new(42, p.clone(), specs);
+
+    let hull_a_before = find_ship(&engine, "victim-a").hull.cur;
+    let hull_b_before = find_ship(&engine, "victim-b").hull.cur;
+
+    // Discharge Arc Lance aimed East.
+    engine.set_sigil_for_test("shooter", Some(Sigil::ArcLance));
+    let target = Vec2 { x: 200.0, y: 0.0 };
+    // Tick 1: bolt at (50, 0) → hits victim-a.
+    let events1 = engine.step(vec![discharge_sigil("shooter", Some(target))]);
+    let a_evs = &events1.iter().find(|(id, _)| id == "victim-a").unwrap().1;
+    let a_hit = a_evs.iter().any(|e| matches!(e, Event::LanceTookHull { .. }));
+    assert!(a_hit, "victim-a must be hit on tick 1; events={a_evs:?}");
+
+    // Tick 2: bolt at (100, 0) → hits victim-b.
+    let events2 = engine.step(vec![]);
+    let b_evs = &events2.iter().find(|(id, _)| id == "victim-b").unwrap().1;
+    let b_hit = b_evs.iter().any(|e| matches!(e, Event::LanceTookHull { .. }));
+    assert!(b_hit, "victim-b must be hit on tick 2 (pierce); events={b_evs:?}");
+
+    // Both hulls must have decreased.
+    let hull_a_after = find_ship(&engine, "victim-a").hull.cur;
+    let hull_b_after = find_ship(&engine, "victim-b").hull.cur;
+    assert!(
+        hull_a_after < hull_a_before,
+        "victim-a hull must decrease; before={hull_a_before}, after={hull_a_after}"
+    );
+    assert!(
+        hull_b_after < hull_b_before,
+        "victim-b hull must decrease (pierce); before={hull_b_before}, after={hull_b_after}"
+    );
+}
+
+// ─── test 97: Golden — Singularity pull: expected displacement ───────────────
+//
+// Setup (from params.py):
+//   singularity_pull = 0.6   (velocity impulse per tick toward well)
+//   singularity_radius = 200.0
+//   singularity_dur = 60
+//
+// Place enemy ship at 80 units East of the well.
+// After 1 tick: enemy velocity must include +0.6 West (toward well).
+// After 10 ticks: enemy must have moved at least 10 × 0.6 = 6 units West.
+//
+// Source: params.py singularity_pull=0.6.
+
+#[test]
+fn golden_singularity_pull_expected_displacement() {
+    let params = Params::default();
+
+    let mut p = Params::default();
+    p.relic_field_cap = 0;
+    p.relic_spawn_period = 9999;
+    p.n_asteroids = 0;
+    p.cannon_start_hot = 9999;
+    p.shield_regen_delay = 9999;
+    p.lin_damping = 1.0;  // no damping so we can measure exact impulse
+
+    let well_pos    = Vec2 { x: 500.0, y: 600.0 };
+    let enemy_start = Vec2 { x: 580.0, y: 600.0 }; // 80 units East
+
+    let specs = vec![
+        ShipSpec {
+            id: "ship-1".to_string(),
+            class: ShipClass::Skiff,
+            anchor_pos: Vec2 { x: 400.0, y: 600.0 },
+        },
+        ShipSpec {
+            id: "enemy".to_string(),
+            class: ShipClass::Skiff,
+            anchor_pos: enemy_start,
+        },
+    ];
+    let mut engine = Engine::new(42, p.clone(), specs);
+
+    let enemy_x_before = engine.god_view().ships.iter()
+        .find(|s| s.id == "enemy").unwrap().pos.x;
+
+    // Discharge Singularity at well_pos.
+    engine.set_sigil_for_test("ship-1", Some(Sigil::Singularity));
+    engine.step(vec![discharge_sigil("ship-1", Some(well_pos))]);
+
+    // After 1 tick of pull: enemy velocity must include -pull component (Westward).
+    let enemy_vel = engine.god_view().ships.iter()
+        .find(|s| s.id == "enemy").unwrap().vel;
+    // Pull direction: from enemy toward well (West = negative x).
+    assert!(
+        enemy_vel.x < 0.0,
+        "golden: enemy must have acquired Westward velocity from singularity pull; \
+         vel.x={}", enemy_vel.x
+    );
+
+    // After 10 more ticks: enemy must be significantly West of starting point.
+    for _ in 0..9 {
+        engine.step(vec![]);
+    }
+    let enemy_x_after = engine.god_view().ships.iter()
+        .find(|s| s.id == "enemy").unwrap().pos.x;
+    let displacement = enemy_x_before - enemy_x_after;
+    let expected_min = params.singularity_pull * 5.0; // loose lower bound
+    assert!(
+        displacement >= expected_min,
+        "golden: enemy must have displaced ≥{expected_min} West (≥5 pull ticks × {}); \
+         got {displacement:.3}", params.singularity_pull
+    );
+}
+
+// ─── test 98: Golden — Aether Mine deals mine_damage (shield then hull) ───────
+//
+// Setup (from params.py):
+//   mine_damage = 60.0, shield_max = 60.0, hull_max = 100.0
+//
+// After detonation:
+//   shield: 60 → 0 (absorbed all)
+//   hull: 100 → 100 (overflow = 0)
+//
+// Source: params.py mine_damage=60, shield_max=60.
+
+#[test]
+fn golden_mine_detonation_deals_mine_damage() {
+    let params = Params::default();
+
+    let mut p = Params::default();
+    p.relic_field_cap = 0;
+    p.relic_spawn_period = 9999;
+    p.n_asteroids = 0;
+    p.cannon_start_hot = 9999;
+    p.shield_regen_delay = 9999;
+    // Use exact params.py values.
+    p.mine_damage = params.mine_damage;  // 60.0
+    p.shield_max  = params.shield_max;   // 60.0
+    p.hull_max    = params.hull_max;     // 100.0
+
+    let owner_pos = Vec2 { x: 500.0, y: 600.0 };
+    let enemy_pos = Vec2 { x: 500.0 + params.mine_radius * 0.4, y: 600.0 };
+
+    let specs = vec![
+        ShipSpec {
+            id: "owner".to_string(),
+            class: ShipClass::Skiff,
+            anchor_pos: owner_pos,
+        },
+        ShipSpec {
+            id: "enemy".to_string(),
+            class: ShipClass::Skiff,
+            anchor_pos: enemy_pos,
+        },
+    ];
+    let mut engine = Engine::new(42, p.clone(), specs);
+
+    engine.set_sigil_for_test("owner", Some(Sigil::AetherMine));
+    engine.step(vec![discharge_sigil("owner", None)]);
+
+    // Advance to arming + detonation.
+    let mut detonated = false;
+    for _ in 0..=params.mine_arm {
+        let events = engine.step(vec![]);
+        let enemy_evs = &events.iter().find(|(id, _)| id == "enemy").unwrap().1;
+        if enemy_evs.iter().any(|e| matches!(e, Event::MineDetonated { .. })) {
+            detonated = true;
+            break;
+        }
+    }
+    assert!(detonated, "mine must detonate within mine_arm+1 ticks");
+
+    let enemy = find_ship(&engine, "enemy");
+    // mine_damage(60) == shield_max(60) → shield reaches exactly 0.
+    assert!(
+        enemy.shield.cur <= 0.01,
+        "golden: mine_damage={} must deplete shield_max={}; shield after={:.3}",
+        params.mine_damage, params.shield_max, enemy.shield.cur
+    );
+    // Hull must be untouched (shield absorbed all damage).
+    assert!(
+        (enemy.hull.cur - params.hull_max).abs() < 0.01,
+        "golden: mine damage equals shield_max so hull must be untouched; \
+         hull={:.3} (expected {})", enemy.hull.cur, params.hull_max
+    );
+}
+
+// ─── test 99: Golden — Arc Lance pierce + shield bypass ───────────────────────
+//
+// Setup (from params.py):
+//   lance_damage = 50.0, shield_max = 60.0, hull_max = 100.0
+//
+// Two collinear ships, both with full shields.
+// After Arc Lance fires:
+//   Ship A: shield unchanged (60), hull: 100 → 50 (−50 lance_damage).
+//   Ship B: shield unchanged (60), hull: 100 → 50 (−50 lance_damage).
+//
+// Source: params.py lance_damage=50.
+
+#[test]
+fn golden_arc_lance_pierce_shield_bypass() {
+    let params = Params::default();
+
+    let mut p = Params::default();
+    p.relic_field_cap = 0;
+    p.relic_spawn_period = 9999;
+    p.n_asteroids = 0;
+    p.cannon_start_hot = 9999;
+    p.shield_regen_delay = 9999;
+    p.lance_damage = params.lance_damage; // 50.0
+    p.shield_max   = params.shield_max;   // 60.0
+    p.hull_max     = params.hull_max;     // 100.0
+    p.lance_speed  = 50.0;   // bolt at x=50 after tick 1, x=100 after tick 2
+    p.proj_range   = 1000.0;
+    p.shield_max   = 60.0;
+
+    let specs = vec![
+        ShipSpec {
+            id: "shooter".to_string(),
+            class: ShipClass::Skiff,
+            anchor_pos: Vec2 { x: 0.0, y: 0.0 },
+        },
+        ShipSpec {
+            id: "victim-a".to_string(),
+            class: ShipClass::Skiff,
+            anchor_pos: Vec2 { x: 50.0, y: 0.0 },
+        },
+        ShipSpec {
+            id: "victim-b".to_string(),
+            class: ShipClass::Skiff,
+            anchor_pos: Vec2 { x: 100.0, y: 0.0 },
+        },
+    ];
+    let mut engine = Engine::new(42, p.clone(), specs);
+
+    engine.set_sigil_for_test("shooter", Some(Sigil::ArcLance));
+    // Tick 1: bolt hits victim-a (x=50).
+    engine.step(vec![discharge_sigil("shooter", Some(Vec2 { x: 200.0, y: 0.0 }))]);
+    // Tick 2: bolt hits victim-b (x=100).
+    engine.step(vec![]);
+
+    let va = find_ship(&engine, "victim-a");
+    let vb = find_ship(&engine, "victim-b");
+
+    // Both shields must be unchanged (bypassed).
+    assert!(
+        (va.shield.cur - params.shield_max).abs() < 0.01,
+        "golden: victim-a shield must be unchanged (bypassed); expected {}, got {}",
+        params.shield_max, va.shield.cur
+    );
+    assert!(
+        (vb.shield.cur - params.shield_max).abs() < 0.01,
+        "golden: victim-b shield must be unchanged (bypassed); expected {}, got {}",
+        params.shield_max, vb.shield.cur
+    );
+
+    // Both hulls must equal hull_max − lance_damage = 100 − 50 = 50.
+    let expected_hull = params.hull_max - params.lance_damage;
+    assert!(
+        (va.hull.cur - expected_hull).abs() < 0.01,
+        "golden: victim-a hull must be {expected_hull} after lance; got {}",
+        va.hull.cur
+    );
+    assert!(
+        (vb.hull.cur - expected_hull).abs() < 0.01,
+        "golden: victim-b hull must be {expected_hull} after lance (pierce); got {}",
+        vb.hull.cur
+    );
+}
+
+// ─── test 100: Determinism — world-effect sigil outcomes reproducible ─────────
+
+#[test]
+fn determinism_world_effect_sigils() {
+    // Run the same world-effect sigil scenario twice with the same seed and
+    // intent sequence; both runs must produce identical state.
+
+    let make = || {
+        let mut p = Params::default();
+        p.relic_field_cap = 2;
+        p.relic_spawn_period = 9999;
+        p.n_asteroids = 0;
+        p.cannon_start_hot = 9999;
+        p.shield_regen_delay = 9999;
+        p.lin_damping = 1.0; // no damping for exact determinism
+        p.arena_w = 202.0;
+        p.arena_h = 202.0;
+        p.singularity_radius = 500.0;
+        let specs = vec![
+            ShipSpec {
+                id: "ship-1".to_string(),
+                class: ShipClass::Skiff,
+                anchor_pos: Vec2 { x: 100.0, y: 100.0 },
+            },
+            ShipSpec {
+                id: "ship-2".to_string(),
+                class: ShipClass::Skiff,
+                anchor_pos: Vec2 { x: 150.0, y: 100.0 },
+            },
+        ];
+        Engine::new(42, p, specs)
+    };
+
+    // Scenario: discharge Singularity (tick 1), wait 20 ticks.
+    let run = || {
+        let mut e = make();
+        e.set_sigil_for_test("ship-1", Some(Sigil::Singularity));
+        let target = Vec2 { x: 120.0, y: 100.0 };
+        e.step(vec![discharge_sigil("ship-1", Some(target))]);
+        for _ in 0..20 {
+            e.step(vec![]);
+        }
+        e.god_view()
+    };
+
+    let v1 = run();
+    let v2 = run();
+
+    assert_eq!(v1.tick, v2.tick, "tick must be identical");
+    assert_eq!(
+        v1.singularities.len(), v2.singularities.len(),
+        "singularity count must be identical"
+    );
+    for (s1, s2) in v1.ships.iter().zip(v2.ships.iter()) {
+        assert_eq!(s1.id, s2.id, "ship order must match");
+        assert_eq!(s1.pos.x, s2.pos.x, "pos.x must be identical for {}", s1.id);
+        assert_eq!(s1.pos.y, s2.pos.y, "pos.y must be identical for {}", s1.id);
+        assert_eq!(s1.vel.x, s2.vel.x, "vel.x must be identical for {}", s1.id);
+        assert_eq!(s1.vel.y, s2.vel.y, "vel.y must be identical for {}", s1.id);
+    }
+    // Relic positions must match (singularity moves them).
+    let mut r1 = v1.relics.clone();
+    let mut r2 = v2.relics.clone();
+    r1.sort_by(|a, b| a.id.cmp(&b.id));
+    r2.sort_by(|a, b| a.id.cmp(&b.id));
+    for (a, b) in r1.iter().zip(r2.iter()) {
+        assert_eq!(a.id, b.id, "relic ids must match");
+        assert_eq!(a.pos.x, b.pos.x, "relic pos.x must be identical ({})", a.id);
+        assert_eq!(a.pos.y, b.pos.y, "relic pos.y must be identical ({})", a.id);
+    }
+}

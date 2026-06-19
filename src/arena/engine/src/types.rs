@@ -178,4 +178,15 @@ pub enum Event {
     /// The Bulwark damage-immunity window has elapsed; `invuln` is now false.
     /// Emitted at the end of the last protected tick.
     BulwarkExpired,
+
+    // ── Issue 10: World-effect Sigil events ───────────────────────────────
+    /// A Singularity gravity well was deployed (emitted to the discharging ship).
+    SingularityDeployed { id: String, pos: Vec2 },
+    /// An Aether Mine was dropped at `pos` (emitted to the mine owner).
+    MineDeployed { id: String, pos: Vec2 },
+    /// An Aether Mine detonated; emitted to every ship that took the blast.
+    MineDetonated { mine_id: String, pos: Vec2 },
+    /// The ship's Hull took `amount` direct damage from an Arc Lance bolt fired
+    /// by `by`. Shields are bypassed entirely.
+    LanceTookHull { amount: f32, by: ShipId },
 }

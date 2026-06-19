@@ -34,23 +34,34 @@ const SIGILS: &[Sigil] = &[
 /// **Effect-dispatch seam** — called immediately after the Sigil is removed
 /// from `ship.sigil` during a discharge Intent.
 ///
-/// `ship` is mutated for state changes; `params` provides tuning constants;
-/// `events` accumulates additional per-ship events beyond `SigilDischarged`
-/// (e.g. the implicit start of the Afterburner window — the expiry events are
-/// emitted by the tick-down block at the end of `Engine::step`).
+/// For **self-buff** Sigils (Afterburner, Bulwark) the function mutates `ship`
+/// directly and returns `SigilWorldEffect::None`.
 ///
-/// Signature for issue 10 (Singularity, AetherMine, ArcLance):
-///   fn dispatch_sigil_effect(sigil, ship, params, events)
-/// where `events` is the ship's own per-tick `Vec<Event>`.  Issue 10 will also
-/// need access to `self.relics` / `self.rng` / world state for placement;
-/// those can be passed as additional parameters or handled by returning a
-/// command enum — document in ADR when the shape is finalised.
+/// For **world-effect** Sigils (Singularity, AetherMine, ArcLance) the function
+/// returns a `SigilWorldEffect` command that `Engine::step` processes after the
+/// per-ship loop, where it has full access to world state (singularities, mines,
+/// rng, etc.).  The `sigil_target` from the incoming Intent is passed in as
+/// `target_hint`; if absent the caller should pass `None` and the arm falls back
+/// to the discharging ship's current position / heading.
+///
+/// ADR: World-effect dispatch uses the "return-a-command" pattern to avoid
+/// borrow-checker issues (ship is mutably borrowed inside the sigil loop; we
+/// can't also mutably borrow self.singularities etc. at the same time).
+#[derive(Debug)]
+enum SigilWorldEffect {
+    None,
+    DeploySingularity { owner: ShipId, pos: Vec2 },
+    DropMine          { owner: ShipId, pos: Vec2 },
+    FireLance         { owner: ShipId, pos: Vec2, heading: f32 },
+}
+
 fn dispatch_sigil_effect(
     sigil: &Sigil,
     ship: &mut ShipState,
     params: &Params,
     _events: &mut Vec<Event>,
-) {
+    target_hint: Option<Vec2>,
+) -> SigilWorldEffect {
     match sigil {
         Sigil::Afterburner => {
             // Sustained thrust/speed boost for afterburner_dur ticks.
@@ -58,6 +69,7 @@ fn dispatch_sigil_effect(
             // step, so the ship gets exactly afterburner_dur boosted physics
             // ticks starting from the step after discharge.
             ship.afterburner_ticks_left = params.afterburner_dur + 1;
+            SigilWorldEffect::None
         }
         Sigil::Bulwark => {
             // Overcharge Shield to shield_max and grant damage immunity for
@@ -72,10 +84,36 @@ fn dispatch_sigil_effect(
             ship.invuln = true;
             ship.invuln_ticks_left = params.bulwark_immunity + 1;
             ship.bulwark_ticks_left = params.bulwark_immunity + 1;
+            SigilWorldEffect::None
         }
-        Sigil::Singularity => { /* Issue 10: deploy gravity-well at sigil_target */ }
-        Sigil::AetherMine  => { /* Issue 10: drop proximity mine at ship position */ }
-        Sigil::ArcLance    => { /* Issue 10: fire piercing bolt toward sigil_target */ }
+        Sigil::Singularity => {
+            // Deploy gravity well at sigil_target (or ship position if no target).
+            let pos = target_hint.unwrap_or(ship.pos);
+            SigilWorldEffect::DeploySingularity { owner: ship.id.clone(), pos }
+        }
+        Sigil::AetherMine => {
+            // Drop a proximity mine at the ship's current position.
+            SigilWorldEffect::DropMine { owner: ship.id.clone(), pos: ship.pos }
+        }
+        Sigil::ArcLance => {
+            // Fire a piercing bolt toward sigil_target (or along current heading).
+            let heading = if let Some(t) = target_hint {
+                let dx = t.x - ship.pos.x;
+                let dy = t.y - ship.pos.y;
+                if dx.abs() > 1e-6 || dy.abs() > 1e-6 {
+                    dy.atan2(dx)
+                } else {
+                    ship.heading
+                }
+            } else {
+                ship.heading
+            };
+            SigilWorldEffect::FireLance {
+                owner: ship.id.clone(),
+                pos: ship.pos,
+                heading,
+            }
+        }
     }
 }
 
@@ -190,6 +228,75 @@ impl ProjectileState {
             owner: self.owner.clone(),
         }
     }
+}
+
+// ─── Internal Singularity state ───────────────────────────────────────────────
+
+/// A Singularity gravity well deployed in the Drift (engine-internal).
+/// Converted to `SingularityView` on `observation` / `god_view` queries.
+struct SingularityState {
+    id: String,
+    pos: Vec2,
+    /// Owner ship — the singularity is visible to everyone but its origin is tracked
+    /// for future anti-grief rules.
+    #[allow(dead_code)]
+    owner: ShipId,
+    /// Remaining ticks before the well collapses (expires when reaches 0).
+    ticks_left: u32,
+}
+
+impl SingularityState {
+    fn to_view(&self, radius: f32) -> SingularityView {
+        SingularityView {
+            id: self.id.clone(),
+            pos: self.pos,
+            radius,
+            ticks_left: self.ticks_left,
+        }
+    }
+}
+
+// ─── Internal Mine state ──────────────────────────────────────────────────────
+
+/// An Aether Mine lying in the Drift (engine-internal).
+/// Converted to `MineView` on `observation` / `god_view` queries.
+/// Visibility rules (PROTOCOL §6):
+///   - Owner always sees their own mine (`own = true`).
+///   - Enemy ships see it only when within `mine_radius` (proximity-visible).
+struct MineState {
+    id: String,
+    pos: Vec2,
+    owner: ShipId,
+    /// Ticks until the mine is armed and can detonate.
+    /// Counts down from `params.mine_arm`; 0 means armed and ready.
+    arm_ticks_left: u32,
+}
+
+impl MineState {
+    fn to_view(&self, own: bool) -> MineView {
+        MineView {
+            id: self.id.clone(),
+            pos: self.pos,
+            own,
+        }
+    }
+}
+
+// ─── Internal Arc Lance bolt state ────────────────────────────────────────────
+
+/// A fast, piercing Arc Lance bolt in flight (engine-internal).
+/// Unlike rune-cannon projectiles, lance bolts:
+///   - Travel at `lance_speed` per tick.
+///   - Bypass Shield: deal `lance_damage` directly to Hull.
+///   - Pierce: do NOT stop on first hit; continue until range is exhausted.
+struct LanceBoltState {
+    #[allow(dead_code)]
+    id: String,
+    pos: Vec2,
+    vel: Vec2,
+    owner: ShipId,
+    /// Cumulative distance traveled; bolt despawns at `params.proj_range`.
+    dist_traveled: f32,
 }
 
 // ─── Internal ship state ──────────────────────────────────────────────────────
@@ -404,6 +511,19 @@ pub struct Engine {
     /// Monotonically-increasing counter for unique asteroid IDs.
     #[allow(dead_code)] // reserved for future asteroid respawning
     asteroid_id_counter: u32,
+    // ── Issue 10: World-effect Sigil state ─────────────────────────────────────
+    /// Active Singularity gravity wells.
+    singularities: Vec<SingularityState>,
+    /// Monotonically-increasing counter for unique singularity IDs.
+    singularity_id_counter: u32,
+    /// Aether Mines in the Drift (armed or arming).
+    mines: Vec<MineState>,
+    /// Monotonically-increasing counter for unique mine IDs.
+    mine_id_counter: u32,
+    /// Arc Lance bolts in flight (pierce-capable, shield-bypassing).
+    lance_bolts: Vec<LanceBoltState>,
+    /// Monotonically-increasing counter for unique lance bolt IDs.
+    lance_id_counter: u32,
 }
 
 impl Engine {
@@ -525,6 +645,12 @@ impl Engine {
             proj_id_counter: 0,
             asteroids,
             asteroid_id_counter,
+            singularities: Vec::new(),
+            singularity_id_counter: 0,
+            mines: Vec::new(),
+            mine_id_counter: 0,
+            lance_bolts: Vec::new(),
+            lance_id_counter: 0,
         }
     }
 
@@ -1046,7 +1172,14 @@ impl Engine {
         //
         // Sigil is one-shot — not persisted in `PersistedIntent`; read directly from
         // the raw incoming intents map.
+        //
+        // World-effect commands (Singularity / AetherMine / ArcLance) are returned
+        // as SigilWorldEffect values and executed AFTER the per-ship loop so we can
+        // mutably borrow self.singularities / self.mines / self.lance_bolts without
+        // conflicting with the ship borrow above.
         {
+            let mut world_effects: Vec<SigilWorldEffect> = Vec::new();
+
             for (id, intent) in &intents {
                 if intent.sigil != Some(true) {
                     continue;
@@ -1056,17 +1189,76 @@ impl Engine {
                         continue;
                     }
                     if let Some(sigil) = ship.sigil.take() {
-                        // Effect-dispatch seam: issues 09 & 10 fill the arms.
                         let ship_ev_vec = ship_events
                             .entry(ship.id.clone())
                             .or_default();
-                        dispatch_sigil_effect(&sigil, ship, &self.params, ship_ev_vec);
+                        let target_hint = intent.sigil_target;
+                        let world_cmd = dispatch_sigil_effect(
+                            &sigil,
+                            ship,
+                            &self.params,
+                            ship_ev_vec,
+                            target_hint,
+                        );
                         ship_events
                             .entry(ship.id.clone())
                             .or_default()
                             .push(Event::SigilDischarged { which: sigil });
+                        world_effects.push(world_cmd);
                     }
-                    // With none held: no-op (no event, ship state unchanged).
+                    // With none held: no-op (no event, no state change).
+                }
+            }
+
+            // Process world-effect commands now that ship borrows are released.
+            for cmd in world_effects {
+                match cmd {
+                    SigilWorldEffect::None => {}
+                    SigilWorldEffect::DeploySingularity { owner, pos } => {
+                        let id = format!("sing-{}", self.singularity_id_counter);
+                        self.singularity_id_counter += 1;
+                        ship_events
+                            .entry(owner.clone())
+                            .or_default()
+                            .push(Event::SingularityDeployed { id: id.clone(), pos });
+                        self.singularities.push(SingularityState {
+                            id,
+                            pos,
+                            owner,
+                            // "+1" compensates for the tick-down that runs later in the
+                            // same step, so the well lasts exactly `singularity_dur`
+                            // MORE steps (total pull count = singularity_dur + 1 including
+                            // the discharge step, matching the pattern of Afterburner/Bulwark).
+                            ticks_left: self.params.singularity_dur + 1,
+                        });
+                    }
+                    SigilWorldEffect::DropMine { owner, pos } => {
+                        let id = format!("mine-{}", self.mine_id_counter);
+                        self.mine_id_counter += 1;
+                        ship_events
+                            .entry(owner.clone())
+                            .or_default()
+                            .push(Event::MineDeployed { id: id.clone(), pos });
+                        self.mines.push(MineState {
+                            id,
+                            pos,
+                            owner,
+                            arm_ticks_left: self.params.mine_arm,
+                        });
+                    }
+                    SigilWorldEffect::FireLance { owner, pos, heading } => {
+                        let id = format!("lance-{}", self.lance_id_counter);
+                        self.lance_id_counter += 1;
+                        let vx = heading.cos() * self.params.lance_speed;
+                        let vy = heading.sin() * self.params.lance_speed;
+                        self.lance_bolts.push(LanceBoltState {
+                            id,
+                            pos,
+                            vel: Vec2::new(vx, vy),
+                            owner,
+                            dist_traveled: 0.0,
+                        });
+                    }
                 }
             }
         }
@@ -1283,22 +1475,225 @@ impl Engine {
             }
         }
 
+        // ── Issue 10: Singularity tick-down and gravitational pull ───────────
+        //
+        // Each active singularity:
+        //   1. Pulls each alive non-owner enemy ship within singularity_radius
+        //      toward the well center by singularity_pull units/tick (velocity impulse).
+        //   2. Pulls each loose Relic within singularity_radius toward the center
+        //      by singularity_pull units/tick (direct position adjustment).
+        //   3. Decrements ticks_left; removes the well when it reaches 0.
+        {
+            let sing_radius  = self.params.singularity_radius;
+            let sing_pull    = self.params.singularity_pull;
+
+            // Use indices to avoid simultaneous mutable borrows.
+            let mut expired: Vec<usize> = Vec::new();
+            for (si, sing) in self.singularities.iter_mut().enumerate() {
+                // Pull enemy ships.
+                for ship in &mut self.ships {
+                    if !ship.alive { continue; }
+                    let dx = sing.pos.x - ship.pos.x;
+                    let dy = sing.pos.y - ship.pos.y;
+                    let dist_sq = dx * dx + dy * dy;
+                    if dist_sq < sing_radius * sing_radius && dist_sq > 0.0 {
+                        let dist = dist_sq.sqrt();
+                        let nx = dx / dist;
+                        let ny = dy / dist;
+                        ship.vel.x += nx * sing_pull;
+                        ship.vel.y += ny * sing_pull;
+                        // Reclamp to effective_max_speed to avoid singularity exploits.
+                        let spd = (ship.vel.x * ship.vel.x + ship.vel.y * ship.vel.y).sqrt();
+                        let cap = if ship.afterburner_ticks_left > 0 {
+                            self.params.max_speed * self.params.afterburner_speed_mult
+                        } else {
+                            self.params.max_speed
+                        };
+                        if spd > cap {
+                            let s = cap / spd;
+                            ship.vel.x *= s;
+                            ship.vel.y *= s;
+                        }
+                    }
+                }
+
+                // Pull loose relics.
+                for relic in &mut self.relics {
+                    let dx = sing.pos.x - relic.pos.x;
+                    let dy = sing.pos.y - relic.pos.y;
+                    let dist_sq = dx * dx + dy * dy;
+                    if dist_sq < sing_radius * sing_radius && dist_sq > 0.0 {
+                        let dist = dist_sq.sqrt();
+                        relic.pos.x += (dx / dist) * sing_pull;
+                        relic.pos.y += (dy / dist) * sing_pull;
+                    }
+                }
+
+                // Tick-down.
+                if sing.ticks_left > 0 {
+                    sing.ticks_left -= 1;
+                }
+                if sing.ticks_left == 0 {
+                    expired.push(si);
+                }
+            }
+            // Remove expired (in reverse order to preserve indices).
+            for si in expired.into_iter().rev() {
+                self.singularities.swap_remove(si);
+            }
+        }
+
+        // ── Issue 10: Aether Mine arm-down, proximity check, detonation ──────
+        //
+        // Each tick:
+        //   1. Decrement arm_ticks_left until it reaches 0 (mine is armed).
+        //   2. For armed mines: check each alive enemy ship within mine_radius;
+        //      if any, detonate (apply_env_damage with mine_damage; schedule
+        //      respawn if lethal; emit MineDetonated to all ships in range).
+        //   3. Remove detonated mines.
+        {
+            let mine_r    = self.params.mine_radius;
+            let mine_dmg  = self.params.mine_damage;
+            let respawn_d = self.params.respawn_delay;
+
+            let mut mines_to_keep: Vec<MineState> = Vec::new();
+            let mines = std::mem::take(&mut self.mines);
+
+            for mut mine in mines {
+                // Arm tick-down.
+                if mine.arm_ticks_left > 0 {
+                    mine.arm_ticks_left -= 1;
+                    mines_to_keep.push(mine);
+                    continue;
+                }
+
+                // Check for enemy ships within mine_radius.
+                let mut detonated = false;
+                let mut env_deaths: Vec<(ShipId, Vec2, u32)> = Vec::new();
+                for ship in &mut self.ships {
+                    if !ship.alive || ship.id == mine.owner {
+                        continue;
+                    }
+                    let dx = ship.pos.x - mine.pos.x;
+                    let dy = ship.pos.y - mine.pos.y;
+                    if dx * dx + dy * dy < mine_r * mine_r {
+                        detonated = true;
+                        if apply_env_damage(ship, mine_dmg, &mut ship_events) {
+                            env_deaths.push((ship.id.clone(), ship.pos, ship.relics_carried));
+                            ship.relics_carried     = 0;
+                            ship.respawn_ticks_left = respawn_d;
+                        }
+                        // Emit MineDetonated to the ship that triggered it.
+                        ship_events
+                            .entry(ship.id.clone())
+                            .or_default()
+                            .push(Event::MineDetonated {
+                                mine_id: mine.id.clone(),
+                                pos: mine.pos,
+                            });
+                    }
+                }
+
+                if detonated {
+                    // Drop relics from mine-killed ships.
+                    let scatter = self.params.ship_radius * 1.5;
+                    for (id, pos, count) in env_deaths {
+                        for _ in 0..count {
+                            let angle: f32 = self.rng.random_range(0.0..TAU);
+                            let r: f32     = self.rng.random_range(0.0..scatter);
+                            let rp = Vec2::new(pos.x + angle.cos() * r, pos.y + angle.sin() * r);
+                            let rid = format!("relic-{}", self.relic_id_counter);
+                            self.relic_id_counter += 1;
+                            self.relics.push(RelicState { id: rid.clone(), pos: rp });
+                            ship_events
+                                .entry(id.clone())
+                                .or_default()
+                                .push(Event::RelicDropped { relic_id: rid, pos: rp });
+                        }
+                    }
+                    // Mine is consumed; do NOT push to mines_to_keep.
+                } else {
+                    mines_to_keep.push(mine);
+                }
+            }
+            self.mines = mines_to_keep;
+        }
+
+        // ── Issue 10: Arc Lance bolt movement, hit detection, and damage ──────
+        //
+        // Lance bolts travel at lance_speed per tick, pierce through all ships
+        // in their path, and bypass shields (damage goes directly to Hull).
+        // They use the same proj_range limit as rune-cannon projectiles.
+        {
+            let ship_r_sq   = self.params.ship_radius * self.params.ship_radius;
+            let lance_range = self.params.proj_range;
+            let lance_dmg   = self.params.lance_damage;
+            let respawn_d   = self.params.respawn_delay;
+
+            let bolts = std::mem::take(&mut self.lance_bolts);
+            let mut alive_bolts: Vec<LanceBoltState> = Vec::new();
+
+            for mut bolt in bolts {
+                // Move bolt.
+                bolt.pos.x += bolt.vel.x;
+                bolt.pos.y += bolt.vel.y;
+                let step_d = (bolt.vel.x * bolt.vel.x + bolt.vel.y * bolt.vel.y).sqrt();
+                bolt.dist_traveled += step_d;
+
+                // Range despawn.
+                if bolt.dist_traveled >= lance_range {
+                    continue;
+                }
+
+                // Hit detection — pierce ALL ships in range (not just first).
+                let mut env_deaths: Vec<(ShipId, Vec2, u32)> = Vec::new();
+                for ship in &mut self.ships {
+                    if !ship.alive || ship.id == bolt.owner {
+                        continue;
+                    }
+                    let dx = ship.pos.x - bolt.pos.x;
+                    let dy = ship.pos.y - bolt.pos.y;
+                    if dx * dx + dy * dy < ship_r_sq {
+                        if apply_lance_damage(
+                            ship,
+                            lance_dmg,
+                            &bolt.owner,
+                            &mut ship_events,
+                        ) {
+                            env_deaths.push((ship.id.clone(), ship.pos, ship.relics_carried));
+                            ship.relics_carried     = 0;
+                            ship.respawn_ticks_left = respawn_d;
+                        }
+                    }
+                }
+
+                // Drop relics for lance-killed ships.
+                let scatter = self.params.ship_radius * 1.5;
+                for (id, pos, count) in env_deaths {
+                    for _ in 0..count {
+                        let angle: f32 = self.rng.random_range(0.0..TAU);
+                        let r: f32     = self.rng.random_range(0.0..scatter);
+                        let rp = Vec2::new(pos.x + angle.cos() * r, pos.y + angle.sin() * r);
+                        let rid = format!("relic-{}", self.relic_id_counter);
+                        self.relic_id_counter += 1;
+                        self.relics.push(RelicState { id: rid.clone(), pos: rp });
+                        ship_events
+                            .entry(id.clone())
+                            .or_default()
+                            .push(Event::RelicDropped { relic_id: rid, pos: rp });
+                    }
+                }
+
+                // Bolt keeps flying (pierces — never removed on hit).
+                alive_bolts.push(bolt);
+            }
+            self.lance_bolts = alive_bolts;
+        }
+
         // ── Issue 06: invuln tick-down ────────────────────────────────────────
         //
         // Runs AFTER combat so that a ship's invuln flag is still set during the
-        // combat block on every tick it is counted as "protected".  With this
-        // placement and `invuln_ticks_left = respawn_invuln + 1` at respawn, the
-        // full `respawn_invuln` quota of fire-step blocks is guaranteed:
-        //
-        //   respawn step  : ticks_left = N+1.  Combat runs (blocked if shot at).
-        //                   End-of-step: N+1 → N.
-        //   fire step 0   : ticks_left = N. Combat: blocked. End: N → N-1.
-        //   …
-        //   fire step N-1 : ticks_left = 1. Combat: blocked. End: 1 → 0. invuln = false.
-        //   fire step N   : invuln = false. Damage applies.
-        //
-        // `invuln_ticks_left = 0` with `invuln = true` means the flag was set
-        // externally (e.g. `set_invuln_for_test`) and intentionally never expires.
+        // combat block on every tick it is counted as "protected".
         for ship in &mut self.ships {
             if !ship.alive || !ship.invuln || ship.invuln_ticks_left == 0 {
                 continue;
@@ -1421,11 +1816,34 @@ impl Engine {
                 .collect(),
             asteroids: self.asteroids.iter().map(|a| a.to_view()).collect(),
             projectiles: self.projectiles.iter().map(|p| p.to_view()).collect(),
-            singularities: vec![],
-            mines: vec![],
+            singularities: self
+                .singularities
+                .iter()
+                .map(|s| s.to_view(self.params.singularity_radius))
+                .collect(),
+            // Mine visibility: owner always sees own mines (own=true);
+            // enemy ships see a mine only when within mine_radius (proximity-visible).
+            mines: {
+                let observing_id = &ship.id;
+                let mine_r_sq = self.params.mine_radius * self.params.mine_radius;
+                self.mines
+                    .iter()
+                    .filter_map(|m| {
+                        if &m.owner == observing_id {
+                            Some(m.to_view(true))
+                        } else {
+                            let dx = ship.pos.x - m.pos.x;
+                            let dy = ship.pos.y - m.pos.y;
+                            if dx * dx + dy * dy <= mine_r_sq {
+                                Some(m.to_view(false))
+                            } else {
+                                None // hidden from this observer
+                            }
+                        }
+                    })
+                    .collect()
+            },
             scores: self.scores.clone(),
-            // Events are produced by `step` and will be attached by the server
-            // in a future issue.  The skeleton always returns an empty list.
             events: vec![],
         })
     }
@@ -1459,8 +1877,13 @@ impl Engine {
                 .collect(),
             asteroids: self.asteroids.iter().map(|a| a.to_view()).collect(),
             projectiles: self.projectiles.iter().map(|p| p.to_view()).collect(),
-            singularities: vec![],
-            mines: vec![],
+            singularities: self
+                .singularities
+                .iter()
+                .map(|s| s.to_view(self.params.singularity_radius))
+                .collect(),
+            // God-view shows ALL mines (full state — for replay/viewer).
+            mines: self.mines.iter().map(|m| m.to_view(true)).collect(),
             scores: self.scores.clone(),
         }
     }
@@ -1734,6 +2157,55 @@ fn apply_env_damage(
                 .push(Event::Died { by: None });
             return true;
         }
+    }
+
+    false
+}
+
+/// Apply Arc Lance `damage` to `ship`, bypassing the Shield entirely.
+///
+/// The Arc Lance is a special piercing weapon that deals damage directly to
+/// the Hull, ignoring the Shield value.  Respects spawn-protection / Bulwark
+/// invulnerability (same guard as all other damage sources).
+///
+/// Emits `LanceTookHull { amount, by }` to the target.
+/// Emits `Died { by: None }` on lethal hit (lance kills are unattributed —
+/// no kill bounty; the weapon is too powerful to award score for).
+///
+/// Returns `true` when the hit was lethal.  Caller handles respawn scheduling
+/// and relic drops.
+fn apply_lance_damage(
+    ship: &mut ShipState,
+    damage: f32,
+    by: &ShipId,
+    events: &mut HashMap<ShipId, Vec<Event>>,
+) -> bool {
+    if !ship.alive || damage <= 0.0 || ship.invuln {
+        return false;
+    }
+
+    // Reset shield-regen delay.
+    ship.ticks_since_last_hit = 0;
+
+    // Direct hull damage — Shield is completely bypassed.
+    let applied = damage.min(ship.hull.cur.max(0.0));
+    ship.hull.cur -= applied;
+    if ship.hull.cur < 0.0 {
+        ship.hull.cur = 0.0;
+    }
+
+    events
+        .entry(ship.id.clone())
+        .or_default()
+        .push(Event::LanceTookHull { amount: applied, by: by.clone() });
+
+    if ship.hull.cur <= 0.0 {
+        ship.alive = false;
+        events
+            .entry(ship.id.clone())
+            .or_default()
+            .push(Event::Died { by: None });
+        return true;
     }
 
     false
