@@ -104,7 +104,10 @@ pub struct GodShipView {
 /// The full-world "god-mode" view produced by `Engine::god_view()`.
 /// Sent to the Viewer for the projector and for replay recording.
 /// Bots never receive this — they get `Observation` instead.
-#[derive(Debug, Clone)]
+///
+/// `PartialEq` is derived so the harness replay test can assert that two
+/// independent runs from the same seed + intent-log produce identical views.
+#[derive(Debug, Clone, PartialEq)]
 pub struct GodView {
     pub tick: u32,
     pub max_ticks: u32,

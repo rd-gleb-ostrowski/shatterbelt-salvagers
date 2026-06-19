@@ -12,6 +12,7 @@
 //! Aether, Relic, Anchor, Drift, Sigil, Match, Tick, Observation, Intent, etc.
 
 mod engine;
+pub mod harness;
 mod intent;
 mod observation;
 mod params;

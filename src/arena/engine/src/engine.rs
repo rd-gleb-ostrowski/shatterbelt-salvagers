@@ -344,6 +344,17 @@ struct ShipState {
     /// when set by Bulwark; decremented in sync).  0 means no Bulwark active.
     /// When it reaches 0, `BulwarkExpired` is emitted.
     bulwark_ticks_left: u32,
+    /// Sigil discharge recorded during step 5_sigil this tick, for inclusion in
+    /// the intent log.  `Some(target)` means the ship discharged its Sigil this
+    /// tick (with the given `sigil_target` from the intent, which may be `None`
+    /// for untargeted Sigils).  Cleared when the intent frame is recorded in
+    /// step 6 so that stale values never carry over into the next tick.
+    ///
+    /// Rationale: `sigil` is one-shot and not persisted, so `applied_intent()`
+    /// cannot see it by the time step 6 runs — the Sigil has already been taken
+    /// from `ship.sigil` in step 5_sigil.  This field bridges that gap so the
+    /// intent log captures every discharge for exact replay parity.
+    sigil_discharge_this_tick: Option<Option<Vec2>>,
 }
 
 impl ShipState {
@@ -363,13 +374,17 @@ impl ShipState {
     /// Snapshot the applied (persisted) state as a fully-specified `Intent`
     /// for the intent log.  All Options are `Some` so replayers know exactly
     /// what was applied each tick without re-running the merge logic.
-    fn applied_intent(&self) -> Intent {
+    ///
+    /// `sigil_discharge`: pass `Some(target_hint)` when this ship discharged its
+    /// Sigil this tick (recorded by step 5_sigil into `sigil_discharge_this_tick`).
+    /// The discharge is one-shot and not persisted, so it must be supplied here.
+    fn applied_intent(&self, sigil_discharge: Option<Option<Vec2>>) -> Intent {
         Intent {
             turn: Some(self.persisted.turn),
             thrust: Some(self.persisted.thrust),
             fire: Some(self.persisted.fire),
-            sigil: None,       // one-shot; not persisted
-            sigil_target: None,
+            sigil: sigil_discharge.as_ref().map(|_| true),
+            sigil_target: sigil_discharge.flatten(),
         }
     }
 
@@ -567,6 +582,7 @@ impl Engine {
                     invuln_ticks_left: 0,
                     afterburner_ticks_left: 0,
                     bulwark_ticks_left: 0,
+                    sigil_discharge_this_tick: None,
                 }
             })
             .collect();
@@ -1205,6 +1221,10 @@ impl Engine {
                             .or_default()
                             .push(Event::SigilDischarged { which: sigil });
                         world_effects.push(world_cmd);
+                        // Record the discharge for the intent log (step 6).
+                        // Sigil is one-shot and already taken above, so we must
+                        // capture the target_hint here while it is still in scope.
+                        ship.sigil_discharge_this_tick = Some(target_hint);
                     }
                     // With none held: no-op (no event, no state change).
                 }
@@ -1746,10 +1766,14 @@ impl Engine {
         }
 
         // 6. Record the applied (persisted) intent for every ship this tick.
+        // `iter_mut` is needed so we can take (and clear) `sigil_discharge_this_tick`.
         let frame: IntentFrame = self
             .ships
-            .iter()
-            .map(|s| (s.id.clone(), s.applied_intent()))
+            .iter_mut()
+            .map(|s| {
+                let discharge = s.sigil_discharge_this_tick.take();
+                (s.id.clone(), s.applied_intent(discharge))
+            })
             .collect();
         self.intent_log.push(frame);
 
