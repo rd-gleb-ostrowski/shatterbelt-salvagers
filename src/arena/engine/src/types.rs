@@ -146,4 +146,14 @@ pub enum Event {
     /// this event is delivered.
     KilledShip { victim: ShipId },
     // Seam — issue 06 adds: RelicDropped { relic_id: String, pos: Vec2 }
+
+    // ── Issue 07: Collision damage ─────────────────────────────────────────
+    /// The ship's Shield absorbed `amount` damage from a collision (wall,
+    /// asteroid, or ship-ram).  No `by` field — all collision damage is
+    /// environmental (no kill bounty).
+    CollisionTookShield { amount: f32 },
+    /// After the Shield was fully depleted, the Hull took `amount` damage from
+    /// a collision.  Emitted on the same hit as `CollisionTookShield` when
+    /// there is overflow.
+    CollisionTookHull { amount: f32 },
 }

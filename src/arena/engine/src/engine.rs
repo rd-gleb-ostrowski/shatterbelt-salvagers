@@ -247,6 +247,29 @@ impl ShipState {
 /// not just what the bot sent.  Use this for exact match replay.
 pub type IntentFrame = Vec<(ShipId, Intent)>;
 
+// ─── Internal Asteroid state ──────────────────────────────────────────────────
+
+/// A drifting Asteroid in the Drift (engine-internal).
+/// Converted to `AsteroidView` on `god_view` / `observation` queries.
+/// Asteroids are collision hazards: they deal `k_asteroid`-scaled damage on contact.
+struct AsteroidState {
+    id: String,
+    pos: Vec2,
+    vel: Vec2,
+    radius: f32,
+}
+
+impl AsteroidState {
+    fn to_view(&self) -> AsteroidView {
+        AsteroidView {
+            id: self.id.clone(),
+            pos: self.pos,
+            vel: self.vel,
+            radius: self.radius,
+        }
+    }
+}
+
 // ─── Internal Relic state ─────────────────────────────────────────────────────
 
 /// A Relic lying in the Drift (engine-internal; converted to `RelicView` on query).
@@ -293,6 +316,11 @@ pub struct Engine {
     projectiles: Vec<ProjectileState>,
     /// Monotonically-increasing counter for unique projectile IDs.
     proj_id_counter: u32,
+    /// Asteroids currently drifting in the Drift (collision hazards + cover).
+    asteroids: Vec<AsteroidState>,
+    /// Monotonically-increasing counter for unique asteroid IDs.
+    #[allow(dead_code)] // reserved for future asteroid respawning
+    asteroid_id_counter: u32,
 }
 
 impl Engine {
@@ -340,7 +368,12 @@ impl Engine {
             ships.iter().map(|s| (s.id.clone(), 0.0_f32)).collect();
 
         // Spawn initial Relics: max(2, relic_field_cap / 2), matching harness.py.
-        let initial_relic_count = std::cmp::max(2, params.relic_field_cap / 2) as usize;
+        // Skip entirely when relic_field_cap == 0 (test isolation).
+        let initial_relic_count = if params.relic_field_cap == 0 {
+            0
+        } else {
+            std::cmp::max(2, params.relic_field_cap / 2) as usize
+        };
         let mut relics: Vec<RelicState> = Vec::with_capacity(initial_relic_count);
         let mut relic_id_counter: u32 = 0;
 
@@ -348,9 +381,9 @@ impl Engine {
         let mut rng = Pcg64::seed_from_u64(seed);
         for _ in 0..initial_relic_count {
             let lo_x = 100.0_f32;
-            let hi_x = (params.arena_w - 100.0).max(lo_x + f32::EPSILON);
+            let hi_x = (params.arena_w - 100.0).max(lo_x + 1.0);
             let lo_y = 100.0_f32;
-            let hi_y = (params.arena_h - 100.0).max(lo_y + f32::EPSILON);
+            let hi_y = (params.arena_h - 100.0).max(lo_y + 1.0);
             let x: f32 = rng.random_range(lo_x..hi_x);
             let y: f32 = rng.random_range(lo_y..hi_y);
             relics.push(RelicState {
@@ -358,6 +391,36 @@ impl Engine {
                 pos: Vec2::new(x, y),
             });
             relic_id_counter += 1;
+        }
+
+        // Spawn asteroids using the engine seeded RNG (after relics, so relic
+        // positions are unaffected).  Mirrors harness.py World.__init__ asteroid
+        // loop.  Positions use a `ship_radius + asteroid_radius_max` safety margin
+        // from each edge so that asteroids cannot overlap the arena corners where
+        // many test ships spawn; velocity in [-drift, +drift].
+        let n_ast = params.n_asteroids as usize;
+        let mut asteroids: Vec<AsteroidState> = Vec::with_capacity(n_ast);
+        let mut asteroid_id_counter: u32 = 0;
+        let ast_margin = params.ship_radius + params.asteroid_radius_max;
+        for _ in 0..n_ast {
+            // Guard against degenerate arenas: hi must be strictly > lo.
+            let lo_ax = ast_margin;
+            let hi_ax = (params.arena_w - ast_margin).max(lo_ax + 1.0);
+            let lo_ay = ast_margin;
+            let hi_ay = (params.arena_h - ast_margin).max(lo_ay + 1.0);
+            let x: f32 = rng.random_range(lo_ax..hi_ax);
+            let y: f32 = rng.random_range(lo_ay..hi_ay);
+            let radius: f32 = rng
+                .random_range(params.asteroid_radius_min..params.asteroid_radius_max);
+            let vx: f32 = rng.random_range(-params.asteroid_drift..=params.asteroid_drift);
+            let vy: f32 = rng.random_range(-params.asteroid_drift..=params.asteroid_drift);
+            asteroids.push(AsteroidState {
+                id: format!("asteroid-{asteroid_id_counter}"),
+                pos: Vec2::new(x, y),
+                vel: Vec2::new(vx, vy),
+                radius,
+            });
+            asteroid_id_counter += 1;
         }
 
         Engine {
@@ -373,6 +436,8 @@ impl Engine {
             relic_id_counter,
             projectiles: Vec::new(),
             proj_id_counter: 0,
+            asteroids,
+            asteroid_id_counter,
         }
     }
 
@@ -484,6 +549,199 @@ impl Engine {
             };
             self.ships[i].pos = Vec2::new(px, py);
         }
+
+        // Initialise per-ship event queues early so collision blocks can push into them.
+        let mut ship_events: HashMap<ShipId, Vec<Event>> =
+            self.ships.iter().map(|s| (s.id.clone(), Vec::new())).collect();
+
+        // 5_coll_0. Asteroid drift (always applies, collision_enabled or not).
+        //
+        // Asteroids move by their constant drift velocity each tick and wrap
+        // around the arena edges, matching harness.py:
+        //   a[0] = (a[0] + a[3]) % arena_w
+        //   a[1] = (a[1] + a[4]) % arena_h
+        let aw = self.params.arena_w;
+        let ah = self.params.arena_h;
+        for asteroid in &mut self.asteroids {
+            asteroid.pos.x = (asteroid.pos.x + asteroid.vel.x).rem_euclid(aw);
+            asteroid.pos.y = (asteroid.pos.y + asteroid.vel.y).rem_euclid(ah);
+        }
+
+        if self.params.collision_enabled {
+        // 5_coll_1. Wall collision detection & response.
+        //
+        // Only triggered when the ship is actively moving INTO the wall
+        // (velocity component toward the wall is non-zero).  This prevents
+        // teleporting ships that happen to start near a wall edge.
+        //
+        // Mirrors harness.py: impact_speed = abs(velocity_component);
+        // bounce: velocity_component *= -0.5 (50 % elastic);
+        // damage = max(0, impact_speed − threshold) × k_wall.
+        {
+            let p = &self.params;
+            let ship_r   = p.ship_radius;
+            let threshold = p.coll_threshold;
+            let k_wall   = p.k_wall;
+            let arena_w  = p.arena_w;
+            let arena_h  = p.arena_h;
+
+            for ship in &mut self.ships {
+                if !ship.alive { continue; }
+
+                // Left wall (x = 0): ship penetrates when pos.x < ship_r.
+                if ship.pos.x < ship_r && ship.vel.x < 0.0 {
+                    ship.pos.x = ship_r;
+                    let impact = ship.vel.x.abs();
+                    let damage = (impact - threshold).max(0.0) * k_wall;
+                    apply_env_damage(ship, damage, &mut ship_events);
+                    ship.vel.x = -ship.vel.x * 0.5;
+                }
+                // Right wall (x = arena_w).
+                if ship.pos.x > arena_w - ship_r && ship.vel.x > 0.0 {
+                    ship.pos.x = arena_w - ship_r;
+                    let impact = ship.vel.x.abs();
+                    let damage = (impact - threshold).max(0.0) * k_wall;
+                    apply_env_damage(ship, damage, &mut ship_events);
+                    ship.vel.x = -ship.vel.x * 0.5;
+                }
+                // Top wall (y = 0, y increases downward per PROTOCOL §3).
+                if ship.pos.y < ship_r && ship.vel.y < 0.0 {
+                    ship.pos.y = ship_r;
+                    let impact = ship.vel.y.abs();
+                    let damage = (impact - threshold).max(0.0) * k_wall;
+                    apply_env_damage(ship, damage, &mut ship_events);
+                    ship.vel.y = -ship.vel.y * 0.5;
+                }
+                // Bottom wall (y = arena_h).
+                if ship.pos.y > arena_h - ship_r && ship.vel.y > 0.0 {
+                    ship.pos.y = arena_h - ship_r;
+                    let impact = ship.vel.y.abs();
+                    let damage = (impact - threshold).max(0.0) * k_wall;
+                    apply_env_damage(ship, damage, &mut ship_events);
+                    ship.vel.y = -ship.vel.y * 0.5;
+                }
+            }
+        }
+
+        // 5_coll_2. Ship–asteroid collision detection & response.
+        //
+        // For each (ship, asteroid) pair within collision distance, only
+        // process if the ship is moving TOWARD the asteroid (vn < 0, where vn
+        // is the dot-product of ship velocity with the normal pointing from the
+        // asteroid toward the ship).  This avoids spurious bounces for ships
+        // that start inside an asteroid with zero velocity.
+        //
+        // Mirrors harness.py: elastic reflection (v −= 2 × vn × n).
+        {
+            let p = &self.params;
+            let ship_r   = p.ship_radius;
+            let threshold = p.coll_threshold;
+            let k_ast    = p.k_asteroid;
+
+            // Read asteroid data first to separate borrows: `&self.asteroids` vs
+            // `&mut self.ships` are different fields, so Rust allows simultaneous access.
+            for ship in &mut self.ships {
+                if !ship.alive { continue; }
+                for asteroid in &self.asteroids {
+                    let dx = ship.pos.x - asteroid.pos.x;
+                    let dy = ship.pos.y - asteroid.pos.y;
+                    let dist_sq = dx * dx + dy * dy;
+                    let rr = ship_r + asteroid.radius;
+                    if dist_sq >= rr * rr || dist_sq == 0.0 {
+                        continue;
+                    }
+                    let d = dist_sq.sqrt();
+                    let nx = dx / d; // normal from asteroid → ship
+                    let ny = dy / d;
+                    // vn < 0 means ship velocity has a component toward the asteroid.
+                    let vn = ship.vel.x * nx + ship.vel.y * ny;
+                    if vn >= 0.0 {
+                        continue; // separating — no collision response
+                    }
+                    // Snap ship to asteroid surface.
+                    ship.pos.x = asteroid.pos.x + nx * rr;
+                    ship.pos.y = asteroid.pos.y + ny * rr;
+                    // Damage: impact speed = |vn|.
+                    let damage = (vn.abs() - threshold).max(0.0) * k_ast;
+                    apply_env_damage(ship, damage, &mut ship_events);
+                    // Elastic velocity reflection about the normal axis.
+                    ship.vel.x -= 2.0 * vn * nx;
+                    ship.vel.y -= 2.0 * vn * ny;
+                }
+            }
+        }
+
+        // 5_coll_3. Ship–ship (ram) collision detection & response.
+        //
+        // Each pair of alive ships is checked once.  Collision only processed
+        // when the closing velocity is positive (ships approaching).
+        //
+        // Mirrors harness.py: relative velocity exchanged along collision normal;
+        // both ships take the same k_ram-scaled damage.
+        {
+            let p = &self.params;
+            let two_r    = 2.0 * p.ship_radius;
+            let threshold = p.coll_threshold;
+            let k_ram    = p.k_ram;
+            let n        = self.ships.len();
+
+            // Collect collisions first to avoid dual mutable borrows.
+            struct RamEvent { i: usize, j: usize, closing: f32, nx: f32, ny: f32, damage: f32 }
+            let mut ram_events: Vec<RamEvent> = Vec::new();
+
+            for i in 0..n {
+                for j in (i + 1)..n {
+                    if !self.ships[i].alive || !self.ships[j].alive { continue; }
+                    let dx = self.ships[j].pos.x - self.ships[i].pos.x;
+                    let dy = self.ships[j].pos.y - self.ships[i].pos.y;
+                    let dist_sq = dx * dx + dy * dy;
+                    if dist_sq >= two_r * two_r || dist_sq == 0.0 { continue; }
+                    let d = dist_sq.sqrt();
+                    let nx = dx / d; // normal from ship_i → ship_j
+                    let ny = dy / d;
+                    // Closing velocity: relative velocity of i toward j.
+                    let closing = (self.ships[i].vel.x - self.ships[j].vel.x) * nx
+                                + (self.ships[i].vel.y - self.ships[j].vel.y) * ny;
+                    if closing <= 0.0 { continue; } // separating
+                    let damage = (closing - threshold).max(0.0) * k_ram;
+                    ram_events.push(RamEvent { i, j, closing, nx, ny, damage });
+                }
+            }
+
+            for ev in ram_events {
+                // split_at_mut gives us two non-overlapping mutable slices.
+                let (left, right) = self.ships.split_at_mut(ev.j);
+                let ship_i = &mut left[ev.i];
+                let ship_j = &mut right[0];
+
+                apply_env_damage(ship_i, ev.damage, &mut ship_events);
+                apply_env_damage(ship_j, ev.damage, &mut ship_events);
+
+                // Exchange the relative velocity component along the collision normal.
+                ship_i.vel.x -= ev.closing * ev.nx;
+                ship_i.vel.y -= ev.closing * ev.ny;
+                ship_j.vel.x += ev.closing * ev.nx;
+                ship_j.vel.y += ev.closing * ev.ny;
+            }
+        }
+
+        // 5_coll_4. Sync collision-corrected positions and velocities back into rapier.
+        //
+        // Wall/asteroid/ram responses may have changed ship.pos and ship.vel;
+        // rapier must start the next tick from the corrected values.
+        for ship in &mut self.ships {
+            if let Some(body) = self.physics.bodies.get_mut(ship.body_handle) {
+                body.set_translation(
+                    rapier2d::math::Vector::new(ship.pos.x, ship.pos.y),
+                    true,
+                );
+                body.set_linvel(
+                    rapier2d::math::Vector::new(ship.vel.x, ship.vel.y),
+                    true,
+                );
+            }
+        }
+        } // end if self.params.collision_enabled
 
         // 5_a. Combat: shield regen, cannon cooldown tick-down, and firing.
         //
@@ -599,8 +857,6 @@ impl Engine {
         // `mem::take` moves projectiles out of `self` so we can borrow `self.ships`
         // mutably without aliasing — the same pattern used for relics above.
         // Matching harness.py: move each projectile THEN check hits in the same tick.
-        let mut ship_events: HashMap<ShipId, Vec<Event>> =
-            self.ships.iter().map(|s| (s.id.clone(), Vec::new())).collect();
         // Kills this tick: (victim_id, killer_id).  Processed after the projectile
         // block so score updates and KilledShip events can access `self.scores`
         // without conflicting with the `self.ships` mutable borrow inside the block.
@@ -746,7 +1002,7 @@ impl Engine {
                 .iter()
                 .map(|r| r.to_view(self.params.relic_value))
                 .collect(),
-            asteroids: vec![],
+            asteroids: self.asteroids.iter().map(|a| a.to_view()).collect(),
             projectiles: self.projectiles.iter().map(|p| p.to_view()).collect(),
             singularities: vec![],
             mines: vec![],
@@ -784,7 +1040,7 @@ impl Engine {
                 .iter()
                 .map(|r| r.to_view(self.params.relic_value))
                 .collect(),
-            asteroids: vec![],
+            asteroids: self.asteroids.iter().map(|a| a.to_view()).collect(),
             projectiles: self.projectiles.iter().map(|p| p.to_view()).collect(),
             singularities: vec![],
             mines: vec![],
@@ -829,6 +1085,16 @@ impl Engine {
     /// The current banked score for `ship_id`, or `None` if the id is unknown.
     pub fn score(&self, ship_id: &ShipId) -> Option<f32> {
         self.scores.get(ship_id).copied()
+    }
+
+    /// Test-only helper: set the `invuln` flag on a ship by id.
+    ///
+    /// This allows collision tests to verify that invulnerable ships receive no
+    /// collision damage, without waiting for issue 06 (spawn protection) to land.
+    pub fn set_invuln_for_test(&mut self, ship_id: &str, invuln: bool) {
+        if let Some(ship) = self.ships.iter_mut().find(|s| s.id == ship_id) {
+            ship.invuln = invuln;
+        }
     }
 
     // ─── Private helpers ──────────────────────────────────────────────────────
@@ -963,4 +1229,71 @@ fn apply_cannon_damage(
     }
 
     None
+}
+
+/// Apply environmental (collision) `damage` to `ship`.
+///
+/// Shares the same Shield-then-Hull path as `apply_cannon_damage`, but:
+/// - Respects `ship.invuln` (spawn-protection / Bulwark immunity): no damage
+///   is applied and `false` is returned.
+/// - Emits `CollisionTookShield` / `CollisionTookHull` instead of the
+///   cannon variants (no `by` field — collision damage is environmental).
+/// - Lethal hits emit `Died { by: None }` and do NOT award a kill bounty.
+///
+/// Returns `true` when the hit was lethal (Hull reached 0).
+///
+/// Seam for issue 10 (Aether Mine detonation): call `apply_env_damage` with
+/// `params.mine_damage` once proximity triggers, passing the same `ship_events`
+/// map — the damage path is identical and already decoupled from the caller.
+fn apply_env_damage(
+    ship: &mut ShipState,
+    damage: f32,
+    events: &mut HashMap<ShipId, Vec<Event>>,
+) -> bool {
+    if !ship.alive || damage <= 0.0 || ship.invuln {
+        return false;
+    }
+
+    // Reset the shield-regen delay: the ship has been hit this tick.
+    ship.ticks_since_last_hit = 0;
+
+    // Shield absorbs as much as it can; remainder overflows to Hull.
+    let shield_absorbed = damage.min(ship.shield.cur);
+    let hull_overflow   = damage - shield_absorbed;
+
+    if shield_absorbed > 0.0 {
+        ship.shield.cur -= shield_absorbed;
+        events
+            .entry(ship.id.clone())
+            .or_default()
+            .push(Event::CollisionTookShield { amount: shield_absorbed });
+        if ship.shield.cur == 0.0 {
+            events
+                .entry(ship.id.clone())
+                .or_default()
+                .push(Event::ShieldDown);
+        }
+    }
+
+    if hull_overflow > 0.0 {
+        ship.hull.cur -= hull_overflow;
+        if ship.hull.cur < 0.0 {
+            ship.hull.cur = 0.0;
+        }
+        events
+            .entry(ship.id.clone())
+            .or_default()
+            .push(Event::CollisionTookHull { amount: hull_overflow });
+        if ship.hull.cur <= 0.0 {
+            ship.alive = false;
+            // Environmental death: no kill attribution, no score bounty.
+            events
+                .entry(ship.id.clone())
+                .or_default()
+                .push(Event::Died { by: None });
+            return true;
+        }
+    }
+
+    false
 }

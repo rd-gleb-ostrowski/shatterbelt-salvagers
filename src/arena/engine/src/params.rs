@@ -77,6 +77,12 @@ pub struct Params {
 
     // ── Harness ──────────────────────────────────────────────────────────────
     pub enable_sigils: bool,
+    /// Enable physical collision detection and response (wall, asteroid, ship–ship).
+    ///
+    /// Defaults to `false` to keep the existing test suite unaffected; set to
+    /// `true` in any Match that should have full-physics collisions.  Mirrors the
+    /// `enable_sigils` precedent.
+    pub collision_enabled: bool,
 }
 
 impl Default for Params {
@@ -143,6 +149,7 @@ impl Default for Params {
             lance_damage: 50.0,
 
             enable_sigils: true,
+            collision_enabled: false,
         }
     }
 }

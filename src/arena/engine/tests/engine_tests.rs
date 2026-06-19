@@ -2363,3 +2363,371 @@ fn determinism_with_kill_scenario() {
         assert_eq!(sc1, sc2, "score for {id} must be identical: {sc1} vs {sc2}");
     }
 }
+
+// ==========================================================================
+// Issue 07: Collisions and hazards
+// TDD tracer-bullet tests 48-57
+// ==========================================================================
+
+fn coll_params() -> Params {
+    let mut p = Params::default();
+    p.collision_enabled = true;
+    p.n_asteroids = 0;
+    p.relic_spawn_period = 9999;
+    p.relic_field_cap = 0;
+    p.shield_regen_delay = 9999;
+    p.cannon_start_hot = 9999;
+    p
+}
+
+fn find_pilot_view(engine: &Engine) -> arena_engine::GodShipView {
+    engine.god_view().ships.into_iter().find(|s| s.id == "pilot").unwrap()
+}
+
+// --- test 48: asteroids in god-view and observation at match start -----------
+
+#[test]
+fn asteroids_in_god_view_and_observation_at_match_start() {
+    let mut p = Params::default();
+    p.n_asteroids = 5;
+    p.relic_field_cap = 0;
+    p.relic_spawn_period = 9999;
+    let spec = ShipSpec {
+        id: "s".to_string(),
+        class: ShipClass::Skiff,
+        anchor_pos: Vec2 { x: 1000.0, y: 600.0 },
+    };
+    let engine = Engine::new(42, p.clone(), vec![spec]);
+
+    let god = engine.god_view();
+    assert_eq!(god.asteroids.len(), 5,
+        "god_view must contain n_asteroids=5; got {}", god.asteroids.len());
+    let obs = engine.observation(&"s".to_string()).unwrap();
+    assert_eq!(obs.asteroids.len(), 5,
+        "observation must contain n_asteroids=5; got {}", obs.asteroids.len());
+    for a in &god.asteroids {
+        assert!(!a.id.is_empty(), "asteroid id must be non-empty");
+        assert!(a.radius >= p.asteroid_radius_min && a.radius <= p.asteroid_radius_max,
+            "radius {} not in [{}, {}]", a.radius, p.asteroid_radius_min, p.asteroid_radius_max);
+    }
+    let god_ids: std::collections::HashSet<&str> =
+        god.asteroids.iter().map(|a| a.id.as_str()).collect();
+    let obs_ids: std::collections::HashSet<&str> =
+        obs.asteroids.iter().map(|a| a.id.as_str()).collect();
+    assert_eq!(god_ids, obs_ids, "god_view and observation must expose same asteroid ids");
+}
+
+// --- test 49: wall collision bounces and damages ----------------------------
+
+#[test]
+fn wall_collision_bounces_and_damages() {
+    let mut p = coll_params();
+    p.arena_w = 200.0;
+    p.arena_h = 400.0;
+    let spec = ShipSpec { id: "pilot".to_string(), class: ShipClass::Skiff,
+                          anchor_pos: Vec2 { x: 100.0, y: 200.0 } };
+    let mut engine = Engine::new(1, p.clone(), vec![spec]);
+
+    let shield_before = p.shield_max;
+    let thrust_east = Intent { thrust: Some(1.0), turn: Some(0.0), ..Default::default() };
+
+    let mut bounced = false;
+    for _ in 0..300 {
+        engine.step(vec![("pilot".to_string(), thrust_east.clone())]);
+        if find_pilot_view(&engine).vel.x < 0.0 { bounced = true; break; }
+    }
+
+    assert!(bounced, "ship must bounce off right wall (vel.x must become negative)");
+    let ship = find_pilot_view(&engine);
+    assert!(ship.shield.cur < shield_before,
+        "wall collision must reduce shield; before={shield_before}, after={}", ship.shield.cur);
+    assert!(ship.pos.x <= p.arena_w, "ship must stay inside arena; x={}", ship.pos.x);
+}
+
+// --- test 50: asteroid collision bounces and damages ------------------------
+
+#[test]
+fn asteroid_collision_bounces_and_damages() {
+    let mut p = coll_params();
+    p.n_asteroids = 1;
+    p.asteroid_radius_min = 25.0;
+    p.asteroid_radius_max = 26.0;
+    p.arena_w = 600.0;
+    p.arena_h = 600.0;
+    let spec = ShipSpec { id: "pilot".to_string(), class: ShipClass::Skiff,
+                          anchor_pos: Vec2 { x: 50.0, y: 300.0 } };
+    let mut engine = Engine::new(1, p.clone(), vec![spec]);
+
+    let shield_max = p.shield_max;
+    let thrust_east = Intent { thrust: Some(1.0), turn: Some(0.0), ..Default::default() };
+
+    let mut took_damage = false;
+    for _ in 0..500 {
+        engine.step(vec![("pilot".to_string(), thrust_east.clone())]);
+        if find_pilot_view(&engine).shield.cur < shield_max { took_damage = true; break; }
+    }
+
+    assert!(took_damage,
+        "ship must take damage from asteroid or wall within 500 ticks; \
+         asteroid={:?}", engine.god_view().asteroids.first().map(|a| (a.pos.x, a.pos.y)));
+}
+
+// --- test 51: ship-ship ram damages both ships ------------------------------
+
+#[test]
+fn ship_ship_ram_damages_both_ships() {
+    let mut p = coll_params();
+    p.arena_w = 600.0;
+    p.arena_h = 600.0;
+    let specs = vec![
+        ShipSpec { id: "alpha".to_string(), class: ShipClass::Skiff,
+                   anchor_pos: Vec2 { x: 100.0, y: 300.0 } },
+        ShipSpec { id: "beta".to_string(),  class: ShipClass::Skiff,
+                   anchor_pos: Vec2 { x: 500.0, y: 300.0 } },
+    ];
+    let mut engine = Engine::new(1, p.clone(), vec![specs[0].clone(), specs[1].clone()]);
+
+    let shield_max = p.shield_max;
+    let ia = Intent { thrust: Some(1.0),  turn: Some(0.0), ..Default::default() };
+    let ib = Intent { thrust: Some(-1.0), turn: Some(0.0), ..Default::default() };
+
+    let mut both_damaged = false;
+    for _ in 0..500 {
+        engine.step(vec![("alpha".to_string(), ia.clone()), ("beta".to_string(), ib.clone())]);
+        let view = engine.god_view();
+        let a = view.ships.iter().find(|s| s.id == "alpha").unwrap();
+        let b = view.ships.iter().find(|s| s.id == "beta").unwrap();
+        if a.shield.cur < shield_max && b.shield.cur < shield_max { both_damaged = true; break; }
+    }
+
+    assert!(both_damaged, "both ships must take damage from ram within 500 ticks");
+}
+
+// --- test 52: sub-threshold speed deals 0 damage ---------------------------
+
+#[test]
+fn sub_threshold_speed_deals_zero_damage() {
+    let mut p = coll_params();
+    p.arena_w = 60.0;
+    p.arena_h = 400.0;
+    p.max_speed = 2.0;      // max_speed(2) < coll_threshold(4) -> 0 damage
+    p.thrust_accel = 0.1;
+    let spec = ShipSpec { id: "slow".to_string(), class: ShipClass::Skiff,
+                          anchor_pos: Vec2 { x: 30.0, y: 200.0 } };
+    let mut engine = Engine::new(1, p.clone(), vec![spec]);
+
+    let shield_before = p.shield_max;
+    let thrust_east = Intent { thrust: Some(1.0), turn: Some(0.0), ..Default::default() };
+
+    let mut bounced = false;
+    for _ in 0..600 {
+        engine.step(vec![("slow".to_string(), thrust_east.clone())]);
+        if engine.god_view().ships[0].vel.x < 0.0 { bounced = true; break; }
+    }
+
+    assert!(bounced, "slow ship must still bounce (but take no damage)");
+    let shield_after = engine.god_view().ships[0].shield.cur;
+    assert!((shield_after - shield_before).abs() < 0.01,
+        "sub-threshold wall hit must deal 0 damage; before={shield_before}, after={shield_after}");
+}
+
+// --- test 53: invuln ship takes no collision damage -------------------------
+
+#[test]
+fn invuln_ship_takes_no_collision_damage() {
+    let mut p = coll_params();
+    p.arena_w = 200.0;
+    p.arena_h = 400.0;
+    let spec = ShipSpec { id: "pilot".to_string(), class: ShipClass::Skiff,
+                          anchor_pos: Vec2 { x: 100.0, y: 200.0 } };
+    let mut engine = Engine::new(1, p.clone(), vec![spec]);
+    engine.set_invuln_for_test("pilot", true);
+
+    let shield_before = p.shield_max;
+    let thrust_east = Intent { thrust: Some(1.0), turn: Some(0.0), ..Default::default() };
+
+    let mut wall_hit = false;
+    for _ in 0..300 {
+        let events = engine.step(vec![("pilot".to_string(), thrust_east.clone())]);
+        if find_pilot_view(&engine).vel.x < 0.0 {
+            wall_hit = true;
+            let pilot_evs = &events.iter().find(|(id, _)| id == "pilot").unwrap().1;
+            let took_coll = pilot_evs.iter().any(|ev| {
+                matches!(ev, Event::CollisionTookShield { .. } | Event::CollisionTookHull { .. })
+            });
+            assert!(!took_coll,
+                "invuln ship must not receive Collision events; got {:?}", pilot_evs);
+            break;
+        }
+    }
+
+    assert!(wall_hit, "invuln ship must still physically bounce");
+    let shield_after = find_pilot_view(&engine).shield.cur;
+    assert!((shield_after - shield_before).abs() < 0.01,
+        "invuln shield must be unchanged; before={shield_before}, after={shield_after}");
+}
+
+// --- test 54: collision causes Died { by: None }, no kill bounty ------------
+
+#[test]
+fn collision_causes_env_death_by_none_no_bounty() {
+    let mut p = coll_params();
+    p.arena_w = 200.0;
+    p.arena_h = 400.0;
+    p.shield_max = 0.0;
+    p.hull_max = 5.0;
+    let spec = ShipSpec { id: "pilot".to_string(), class: ShipClass::Skiff,
+                          anchor_pos: Vec2 { x: 100.0, y: 200.0 } };
+    let mut engine = Engine::new(1, p.clone(), vec![spec]);
+
+    let score_before = engine.score(&"pilot".to_string()).unwrap();
+    let thrust_east = Intent { thrust: Some(1.0), turn: Some(0.0), ..Default::default() };
+
+    let mut died = false;
+    for _ in 0..300 {
+        let events = engine.step(vec![("pilot".to_string(), thrust_east.clone())]);
+        let pilot_evs = &events.iter().find(|(id, _)| id == "pilot").unwrap().1;
+        for ev in pilot_evs {
+            if let Event::Died { by } = ev {
+                assert!(by.is_none(),
+                    "env death must have Died {{ by: None }}; got {:?}", by);
+                died = true;
+                break;
+            }
+        }
+        if died { break; }
+    }
+
+    assert!(died, "pilot must die from wall collision within 300 ticks");
+    let score_after = engine.score(&"pilot".to_string()).unwrap();
+    assert!((score_after - score_before).abs() < 1e-4,
+        "env death must not award bounty; before={score_before}, after={score_after}");
+}
+
+// --- test 55: collision emits CollisionTookShield / CollisionTookHull -------
+
+#[test]
+fn collision_emits_collision_took_events() {
+    let mut p = coll_params();
+    p.arena_w = 200.0;
+    p.arena_h = 400.0;
+    let spec = ShipSpec { id: "pilot".to_string(), class: ShipClass::Skiff,
+                          anchor_pos: Vec2 { x: 100.0, y: 200.0 } };
+    let mut engine = Engine::new(1, p.clone(), vec![spec]);
+
+    let thrust_east = Intent { thrust: Some(1.0), turn: Some(0.0), ..Default::default() };
+    let mut found_shield_event = false;
+    for _ in 0..300 {
+        let events = engine.step(vec![("pilot".to_string(), thrust_east.clone())]);
+        let pilot_evs = &events.iter().find(|(id, _)| id == "pilot").unwrap().1;
+        for ev in pilot_evs {
+            if let Event::CollisionTookShield { amount } = ev {
+                assert!(*amount > 0.0, "CollisionTookShield amount must be > 0; got {amount}");
+                found_shield_event = true;
+            }
+        }
+        if found_shield_event { break; }
+    }
+
+    assert!(found_shield_event,
+        "wall collision at high speed must emit CollisionTookShield event");
+}
+
+// --- test 56: golden wall damage formula ------------------------------------
+//
+// Formula (harness.py + params.py):
+//   damage = max(0, (impact_speed - coll_threshold) * k_wall)
+//          = max(0, (12 - 4) * 3) = 24.0
+// shield after = 60 - 24 = 36.
+// Source: harness.py wall block.
+//
+// Setup: wide arena so ship reaches terminal velocity (max_speed=12) well
+// before hitting the right wall.  Ship at x=100 in 800-wide arena; wall at 780.
+// Ramp-up takes ~44 ticks / ~240 units, leaving ~440 units at max_speed.
+
+#[test]
+fn golden_wall_collision_damage_formula() {
+    let mut p = coll_params();
+    p.arena_w = 800.0;    // right-wall boundary at 800-20=780; wide enough for
+                           // ship to reach max_speed before hitting.
+    p.arena_h = 1200.0;
+    p.coll_threshold = 4.0;
+    p.k_wall         = 3.0;
+    p.shield_max     = 60.0;
+    p.hull_max       = 100.0;
+    p.max_speed      = 12.0;
+    p.shield_regen_delay = 9999;
+    let spec = ShipSpec { id: "pilot".to_string(), class: ShipClass::Skiff,
+                          anchor_pos: Vec2 { x: 100.0, y: 600.0 } };
+    let mut engine = Engine::new(1, p.clone(), vec![spec]);
+
+    let thrust_east = Intent { thrust: Some(1.0), turn: Some(0.0), ..Default::default() };
+    let mut damage_taken: f32 = 0.0;
+
+    for _ in 0..500 {
+        let events = engine.step(vec![("pilot".to_string(), thrust_east.clone())]);
+        let pilot_evs = &events.iter().find(|(id, _)| id == "pilot").unwrap().1;
+        for ev in pilot_evs {
+            if let Event::CollisionTookShield { amount } = ev { damage_taken = *amount; }
+        }
+        if damage_taken > 0.0 { break; }
+    }
+
+    assert!(damage_taken > 0.0, "wall collision must occur within 500 ticks");
+
+    // Expected at impact_speed ≈ max_speed (allow ±15% for damping).
+    // Source: harness.py `self.damage(s, max(0, abs(s.vx) - p.coll_threshold) * p.k_wall)`.
+    let expected = (p.max_speed - p.coll_threshold).max(0.0) * p.k_wall; // 24.0
+    assert!(
+        (damage_taken - expected).abs() < expected * 0.15,
+        "golden wall damage: expected ~{expected:.1} (max(0,{}-{})*{}), got {damage_taken:.4}",
+        p.max_speed, p.coll_threshold, p.k_wall
+    );
+
+    let ship = find_pilot_view(&engine);
+    let expected_shield = (p.shield_max - damage_taken).max(0.0);
+    assert!(
+        (ship.shield.cur - expected_shield).abs() < 0.5,
+        "golden shield after wall: expected ~{expected_shield:.1}, got {:.4}", ship.shield.cur
+    );
+}
+
+// --- test 57: determinism with collision scenario ---------------------------
+
+#[test]
+fn determinism_collision_scenario() {
+    let mut p = coll_params();
+    p.arena_w = 200.0;
+    p.arena_h = 400.0;
+    p.n_asteroids = 3;
+
+    let make = || {
+        let spec = ShipSpec { id: "pilot".to_string(), class: ShipClass::Skiff,
+                              anchor_pos: Vec2 { x: 100.0, y: 200.0 } };
+        Engine::new(42, p.clone(), vec![spec])
+    };
+
+    let thrust_east = Intent { thrust: Some(1.0), turn: Some(0.0), ..Default::default() };
+    let run = || {
+        let mut e = make();
+        for _ in 0..200 { e.step(vec![("pilot".to_string(), thrust_east.clone())]); }
+        e.god_view()
+    };
+
+    let v1 = run();
+    let v2 = run();
+
+    let (s1, s2) = (&v1.ships[0], &v2.ships[0]);
+    assert_eq!(s1.pos.x,      s2.pos.x,      "pos.x must be deterministic");
+    assert_eq!(s1.pos.y,      s2.pos.y,      "pos.y must be deterministic");
+    assert_eq!(s1.vel.x,      s2.vel.x,      "vel.x must be deterministic");
+    assert_eq!(s1.vel.y,      s2.vel.y,      "vel.y must be deterministic");
+    assert_eq!(s1.shield.cur, s2.shield.cur, "shield must be deterministic");
+    assert_eq!(s1.hull.cur,   s2.hull.cur,   "hull must be deterministic");
+
+    assert_eq!(v1.asteroids.len(), v2.asteroids.len());
+    for (a1, a2) in v1.asteroids.iter().zip(v2.asteroids.iter()) {
+        assert_eq!(a1.pos.x, a2.pos.x, "asteroid pos.x deterministic ({})", a1.id);
+        assert_eq!(a1.pos.y, a2.pos.y, "asteroid pos.y deterministic ({})", a1.id);
+    }
+}
