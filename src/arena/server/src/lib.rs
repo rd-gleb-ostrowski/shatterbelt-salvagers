@@ -30,4 +30,5 @@ pub mod pacer;
 pub mod routes;
 pub mod runner;
 pub mod store;
+pub mod wasm_host;
 pub mod ws;
