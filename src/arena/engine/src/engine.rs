@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::f32::consts::TAU;
 
+use rand::seq::IndexedRandom;
 use rand::RngExt;
 use rand::SeedableRng;
 use rand_pcg::Pcg64;
@@ -13,7 +14,42 @@ use crate::types::*;
 // Explicit import so the engine's own Vec2 wins over rapier2d/glam's Vec2 from the glob above.
 use crate::types::Vec2;
 
-// ─── Physics world ────────────────────────────────────────────────────────────
+// ─── Sigil roster & effect-dispatch seam ─────────────────────────────────────
+
+/// All five Sigil variants, in canonical order.
+/// Used for random selection on Relic pickup (see relic-pickup block in `step()`).
+///
+/// Verified against rand 0.10.1 source:
+///   ~/.cargo/registry/src/…/rand-0.10.1/src/seq/slice.rs — `IndexedRandom::choose`
+///   Returns `Some(&self[rng.random_range(..self.len())])`, deterministic with a
+///   seeded RNG.
+const SIGILS: &[Sigil] = &[
+    Sigil::Afterburner,
+    Sigil::Bulwark,
+    Sigil::Singularity,
+    Sigil::AetherMine,
+    Sigil::ArcLance,
+];
+
+/// **Effect-dispatch seam** — called immediately after the Sigil is removed
+/// from `ship.sigil` during a discharge Intent.
+///
+/// Every arm is a no-op placeholder.  Issues 09 and 10 fill them:
+///   - Issue 09 (Afterburner, Bulwark): mobility & defence effects.
+///   - Issue 10 (Singularity, AetherMine, ArcLance): control/trap/offence effects.
+///
+/// Signature is intentional: `ship` is available for state mutations and
+/// `_params` is available for tuning constants; `_events` can be added as a
+/// parameter when an effect needs to emit additional events.
+fn dispatch_sigil_effect(sigil: &Sigil, _ship: &mut ShipState, _params: &Params) {
+    match sigil {
+        Sigil::Afterburner => { /* Issue 09: apply sustained thrust-surge buff */ }
+        Sigil::Bulwark     => { /* Issue 09: overcharge Shield + grant invuln ticks */ }
+        Sigil::Singularity => { /* Issue 10: deploy gravity-well at sigil_target */ }
+        Sigil::AetherMine  => { /* Issue 10: drop proximity mine at ship position */ }
+        Sigil::ArcLance    => { /* Issue 10: fire piercing bolt toward sigil_target */ }
+    }
+}
 
 /// All rapier2d state for one match.
 ///
@@ -792,19 +828,63 @@ impl Engine {
             self.projectiles.extend(new_projectiles);
         }
 
+        // 5_sigil. Sigil discharge: process `intent.sigil = true` for each alive ship.
+        //
+        // Ordered before relic pickup (5b) so that a ship that discharges its current
+        // Sigil on the same tick it picks up a relic will end the tick with the newly
+        // granted Sigil (not the one it just used).
+        //
+        // Sigil is one-shot — not persisted in `PersistedIntent`; read directly from
+        // the raw incoming intents map.
+        {
+            for (id, intent) in &intents {
+                if intent.sigil != Some(true) {
+                    continue;
+                }
+                if let Some(ship) = self.ships.iter_mut().find(|s| s.id == *id) {
+                    if !ship.alive {
+                        continue;
+                    }
+                    if let Some(sigil) = ship.sigil.take() {
+                        // Effect-dispatch seam: issues 09 & 10 fill the arms.
+                        dispatch_sigil_effect(&sigil, ship, &self.params);
+                        ship_events
+                            .entry(ship.id.clone())
+                            .or_default()
+                            .push(Event::SigilDischarged { which: sigil });
+                    }
+                    // With none held: no-op (no event, ship state unchanged).
+                }
+            }
+        }
+
         // 5b. Relic pickup: for each alive ship, consume nearby Relics up to carry_cap.
         //
         // Matching harness.py per-ship order: iterate ships in order; each ship
         // processes ALL relics in the field and grabs what it can before the next
         // ship gets a turn.  `mem::take` temporarily moves relics out so we can
         // borrow `self.ships` mutably without aliasing.
+        //
+        // Two-pass Sigil grant: the inner loop collects ship indices that need a
+        // Sigil (holding none when they pick up a relic); after the loop `self.rng`
+        // is used to grant one Sigil per qualifying ship.  The two-pass approach
+        // keeps `self.ships` and `self.rng` borrows non-overlapping.
         {
             let pickup_r_sq = self.params.relic_pickup_radius * self.params.relic_pickup_radius;
             let carry_cap   = self.params.carry_cap;
+            let enable_sigils = self.params.enable_sigils;
             let mut relics  = std::mem::take(&mut self.relics);
 
-            for ship in &mut self.ships {
+            // Indices (into `self.ships`) of ships that need a Sigil grant this tick.
+            let mut needs_sigil: Vec<usize> = Vec::new();
+
+            for (ship_idx, ship) in self.ships.iter_mut().enumerate() {
                 if !ship.alive { continue; }
+
+                // Track whether this ship already qualified for a Sigil this loop.
+                // (A ship picks up at most one Sigil per tick even if it grabs
+                // multiple Relics in the same batch.)
+                let mut this_ship_queued = false;
 
                 // Walk the relic list; swap_remove any that this ship picks up.
                 let mut i = 0;
@@ -818,6 +898,12 @@ impl Engine {
                         ship.relics_carried += 1;
                         relics.swap_remove(i);
                         // Do NOT increment i: the swapped-in element needs checking.
+
+                        // Sigil grant: first relic pickup while holding none.
+                        if enable_sigils && ship.sigil.is_none() && !this_ship_queued {
+                            needs_sigil.push(ship_idx);
+                            this_ship_queued = true;
+                        }
                     } else {
                         i += 1;
                     }
@@ -825,6 +911,25 @@ impl Engine {
             }
 
             self.relics = relics;
+
+            // Pass 2: grant Sigils outside the ships loop so `self.rng` can be
+            // borrowed independently of `self.ships`.
+            // `IndexedRandom::choose` on a non-empty slice always returns `Some`.
+            for idx in needs_sigil {
+                // Re-check: the discharge block above may have cleared sigil (if the
+                // ship discharged and then picked up a relic in the same tick —
+                // sigil was taken in 5_sigil, so sigil is already None here → grant).
+                if self.ships[idx].sigil.is_none() {
+                    // SIGILS is a non-empty static slice; unwrap is safe.
+                    let granted = SIGILS.choose(&mut self.rng).unwrap().clone();
+                    let ship_id = self.ships[idx].id.clone();
+                    self.ships[idx].sigil = Some(granted.clone());
+                    ship_events
+                        .entry(ship_id)
+                        .or_default()
+                        .push(Event::SigilGranted { which: granted });
+                }
+            }
         }
 
         // 5c. Relic banking: each alive ship at its Anchor banks carried Relics.

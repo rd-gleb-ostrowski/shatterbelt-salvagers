@@ -156,4 +156,12 @@ pub enum Event {
     /// a collision.  Emitted on the same hit as `CollisionTookShield` when
     /// there is overflow.
     CollisionTookHull { amount: f32 },
+
+    // ── Issue 08: Sigil framework ──────────────────────────────────────────
+    /// This ship picked up a Relic and was granted a random Sigil.
+    /// Only emitted when the ship held no Sigil before the pickup.
+    SigilGranted { which: Sigil },
+    /// The held Sigil was consumed via a discharge Intent.
+    /// Emitted on the same tick the Sigil disappears from the ship's state.
+    SigilDischarged { which: Sigil },
 }

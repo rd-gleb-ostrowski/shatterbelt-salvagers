@@ -2731,3 +2731,359 @@ fn determinism_collision_scenario() {
         assert_eq!(a1.pos.y, a2.pos.y, "asteroid pos.y deterministic ({})", a1.id);
     }
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Issue 08: Sigil framework
+//
+// TDD tracer-bullet order:
+//  58. Picking up a relic when holding none grants exactly one Sigil (own
+//      observation shows it; SigilGranted event emitted).
+//  59. Picking up a relic while already holding a Sigil grants no additional
+//      Sigil (at-most-one invariant).
+//  60. The held Sigil appears in the owner's own Observation but never in an
+//      enemy's Observation (OtherShipView has no sigil field — compile-time
+//      guarantee; runtime test confirms the owner sees it, enemy does not via
+//      that struct).
+//  61. Discharging with intent.sigil = true consumes the held Sigil and emits
+//      a SigilDischarged event.
+//  62. Discharging with no held Sigil is a no-op: no event, no state change.
+//  63. Determinism: same seed grants the same Sigil across two identical runs.
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ─── helpers ─────────────────────────────────────────────────────────────────
+
+/// Params for a tiny arena where the ship at (100, 100) is always within
+/// pickup range of every relic AND within bank radius of its own anchor.
+/// `relic_field_cap = 4` → 2 initial relics.
+/// `enable_sigils = true` (the default).
+fn sigil_params() -> Params {
+    let mut p = Params::default();
+    p.arena_w = 202.0;
+    p.arena_h = 202.0;
+    p.relic_field_cap = 4;
+    p.relic_spawn_period = 9999; // no replenishment during sigil tests
+    p.carry_cap = 5;
+    p.enable_sigils = true;
+    p.n_asteroids = 0; // no asteroids — simpler, faster
+    p
+}
+
+/// Single ship placed at its anchor (100, 100): picks up relics AND banks
+/// them in one step.  The granted Sigil stays even after banking.
+fn sigil_single_engine(seed: u64) -> Engine {
+    let p = sigil_params();
+    let spec = ShipSpec {
+        id: "ship-1".to_string(),
+        class: ShipClass::Skiff,
+        anchor_pos: Vec2 { x: 100.0, y: 100.0 },
+    };
+    Engine::new(seed, p, vec![spec])
+}
+
+/// Two-ship sigil engine: ship-1 at (100, 100), ship-2 far away at (200, 200).
+/// Only ship-1 is within pickup range of the relics that spawn near (100, 100).
+fn sigil_two_ship_engine(seed: u64) -> Engine {
+    let mut p = sigil_params();
+    // Place ship-2 far enough that it never picks up relics in these tests.
+    let specs = vec![
+        ShipSpec {
+            id: "ship-1".to_string(),
+            class: ShipClass::Skiff,
+            anchor_pos: Vec2 { x: 100.0, y: 100.0 },
+        },
+        ShipSpec {
+            id: "ship-2".to_string(),
+            class: ShipClass::Skiff,
+            anchor_pos: Vec2 { x: 199.0, y: 199.0 },
+        },
+    ];
+    // Small pickup radius so ship-2 doesn't accidentally grab relics.
+    p.relic_pickup_radius = 10.0;
+    Engine::new(seed, p, specs)
+}
+
+// ─── test 58: picking up a relic grants one Sigil when holding none ───────────
+
+#[test]
+fn pickup_relic_grants_sigil_when_holding_none() {
+    let mut engine = sigil_single_engine(42);
+
+    // Before any step, no sigil.
+    let obs0 = engine.observation(&"ship-1".to_string()).unwrap();
+    assert!(obs0.self_view.sigil.is_none(), "sigil must be None before any pickup");
+
+    // Step: ship picks up nearby relics (and banks them; both within 100u of anchor).
+    let events = engine.step(vec![]);
+
+    // Own observation now shows a held Sigil.
+    let obs1 = engine.observation(&"ship-1".to_string()).unwrap();
+    assert!(
+        obs1.self_view.sigil.is_some(),
+        "sigil must be granted after picking up a relic"
+    );
+
+    // SigilGranted event must be emitted in this step.
+    let ship_events = events
+        .into_iter()
+        .find(|(id, _)| id == "ship-1")
+        .unwrap()
+        .1;
+    let granted = ship_events
+        .iter()
+        .filter(|e| matches!(e, Event::SigilGranted { .. }))
+        .count();
+    assert_eq!(granted, 1, "exactly one SigilGranted event per pickup (first relic only)");
+
+    // The event's variant must match the observation's sigil.
+    if let Some(Event::SigilGranted { which }) = ship_events
+        .iter()
+        .find(|e| matches!(e, Event::SigilGranted { .. }))
+    {
+        assert_eq!(
+            Some(which.clone()),
+            obs1.self_view.sigil,
+            "SigilGranted event variant must match the held sigil in the observation"
+        );
+    }
+}
+
+// ─── test 59: picking up while holding grants no additional Sigil ─────────────
+
+#[test]
+fn pickup_while_holding_grants_no_additional_sigil() {
+    // Two-step scenario:
+    //   Step 1: ship picks up relics → sigil granted.
+    //   Step 2: more relics spawn (relic_spawn_period = 1) → ship picks up again.
+    //   After step 2: still exactly one sigil (at-most-one invariant).
+
+    let mut p = sigil_params();
+    p.relic_spawn_period = 1; // replenish every tick so there are relics in step 2
+    p.carry_cap = 5;
+    let spec = ShipSpec {
+        id: "ship-1".to_string(),
+        class: ShipClass::Skiff,
+        anchor_pos: Vec2 { x: 100.0, y: 100.0 },
+    };
+    let mut engine = Engine::new(42, p, vec![spec]);
+
+    // Step 1: pick up relics → sigil granted.
+    engine.step(vec![]);
+    let sigil_after_first = engine
+        .observation(&"ship-1".to_string())
+        .unwrap()
+        .self_view
+        .sigil
+        .clone();
+    assert!(sigil_after_first.is_some(), "sigil must be granted after first pickup");
+
+    // Step 2: another relic spawns (relic_spawn_period = 1 fires on tick % 1 == 0);
+    // ship picks it up while already holding a sigil.
+    let events2 = engine.step(vec![]);
+
+    let obs2 = engine.observation(&"ship-1".to_string()).unwrap();
+
+    // Sigil must still be the SAME one — no replacement granted.
+    assert_eq!(
+        obs2.self_view.sigil, sigil_after_first,
+        "sigil must not change when picking up while already holding one"
+    );
+
+    // No SigilGranted event in step 2.
+    let ship_events2 = events2
+        .into_iter()
+        .find(|(id, _)| id == "ship-1")
+        .unwrap()
+        .1;
+    let extra_grants = ship_events2
+        .iter()
+        .filter(|e| matches!(e, Event::SigilGranted { .. }))
+        .count();
+    assert_eq!(
+        extra_grants, 0,
+        "SigilGranted must NOT be emitted when ship already holds a Sigil"
+    );
+}
+
+// ─── test 60: held Sigil visible in own observation only, hidden from enemies ──
+
+#[test]
+fn sigil_visible_to_owner_hidden_from_enemy() {
+    let mut engine = sigil_two_ship_engine(42);
+
+    // Step: ship-1 picks up relics (ship-2 is too far away).
+    engine.step(vec![]);
+
+    // ship-1's own observation must show the sigil.
+    let obs1 = engine.observation(&"ship-1".to_string()).unwrap();
+    assert!(
+        obs1.self_view.sigil.is_some(),
+        "owner (ship-1) must see its own sigil"
+    );
+
+    // ship-2's observation of ship-1 must NOT expose the sigil.
+    // The `ships` field of ship-2's Observation contains OtherShipView items,
+    // which structurally have no `sigil` or `aether` field (PROTOCOL §6).
+    // This is a compile-time guarantee — the test confirms the runtime value:
+    // ship-1 is visible in ship-2's `ships` list, with no sigil information.
+    let obs2 = engine.observation(&"ship-2".to_string()).unwrap();
+    let ship1_in_obs2 = obs2
+        .ships
+        .iter()
+        .find(|s| s.id == "ship-1")
+        .expect("ship-1 must appear in ship-2's ships list");
+
+    // OtherShipView has no `sigil` field — asserting the struct compiles without
+    // one is the compile-time test.  The runtime test: ship-1 IS visible (alive),
+    // confirming the observation correctly includes enemy ships while omitting
+    // their private fields.
+    assert!(
+        ship1_in_obs2.alive,
+        "ship-1 must be visible and alive in ship-2's observation"
+    );
+    // ship-2's own sigil must be None (it didn't pick up any relics).
+    assert!(
+        obs2.self_view.sigil.is_none(),
+        "ship-2's own sigil must be None (it picked up no relics)"
+    );
+}
+
+// ─── test 61: discharge consumes the held Sigil and emits SigilDischarged ────
+
+#[test]
+fn discharge_consumes_sigil_and_emits_event() {
+    let mut engine = sigil_single_engine(42);
+
+    // Step 1: pick up relics → get sigil.
+    engine.step(vec![]);
+    let sigil_held = engine
+        .observation(&"ship-1".to_string())
+        .unwrap()
+        .self_view
+        .sigil
+        .clone()
+        .expect("sigil must be held after pickup");
+
+    // Step 2: discharge the sigil.
+    let discharge = Intent {
+        sigil: Some(true),
+        ..Default::default()
+    };
+    let events = engine.step(vec![("ship-1".to_string(), discharge)]);
+
+    // Sigil must now be None.
+    let obs_after = engine.observation(&"ship-1".to_string()).unwrap();
+    assert!(
+        obs_after.self_view.sigil.is_none(),
+        "sigil must be consumed after discharge"
+    );
+
+    // SigilDischarged event must be emitted.
+    let ship_events = events
+        .into_iter()
+        .find(|(id, _)| id == "ship-1")
+        .unwrap()
+        .1;
+    let discharged = ship_events
+        .iter()
+        .find(|e| matches!(e, Event::SigilDischarged { .. }));
+    assert!(discharged.is_some(), "SigilDischarged event must be emitted on discharge");
+
+    // The event's variant must match what was held.
+    if let Some(Event::SigilDischarged { which }) = discharged {
+        assert_eq!(
+            *which, sigil_held,
+            "SigilDischarged must identify the sigil that was consumed"
+        );
+    }
+}
+
+// ─── test 62: discharge with no held Sigil is a no-op ────────────────────────
+
+#[test]
+fn discharge_with_no_sigil_is_noop() {
+    // Use a setup with NO relics so pickup can't silently grant a sigil in the
+    // same tick as the (no-op) discharge intent.
+    let mut p = sigil_params();
+    p.relic_field_cap = 0;       // no initial relics
+    p.relic_spawn_period = 9999; // no replenishment
+    let spec = ShipSpec {
+        id: "ship-1".to_string(),
+        class: ShipClass::Skiff,
+        anchor_pos: Vec2 { x: 100.0, y: 100.0 },
+    };
+    let mut engine = Engine::new(42, p, vec![spec]);
+
+    // Confirm no sigil at start and no relics in the Drift.
+    let obs0 = engine.observation(&"ship-1".to_string()).unwrap();
+    assert!(obs0.self_view.sigil.is_none(), "no sigil at start");
+    assert!(engine.god_view().relics.is_empty(), "no relics in Drift for this test");
+
+    // Send discharge intent with no sigil held.
+    let discharge = Intent {
+        sigil: Some(true),
+        ..Default::default()
+    };
+    let events = engine.step(vec![("ship-1".to_string(), discharge)]);
+
+    // State must be unchanged: still no sigil.
+    let obs1 = engine.observation(&"ship-1".to_string()).unwrap();
+    assert!(
+        obs1.self_view.sigil.is_none(),
+        "sigil must remain None after discharging with nothing held"
+    );
+
+    // No SigilDischarged event.
+    let ship_events = events
+        .into_iter()
+        .find(|(id, _)| id == "ship-1")
+        .unwrap()
+        .1;
+    let has_discharged = ship_events
+        .iter()
+        .any(|e| matches!(e, Event::SigilDischarged { .. }));
+    assert!(
+        !has_discharged,
+        "SigilDischarged must NOT be emitted when no sigil was held"
+    );
+    // Also verify no spurious SigilGranted event.
+    let has_granted = ship_events
+        .iter()
+        .any(|e| matches!(e, Event::SigilGranted { .. }));
+    assert!(
+        !has_granted,
+        "SigilGranted must NOT be emitted when there were no relics to pick up"
+    );
+}
+
+// ─── test 63: determinism — same seed grants the same Sigil ──────────────────
+
+#[test]
+fn determinism_same_seed_grants_same_sigil() {
+    // Two engines with the same seed and same (empty) intents must produce
+    // the exact same Sigil assignment after a relic pickup.
+    let make = || sigil_single_engine(77);
+
+    let mut e1 = make();
+    let mut e2 = make();
+
+    e1.step(vec![]);
+    e2.step(vec![]);
+
+    let sigil1 = e1
+        .observation(&"ship-1".to_string())
+        .unwrap()
+        .self_view
+        .sigil;
+    let sigil2 = e2
+        .observation(&"ship-1".to_string())
+        .unwrap()
+        .self_view
+        .sigil;
+
+    assert!(sigil1.is_some(), "sigil must be granted in engine 1");
+    assert!(sigil2.is_some(), "sigil must be granted in engine 2");
+    assert_eq!(
+        sigil1, sigil2,
+        "same seed must produce the same Sigil assignment"
+    );
+}
