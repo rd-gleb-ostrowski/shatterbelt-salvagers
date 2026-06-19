@@ -102,6 +102,31 @@ struct PersistedIntent {
     fire: bool,
 }
 
+// ─── Internal projectile state ────────────────────────────────────────────────
+
+/// An arcane rune-cannon projectile in flight (engine-internal).
+/// Converted to `ProjectileView` on `observation` / `god_view` queries.
+struct ProjectileState {
+    id: String,
+    pos: Vec2,
+    vel: Vec2,
+    owner: ShipId,
+    /// Cumulative distance traveled this projectile's lifetime.
+    /// Despawned once this reaches or exceeds `params.proj_range`.
+    dist_traveled: f32,
+}
+
+impl ProjectileState {
+    fn to_view(&self) -> ProjectileView {
+        ProjectileView {
+            id: self.id.clone(),
+            pos: self.pos,
+            vel: self.vel,
+            owner: self.owner.clone(),
+        }
+    }
+}
+
 // ─── Internal ship state ──────────────────────────────────────────────────────
 
 struct ShipState {
@@ -121,6 +146,11 @@ struct ShipState {
     relics_carried: u32,
     anchor_pos: Vec2,
     persisted: PersistedIntent,
+    /// Ticks elapsed since this ship last took damage.
+    /// Used for the Shield-regen delay (`params.shield_regen_delay`).
+    /// Mirrors `Ship.unhit` in harness.py; initialised to `shield_regen_delay`
+    /// so that the first-ever regen check passes immediately (ship starts full).
+    ticks_since_last_hit: u32,
     /// Handle into the rapier `PhysicsWorld::bodies` set.
     /// Position and velocity are the source of truth in rapier;
     /// `ship.pos` / `ship.vel` are synced back after each physics step.
@@ -258,6 +288,10 @@ pub struct Engine {
     relics: Vec<RelicState>,
     /// Monotonically-increasing counter for unique relic IDs.
     relic_id_counter: u32,
+    /// Rune-cannon projectiles currently in flight.
+    projectiles: Vec<ProjectileState>,
+    /// Monotonically-increasing counter for unique projectile IDs.
+    proj_id_counter: u32,
 }
 
 impl Engine {
@@ -293,6 +327,9 @@ impl Engine {
                     relics_carried: 0,
                     anchor_pos: spec.anchor_pos,
                     persisted: PersistedIntent::default(),
+                    // Start at shield_regen_delay so regen is active immediately;
+                    // ship starts with full shield so the first regen check is a no-op.
+                    ticks_since_last_hit: params.shield_regen_delay,
                     body_handle,
                 }
             })
@@ -333,6 +370,8 @@ impl Engine {
             physics,
             relics,
             relic_id_counter,
+            projectiles: Vec::new(),
+            proj_id_counter: 0,
         }
     }
 
@@ -445,6 +484,55 @@ impl Engine {
             self.ships[i].pos = Vec2::new(px, py);
         }
 
+        // 5_a. Combat: shield regen, cannon cooldown tick-down, and firing.
+        //
+        // Mirrors harness.py ship-loop order: regen → cd → fire.
+        // Projectile spawning uses a local ID counter to avoid re-borrowing `self`.
+        {
+            let mut new_projectiles: Vec<ProjectileState> = Vec::new();
+            let mut next_proj_id = self.proj_id_counter;
+
+            for ship in &mut self.ships {
+                if !ship.alive {
+                    continue;
+                }
+                let p = &self.params;
+
+                // Shield regen: increment unhit counter; regen once delay elapses.
+                ship.ticks_since_last_hit = ship.ticks_since_last_hit.saturating_add(1);
+                if ship.ticks_since_last_hit >= p.shield_regen_delay {
+                    ship.shield.cur = (ship.shield.cur + p.shield_regen).min(ship.shield.max);
+                }
+
+                // Cannon cooldown: tick down toward 0.
+                if ship.cannon_cooldown > 0 {
+                    ship.cannon_cooldown -= 1;
+                }
+
+                // Fire: spawn a projectile when trigger held, cannon ready, aether available.
+                if ship.persisted.fire
+                    && ship.cannon_cooldown == 0
+                    && ship.aether.cur >= p.shot_cost
+                {
+                    let vx = ship.heading.cos() * p.proj_speed;
+                    let vy = ship.heading.sin() * p.proj_speed;
+                    new_projectiles.push(ProjectileState {
+                        id: format!("proj-{next_proj_id}"),
+                        pos: ship.pos,
+                        vel: Vec2::new(vx, vy),
+                        owner: ship.id.clone(),
+                        dist_traveled: 0.0,
+                    });
+                    next_proj_id += 1;
+                    ship.aether.cur -= p.shot_cost;
+                    ship.cannon_cooldown = p.cannon_cooldown;
+                }
+            }
+
+            self.proj_id_counter = next_proj_id;
+            self.projectiles.extend(new_projectiles);
+        }
+
         // 5b. Relic pickup: for each alive ship, consume nearby Relics up to carry_cap.
         //
         // Matching harness.py per-ship order: iterate ships in order; each ship
@@ -505,6 +593,63 @@ impl Engine {
             }
         }
 
+        // 5d. Projectile movement, range despawn, hit detection, and damage events.
+        //
+        // `mem::take` moves projectiles out of `self` so we can borrow `self.ships`
+        // mutably without aliasing — the same pattern used for relics above.
+        // Matching harness.py: move each projectile THEN check hits in the same tick.
+        let mut ship_events: HashMap<ShipId, Vec<Event>> =
+            self.ships.iter().map(|s| (s.id.clone(), Vec::new())).collect();
+        {
+            let ship_radius_sq =
+                self.params.ship_radius * self.params.ship_radius;
+            let proj_range  = self.params.proj_range;
+            let cannon_dmg  = self.params.cannon_damage;
+
+            let projs = std::mem::take(&mut self.projectiles);
+            let mut alive_projs: Vec<ProjectileState> = Vec::new();
+
+            for mut proj in projs {
+                // Move projectile this tick.
+                proj.pos.x += proj.vel.x;
+                proj.pos.y += proj.vel.y;
+                let step_dist =
+                    (proj.vel.x * proj.vel.x + proj.vel.y * proj.vel.y).sqrt();
+                proj.dist_traveled += step_dist;
+
+                // Range despawn: projectile has traveled its maximum distance.
+                if proj.dist_traveled >= proj_range {
+                    continue;
+                }
+
+                // Hit detection: first alive non-owner ship within ship_radius.
+                let mut hit = false;
+                for ship in &mut self.ships {
+                    if !ship.alive || ship.id == proj.owner {
+                        continue;
+                    }
+                    let dx = ship.pos.x - proj.pos.x;
+                    let dy = ship.pos.y - proj.pos.y;
+                    if dx * dx + dy * dy < ship_radius_sq {
+                        apply_cannon_damage(
+                            ship,
+                            cannon_dmg,
+                            &proj.owner,
+                            &mut ship_events,
+                        );
+                        hit = true;
+                        break;
+                    }
+                }
+
+                if !hit {
+                    alive_projs.push(proj);
+                }
+            }
+
+            self.projectiles = alive_projs;
+        }
+
         // 6. Record the applied (persisted) intent for every ship this tick.
         let frame: IntentFrame = self
             .ships
@@ -524,10 +669,10 @@ impl Engine {
             self.spawn_relic_if_below_cap();
         }
 
-        // 8. Return empty events per ship (populated by later issues).
+        // 8. Return accumulated events per ship.
         self.ships
             .iter()
-            .map(|s| (s.id.clone(), Vec::<Event>::new()))
+            .map(|s| (s.id.clone(), ship_events.remove(&s.id).unwrap_or_default()))
             .collect()
     }
 
@@ -575,7 +720,7 @@ impl Engine {
                 .map(|r| r.to_view(self.params.relic_value))
                 .collect(),
             asteroids: vec![],
-            projectiles: vec![],
+            projectiles: self.projectiles.iter().map(|p| p.to_view()).collect(),
             singularities: vec![],
             mines: vec![],
             scores: self.scores.clone(),
@@ -613,7 +758,7 @@ impl Engine {
                 .map(|r| r.to_view(self.params.relic_value))
                 .collect(),
             asteroids: vec![],
-            projectiles: vec![],
+            projectiles: self.projectiles.iter().map(|p| p.to_view()).collect(),
             singularities: vec![],
             mines: vec![],
             scores: self.scores.clone(),
@@ -712,4 +857,69 @@ pub fn scale_drift(base: &Params, n_ships: usize) -> Params {
     p.relic_spawn_period =
         ((base.relic_spawn_period as f32) * 4.0 / (n_ships as f32)).round().max(15.0) as u32;
     p
+}
+
+// ─── Damage helper ────────────────────────────────────────────────────────────
+
+/// Apply `damage` from a rune-cannon projectile owned by `by` to `ship`.
+///
+/// Damage hits the **Shield** first; any overflow goes to the **Hull**.
+/// Resets `ship.ticks_since_last_hit` to 0 (pausing shield regen).
+/// Marks `ship.alive = false` when Hull reaches 0 — destruction consequences
+/// (relic-drop, respawn, kill-bounty) are seams left for issue 05/06.
+///
+/// Emits `Event::TookShield`, `Event::ShieldDown`, and/or `Event::TookHull`
+/// into `events` for the target ship.
+fn apply_cannon_damage(
+    ship: &mut ShipState,
+    damage: f32,
+    by: &ShipId,
+    events: &mut HashMap<ShipId, Vec<Event>>,
+) {
+    if !ship.alive || damage <= 0.0 {
+        return;
+    }
+
+    // Reset the shield-regen delay: the ship has been hit this tick.
+    ship.ticks_since_last_hit = 0;
+
+    // Shield absorbs as much as it can; remainder overflows to Hull.
+    let shield_absorbed = damage.min(ship.shield.cur);
+    let hull_overflow   = damage - shield_absorbed;
+
+    if shield_absorbed > 0.0 {
+        ship.shield.cur -= shield_absorbed;
+        events
+            .entry(ship.id.clone())
+            .or_default()
+            .push(Event::TookShield {
+                amount: shield_absorbed,
+                by: by.clone(),
+            });
+        if ship.shield.cur == 0.0 {
+            events
+                .entry(ship.id.clone())
+                .or_default()
+                .push(Event::ShieldDown);
+        }
+    }
+
+    if hull_overflow > 0.0 {
+        ship.hull.cur -= hull_overflow;
+        // Clamp so hull never goes below 0.
+        if ship.hull.cur < 0.0 {
+            ship.hull.cur = 0.0;
+        }
+        events
+            .entry(ship.id.clone())
+            .or_default()
+            .push(Event::TookHull {
+                amount: hull_overflow,
+                by: by.clone(),
+            });
+        // Seam for issue 05: hull at 0 → mark not-alive; no drop/respawn yet.
+        if ship.hull.cur <= 0.0 {
+            ship.alive = false;
+        }
+    }
 }

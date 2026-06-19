@@ -121,9 +121,19 @@ pub struct MineView {
     pub own: bool,
 }
 
-/// Per-ship events emitted by `Engine::step`.
+/// Per-ship events emitted by `Engine::step` (PROTOCOL.md §7).
 ///
-/// Only lifecycle/no-op events exist in issue 01.  Combat and economy events
-/// (tookHull, relicBanked, died, etc.) are added in later issues.
+/// Populated by combat in issue 04.  Kill/death/relic-drop events are added
+/// in issues 05/06.
 #[derive(Debug, Clone, PartialEq)]
-pub enum Event {}
+pub enum Event {
+    /// The ship's Shield absorbed `amount` damage from the rune-cannon of `by`.
+    TookShield { amount: f32, by: ShipId },
+    /// After the Shield was fully depleted, the Hull took `amount` damage from `by`.
+    /// Emitted on the same hit as `TookShield` when there is overflow.
+    TookHull { amount: f32, by: ShipId },
+    /// The ship's Shield was reduced to exactly 0 this tick (useful for reactive bots).
+    ShieldDown,
+    // Seam — issue 05 adds: Died { by: ShipId }, KilledShip { ship_id: ShipId }
+    // Seam — issue 06 adds: RelicDropped { relic_id: String, pos: Vec2 }
+}

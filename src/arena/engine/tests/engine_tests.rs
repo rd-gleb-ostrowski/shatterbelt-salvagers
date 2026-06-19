@@ -1393,3 +1393,639 @@ fn determinism_same_seed_reproduces_relic_spawns_and_score() {
         assert_eq!(s1, s2, "score for {id} must be identical: {s1} vs {s2}");
     }
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Issue 04: Rune-cannon & shield/hull damage
+//
+// TDD tracer-bullet order (mirrors issue spec):
+//  31. Firing with aether + off-cooldown spawns a projectile, deducts shot_cost,
+//      and starts the cooldown.
+//  32. Firing on cooldown produces no projectile and no cost.
+//  33. Firing without enough aether produces no projectile and no cost.
+//  34. Projectile travels at proj_speed each tick and despawns past proj_range.
+//  35. Projectile hit reduces Shield first; Hull is untouched.
+//  36. Overflow damage after Shield depletion reduces Hull.
+//  37. Shield regenerates after shield_regen_delay ticks unhit, capped at max.
+//  38. A hit emits per-ship events (TookShield / ShieldDown / TookHull).
+//  39. Golden TTK: 8 shots bring shield+hull to 0 in ~120 ticks.
+//  40. Determinism: same seed + fire-intent log → identical shield/hull state.
+// ═══════════════════════════════════════════════════════════════════════════
+
+use arena_engine::Event;
+
+// ─── helpers ─────────────────────────────────────────────────────────────────
+
+/// Two-ship engine optimised for cannon tests.
+///
+/// - Shooter at (0, 0), heading East (0 rad).
+/// - Target at (21, 0) — exactly 21 units away; a proj_speed-25 projectile
+///   reaches the target in 1 tick (projectile moves from (0,0) to (25,0);
+///   distance to target center = |25 - 21| = 4 < ship_radius 20 → HIT).
+/// - `cannon_start_hot = 0` so the cannon is ready immediately.
+/// - `cannon_cooldown = 0` by default so the test controls firing rate through
+///   params passed in.
+fn cannon_engine_with_params(p: Params) -> Engine {
+    let specs = vec![
+        ShipSpec {
+            id: "shooter".to_string(),
+            class: ShipClass::Skiff,
+            anchor_pos: Vec2 { x: 0.0, y: 0.0 },
+        },
+        ShipSpec {
+            id: "target".to_string(),
+            class: ShipClass::Skiff,
+            anchor_pos: Vec2 { x: 21.0, y: 0.0 },
+        },
+    ];
+    Engine::new(1, p, specs)
+}
+
+/// Params with `cannon_start_hot = 0` (cannon ready from tick 1).
+fn ready_params() -> Params {
+    let mut p = Params::default();
+    p.cannon_start_hot = 0;
+    p
+}
+
+/// Fire-only intent (no thrust / turn).
+fn fire_intent() -> Intent {
+    Intent {
+        fire: Some(true),
+        ..Default::default()
+    }
+}
+
+fn cease_fire() -> Intent {
+    Intent {
+        fire: Some(false),
+        ..Default::default()
+    }
+}
+
+/// Helper: look up a ship in the god-view by id.
+fn find_ship(engine: &Engine, id: &str) -> arena_engine::GodShipView {
+    engine
+        .god_view()
+        .ships
+        .into_iter()
+        .find(|s| s.id == id)
+        .unwrap_or_else(|| panic!("ship {id} not found"))
+}
+
+// ─── test 31: fire spawns projectile, deducts shot_cost, starts cooldown ─────
+
+#[test]
+fn fire_spawns_projectile_deducts_aether_starts_cooldown() {
+    // Single-ship engine so the projectile has nothing to hit and stays alive
+    // for observation after the step.
+    let p = ready_params();
+    let spec = ShipSpec {
+        id: "shooter".to_string(),
+        class: ShipClass::Skiff,
+        anchor_pos: Vec2 { x: 0.0, y: 0.0 },
+    };
+    let mut engine = Engine::new(1, p.clone(), vec![spec]);
+
+    // Confirm cannon is ready and aether is full.
+    let s0 = &engine.god_view().ships[0];
+    assert_eq!(s0.cannon_cooldown, 0, "cannon must be ready (start_hot=0)");
+    assert_eq!(s0.aether.cur, p.aether_max);
+
+    // Step with fire=true.  Shooter heading = 0 → projectile goes East.
+    engine.step(vec![("shooter".to_string(), fire_intent())]);
+
+    let view = engine.god_view();
+
+    // One projectile spawned, owned by shooter.
+    assert_eq!(view.projectiles.len(), 1, "exactly one projectile after firing");
+    assert_eq!(view.projectiles[0].owner, "shooter");
+
+    // Projectile velocity matches heading=0 East at proj_speed.
+    let pv = &view.projectiles[0].vel;
+    assert!((pv.x - p.proj_speed).abs() < 1e-4, "proj vel.x = proj_speed");
+    assert!(pv.y.abs() < 1e-4, "proj vel.y = 0 (heading East)");
+
+    // Projectile should also be visible in per-ship observation.
+    let obs = engine
+        .observation(&"shooter".to_string())
+        .expect("observation exists");
+    assert_eq!(
+        obs.projectiles.len(),
+        1,
+        "projectile visible in observation"
+    );
+
+    // Aether deducted by shot_cost (regen may offset at max so check ≤ max - cost + regen).
+    let s1 = &engine.god_view().ships[0];
+    // aether after: starts at max (100), regen applied first → capped at 100,
+    // then shot deducted: 100 - 12 = 88.
+    let expected_aether = p.aether_max - p.shot_cost;
+    assert!(
+        (s1.aether.cur - expected_aether).abs() < 0.01,
+        "aether must drop by shot_cost; expected {expected_aether}, got {}",
+        s1.aether.cur
+    );
+
+    // Cooldown started.
+    assert_eq!(
+        s1.cannon_cooldown,
+        p.cannon_cooldown,
+        "cooldown must start at cannon_cooldown after firing"
+    );
+}
+
+// ─── test 32: firing on cooldown produces no projectile and no cost ───────────
+
+#[test]
+fn fire_on_cooldown_produces_no_projectile_and_no_cost() {
+    // Default params: cannon_start_hot = 15 → cannon starts on cooldown.
+    let p = Params::default();
+    let mut engine = cannon_engine_with_params(p.clone());
+
+    let s0 = find_ship(&engine, "shooter");
+    assert_eq!(
+        s0.cannon_cooldown,
+        p.cannon_start_hot,
+        "cannon must start on cooldown"
+    );
+    let aether_before = s0.aether.cur;
+
+    // Try to fire while on cooldown.
+    engine.step(vec![("shooter".to_string(), fire_intent())]);
+
+    let view = engine.god_view();
+
+    assert_eq!(
+        view.projectiles.len(),
+        0,
+        "no projectile must be spawned while cannon is on cooldown"
+    );
+
+    let s1 = find_ship(&engine, "shooter");
+    // Aether must NOT drop by shot_cost (only regen applied, capped at max).
+    assert!(
+        s1.aether.cur >= aether_before,
+        "aether must not decrease while cannon is on cooldown; before={aether_before}, after={}",
+        s1.aether.cur
+    );
+    // Cooldown ticked down by 1.
+    assert_eq!(
+        s1.cannon_cooldown,
+        p.cannon_start_hot - 1,
+        "cooldown must tick down by 1"
+    );
+}
+
+// ─── test 33: firing without enough aether produces no projectile ─────────────
+
+#[test]
+fn fire_without_aether_produces_no_projectile() {
+    let mut p = ready_params();
+    p.aether_max = 0.0;   // ship starts with zero aether
+    p.aether_regen = 0.0; // no regen
+
+    let mut engine = cannon_engine_with_params(p);
+
+    let s0 = find_ship(&engine, "shooter");
+    assert_eq!(s0.aether.cur, 0.0, "aether must start at 0");
+    assert_eq!(s0.cannon_cooldown, 0, "cannon must be ready");
+
+    engine.step(vec![("shooter".to_string(), fire_intent())]);
+
+    let view = engine.god_view();
+    assert_eq!(
+        view.projectiles.len(),
+        0,
+        "no projectile must be spawned without sufficient aether"
+    );
+
+    // No aether was spent (it was already zero).
+    assert_eq!(
+        find_ship(&engine, "shooter").aether.cur,
+        0.0,
+        "aether must remain 0"
+    );
+}
+
+// ─── test 34: projectile travels at proj_speed and despawns past proj_range ───
+
+#[test]
+fn projectile_travels_at_proj_speed_and_despawns_past_range() {
+    let mut p = ready_params();
+    // Tune range so we can observe both travel and despawn quickly.
+    // One shot; cooldown = 9999 prevents a second.
+    p.cannon_cooldown = 9999;
+    p.proj_speed = 25.0;
+    p.proj_range = 100.0; // despawn after 4 ticks (4 × 25 = 100)
+    p.relic_spawn_period = 9999;
+
+    let specs = vec![ShipSpec {
+        id: "shooter".to_string(),
+        class: ShipClass::Skiff,
+        anchor_pos: Vec2 { x: 0.0, y: 0.0 },
+    }];
+    let mut engine = Engine::new(1, p.clone(), specs);
+
+    // Tick 1: fire → projectile at (25, 0) after movement (1 × 25).
+    engine.step(vec![("shooter".to_string(), fire_intent())]);
+    let projs = engine.god_view().projectiles;
+    assert_eq!(projs.len(), 1, "projectile alive after tick 1");
+    let px1 = projs[0].pos.x;
+    assert!(
+        (px1 - 25.0).abs() < 0.1,
+        "after tick 1 projectile at x=25; got {px1}"
+    );
+
+    // Tick 2: projectile at (50, 0).
+    engine.step(vec![]);
+    let px2 = engine.god_view().projectiles[0].pos.x;
+    assert!(
+        (px2 - 50.0).abs() < 0.1,
+        "after tick 2 projectile at x=50; got {px2}"
+    );
+
+    // Ticks 3 & 4: still alive.
+    engine.step(vec![]); // x=75
+    engine.step(vec![]); // x=100 → dist_traveled=100 >= proj_range=100 → despawn
+
+    assert_eq!(
+        engine.god_view().projectiles.len(),
+        0,
+        "projectile must despawn once dist_traveled >= proj_range"
+    );
+}
+
+// ─── test 35: projectile hit reduces Shield first; Hull is untouched ──────────
+
+#[test]
+fn projectile_hit_reduces_shield_first() {
+    let mut p = ready_params();
+    p.cannon_damage = 20.0;
+    p.shield_max = 60.0;
+    p.hull_max = 100.0;
+    p.cannon_cooldown = 999; // prevent second shot
+
+    let mut engine = cannon_engine_with_params(p.clone());
+
+    // Tick 1: fire → projectile moves 25u → hits target at (21, 0): dist = 4 < 20.
+    engine.step(vec![("shooter".to_string(), fire_intent())]);
+
+    let target = find_ship(&engine, "target");
+
+    // Shield absorbed the 20-unit hit.
+    assert!(
+        (target.shield.cur - (p.shield_max - p.cannon_damage)).abs() < 0.01,
+        "shield must drop by cannon_damage; expected {}, got {}",
+        p.shield_max - p.cannon_damage,
+        target.shield.cur
+    );
+
+    // Hull is untouched (shield absorbed everything).
+    assert!(
+        (target.hull.cur - p.hull_max).abs() < 0.01,
+        "hull must be untouched when shield absorbs the hit; got {}",
+        target.hull.cur
+    );
+
+    // Projectile consumed.
+    assert_eq!(
+        engine.god_view().projectiles.len(),
+        0,
+        "projectile must be removed after hitting a ship"
+    );
+}
+
+// ─── test 36: overflow damage reduces Hull after Shield is depleted ───────────
+
+#[test]
+fn overflow_damage_reduces_hull_after_shield_depleted() {
+    let mut p = ready_params();
+    p.cannon_damage = 20.0;
+    p.shield_max = 60.0;
+    p.hull_max = 100.0;
+    p.cannon_cooldown = 0; // fire every tick (rapid shots to strip shield quickly)
+    p.shield_regen_delay = 9999; // no regen interference
+
+    let mut engine = cannon_engine_with_params(p.clone());
+
+    // 3 shots strip the shield: 60 / 20 = 3 shots.
+    for _ in 0..3 {
+        engine.step(vec![("shooter".to_string(), fire_intent())]);
+    }
+
+    let t3 = find_ship(&engine, "target");
+    assert!(
+        t3.shield.cur <= 0.01,
+        "shield must be 0 after 3 hits; got {}",
+        t3.shield.cur
+    );
+    assert!(
+        (t3.hull.cur - p.hull_max).abs() < 0.01,
+        "hull must still be untouched after shield-only hits; got {}",
+        t3.hull.cur
+    );
+
+    // 4th shot: all 20 damage overflows to hull.
+    engine.step(vec![("shooter".to_string(), fire_intent())]);
+
+    let t4 = find_ship(&engine, "target");
+    let expected_hull = p.hull_max - p.cannon_damage;
+    assert!(
+        (t4.hull.cur - expected_hull).abs() < 0.01,
+        "4th hit must deal overflow damage to hull; expected {expected_hull}, got {}",
+        t4.hull.cur
+    );
+    assert!(
+        t4.shield.cur <= 0.01,
+        "shield must remain 0; got {}",
+        t4.shield.cur
+    );
+}
+
+// ─── test 37: shield regenerates after regen delay, capped at max ─────────────
+
+#[test]
+fn shield_regenerates_after_regen_delay_capped_at_max() {
+    let mut p = ready_params();
+    p.cannon_damage = 20.0;
+    p.shield_max = 60.0;
+    p.shield_regen = 2.0;
+    p.shield_regen_delay = 30;
+    p.cannon_cooldown = 9999; // only one shot
+
+    let mut engine = cannon_engine_with_params(p.clone());
+
+    // Tick 1: fire → shield 60 → 40.
+    engine.step(vec![("shooter".to_string(), fire_intent())]);
+
+    let after_hit = find_ship(&engine, "target").shield.cur;
+    assert!(
+        (after_hit - 40.0).abs() < 0.01,
+        "shield must be 40 after one hit; got {after_hit}"
+    );
+
+    // No more firing: regen waits for shield_regen_delay ticks.
+    // After 30 ticks the counter reaches delay → regen begins (+2/tick).
+    // Full recovery: (60 - 40) / 2 = 10 regen ticks → tick 31 + 9 = tick 40 total.
+    for _ in 0..39 {
+        engine.step(vec![("shooter".to_string(), cease_fire())]);
+    }
+    // Total: 40 steps. Last regen tick = step 40 (ticks_since_last_hit = 39 ≥ 30).
+    // shield = 40 + 2 × 10 = 60.
+    let after_regen = find_ship(&engine, "target").shield.cur;
+    assert!(
+        (after_regen - p.shield_max).abs() < 0.01,
+        "shield must fully regenerate to shield_max={} after sufficient unhit ticks; got {}",
+        p.shield_max,
+        after_regen
+    );
+
+    // Partial regen check: after only 5 regen ticks (step 35 total) shield < max.
+    // Re-run with a new engine.
+    let mut engine2 = cannon_engine_with_params(p.clone());
+    engine2.step(vec![("shooter".to_string(), fire_intent())]); // hit
+    for _ in 0..34 {
+        engine2.step(vec![("shooter".to_string(), cease_fire())]);
+    }
+    let partial = find_ship(&engine2, "target").shield.cur;
+    // At step 35 total: ticks_since_last_hit = 34, 4 regen ticks → shield = 40 + 8 = 48.
+    assert!(
+        partial > after_hit,
+        "shield must regen over time; before_regen={after_hit}, after_partial={partial}"
+    );
+    assert!(
+        partial < p.shield_max,
+        "shield must not yet be at max after only partial regen; got {partial}"
+    );
+}
+
+// ─── test 38: a hit emits per-ship events ─────────────────────────────────────
+
+#[test]
+fn hit_emits_per_ship_events() {
+    let mut p = ready_params();
+    p.cannon_damage = 20.0;
+    p.shield_max = 60.0;
+    p.hull_max = 100.0;
+    p.cannon_cooldown = 999;
+
+    let mut engine = cannon_engine_with_params(p);
+
+    // Tick 1: fire → hit target.
+    let events = engine.step(vec![("shooter".to_string(), fire_intent())]);
+
+    let target_events: &Vec<Event> = &events
+        .iter()
+        .find(|(id, _)| id == "target")
+        .expect("target entry in events")
+        .1;
+
+    // Target must receive a TookShield event with the correct amount.
+    let took_shield = target_events
+        .iter()
+        .find(|e| matches!(e, Event::TookShield { .. }));
+    assert!(
+        took_shield.is_some(),
+        "target must receive TookShield event; got: {target_events:?}"
+    );
+    if let Some(Event::TookShield { amount, by }) = took_shield {
+        assert!(
+            (amount - 20.0).abs() < 0.01,
+            "TookShield amount must equal cannon_damage; got {amount}"
+        );
+        assert_eq!(by, "shooter", "TookShield.by must be the shooter");
+    }
+
+    // Shooter must NOT receive a TookShield event (it fired, not hit).
+    let shooter_events: &Vec<Event> = &events
+        .iter()
+        .find(|(id, _)| id == "shooter")
+        .expect("shooter entry in events")
+        .1;
+    assert!(
+        !shooter_events
+            .iter()
+            .any(|e| matches!(e, Event::TookShield { .. })),
+        "shooter must not receive TookShield"
+    );
+}
+
+// ─── test 39: golden TTK — 8 shots bring shield+hull to zero ─────────────────
+//
+// Source: harness.py `combat_metrics()` with DEFAULT params:
+//   ehp            = shield_max + hull_max = 60 + 100 = 160
+//   shots_to_kill  = ceil(160 / 20)        = 8 shots
+//   ttk_ticks      = 8 × cannon_cooldown   = 8 × 15 = 120 ticks  (4.0 s at 30 Hz)
+//
+// Setup: attacker at (0, 0) heading East; defender at (21, 0) — stationary.
+// Projectile travel time = 1 tick (proj moves 25 u/tick; distance 21 u < 25 u
+// → distance to center is 4 u < ship_radius 20 u → HIT in the same tick as spawn).
+//
+// With cannon_start_hot = 15 (default): first shot fires at tick 15.
+//   Shot 1 → tick 15 → hit tick 15
+//   Shot 2 → tick 30 → hit tick 30
+//   ...
+//   Shot 8 → tick 15 + 7×15 = 120 → hit tick 120
+//   Hull reaches 0 at tick 120.
+//
+// Expected TTK: 120 ticks (4.0 s). Shield regen does NOT interfere because
+// cannon_cooldown (15) < shield_regen_delay (30).
+//
+// Test asserts: 110 ≤ TTK ≤ 135 (±15 tick / ±0.5 s tolerance), mirroring the
+// BALANCE.md "TTK ≈ 4.0 s" magnitude.
+
+#[test]
+fn golden_ttk_eight_shots_bring_hull_to_zero() {
+    // Use all-default params: cannon_start_hot=15, cannon_cooldown=15,
+    // cannon_damage=20, shield_max=60, hull_max=100, proj_speed=25.
+    let p = Params::default();
+
+    let specs = vec![
+        ShipSpec {
+            id: "attacker".to_string(),
+            class: ShipClass::Skiff,
+            anchor_pos: Vec2 { x: 0.0, y: 0.0 },
+        },
+        ShipSpec {
+            id: "defender".to_string(),
+            class: ShipClass::Skiff,
+            anchor_pos: Vec2 { x: 21.0, y: 0.0 },
+        },
+    ];
+    let mut engine = Engine::new(42, p.clone(), specs);
+
+    // Budget = harness ttk + generous margin.
+    let harness_ttk = (p.shield_max + p.hull_max) / p.cannon_damage * p.cannon_cooldown as f32;
+    // harness_ttk = (60+100)/20 * 15 = 8 * 15 = 120
+    let max_budget = (harness_ttk as u32) + 30;
+
+    let fire = Intent {
+        fire: Some(true),
+        ..Default::default()
+    };
+
+    let mut hull_zero_tick: Option<u32> = None;
+    for _ in 0..max_budget {
+        engine.step(vec![("attacker".to_string(), fire.clone())]);
+        let def = engine
+            .god_view()
+            .ships
+            .into_iter()
+            .find(|s| s.id == "defender")
+            .unwrap();
+        if def.hull.cur <= 0.0 && hull_zero_tick.is_none() {
+            hull_zero_tick = Some(engine.tick());
+        }
+    }
+
+    let ttk = hull_zero_tick
+        .expect("defender hull must reach 0 within budget ticks");
+    let defender = engine
+        .god_view()
+        .ships
+        .into_iter()
+        .find(|s| s.id == "defender")
+        .unwrap();
+
+    // Hull and shield must both be 0.
+    assert!(
+        defender.hull.cur <= 0.001,
+        "hull must be 0 after 8 hits; got {}",
+        defender.hull.cur
+    );
+    assert!(
+        defender.shield.cur <= 0.001,
+        "shield must be depleted; got {}",
+        defender.shield.cur
+    );
+
+    // Golden magnitude: TTK must be within ±15 ticks of harness prediction.
+    // harness_ttk = 120, our TTK = 120 (same-tick hit with 1-tick travel absorbed
+    // by the fact that proj moves in the spawn tick). Tolerance: ±15 ticks.
+    let ttk_seconds = ttk as f32 / p.tick_rate as f32;
+    let harness_ttk_seconds = harness_ttk / p.tick_rate as f32;
+    assert!(
+        ttk <= harness_ttk as u32 + 15,
+        "TTK {ttk} ticks ({ttk_seconds:.2}s) must be ≤ harness {harness_ttk}+15 ticks ({harness_ttk_seconds:.2}s)"
+    );
+    assert!(
+        ttk >= harness_ttk as u32 - 15,
+        "TTK {ttk} ticks must not be suspiciously fast relative to harness {harness_ttk}"
+    );
+}
+
+// ─── test 40: determinism with fire-intent log ────────────────────────────────
+
+#[test]
+fn determinism_with_fire_intent_log() {
+    // Run two engines with the same seed and same scripted fire-intents.
+    // Both must end with identical shield, hull, aether, and projectile state.
+
+    let make = || {
+        let mut p = Params::default();
+        p.cannon_start_hot = 0;
+        p.max_ticks = 60;
+        p.relic_spawn_period = 9999;
+        let specs = vec![
+            ShipSpec {
+                id: "alpha".to_string(),
+                class: ShipClass::Skiff,
+                anchor_pos: Vec2 { x: 0.0, y: 0.0 },
+            },
+            ShipSpec {
+                id: "beta".to_string(),
+                class: ShipClass::Skiff,
+                anchor_pos: Vec2 { x: 21.0, y: 0.0 },
+            },
+        ];
+        Engine::new(77, p, specs)
+    };
+
+    let scripted: Vec<Vec<(String, Intent)>> = vec![
+        vec![("alpha".to_string(), Intent { fire: Some(true), ..Default::default() })],
+        vec![],
+        vec![("alpha".to_string(), Intent { fire: Some(true), ..Default::default() })],
+        vec![("alpha".to_string(), Intent { fire: Some(false), ..Default::default() })],
+        vec![("alpha".to_string(), Intent { fire: Some(true), ..Default::default() })],
+    ];
+
+    let run = |scripted: &Vec<Vec<(String, Intent)>>| {
+        let mut e = make();
+        for frame in scripted {
+            e.step(frame.clone());
+        }
+        for _ in scripted.len()..60 {
+            e.step(vec![]);
+        }
+        e.god_view()
+    };
+
+    let v1 = run(&scripted);
+    let v2 = run(&scripted);
+
+    assert_eq!(v1.tick, v2.tick, "ticks must match");
+    assert_eq!(
+        v1.projectiles.len(),
+        v2.projectiles.len(),
+        "projectile counts must match"
+    );
+    for (s1, s2) in v1.ships.iter().zip(v2.ships.iter()) {
+        assert_eq!(s1.id, s2.id);
+        assert_eq!(
+            s1.shield.cur, s2.shield.cur,
+            "shield.cur must be identical for {}",
+            s1.id
+        );
+        assert_eq!(
+            s1.hull.cur, s2.hull.cur,
+            "hull.cur must be identical for {}",
+            s1.id
+        );
+        assert_eq!(
+            s1.aether.cur, s2.aether.cur,
+            "aether.cur must be identical for {}",
+            s1.id
+        );
+    }
+}
+
