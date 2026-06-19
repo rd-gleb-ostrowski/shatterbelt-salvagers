@@ -385,7 +385,7 @@ fn decide(policy: Policy, obs: &Observation, params: &Params) -> Intent {
     let thrust = if err.abs() < 0.5 { 1.0_f32 } else { 0.3_f32 };
 
     // Fire when aimed at the nearest enemy within range.
-    let fire = nearest_enemy.map_or(false, |e| {
+    let fire = nearest_enemy.is_some_and(|e| {
         let ea = (e.pos.y - s.pos.y).atan2(e.pos.x - s.pos.x);
         let d = dist_sq(e.pos, s.pos).sqrt();
         let aim_err = norm_angle(ea - s.heading).abs();

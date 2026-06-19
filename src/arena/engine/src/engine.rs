@@ -141,9 +141,11 @@ struct PhysicsWorld {
 
 impl PhysicsWorld {
     fn new() -> Self {
-        let mut integration_params = IntegrationParameters::default();
         // 1 time unit per step = 1 game tick; pos += vel * 1.0 each step.
-        integration_params.dt = 1.0;
+        let integration_params = IntegrationParameters {
+            dt: 1.0,
+            ..IntegrationParameters::default()
+        };
         Self {
             bodies: RigidBodySet::new(),
             colliders: ColliderSet::new(),
@@ -688,11 +690,11 @@ impl Engine {
     ///   3. Set the computed velocity on each ship's rapier body.
     ///   4. Step rapier (moves bodies by `vel * dt`, dt = 1.0).
     ///   5. Sync positions back from rapier bodies into `ship.pos`.
-    ///   5b. Relic pickup: each alive ship picks up nearby Relics up to carry_cap.
-    ///   5c. Relic banking: each ship at its Anchor banks carried Relics into score.
+    ///      5b. Relic pickup: each alive ship picks up nearby Relics up to carry_cap.
+    ///      5c. Relic banking: each ship at its Anchor banks carried Relics into score.
     ///   6. Record applied intents.
     ///   7. Advance tick.
-    ///   7b. Relic replenishment: spawn one Relic if tick % relic_spawn_period == 0.
+    ///      7b. Relic replenishment: spawn one Relic if tick % relic_spawn_period == 0.
     pub fn step(&mut self, intents: Vec<(ShipId, Intent)>) -> Vec<(ShipId, Vec<Event>)> {
         // ── Issue 06: respawn tick-down ───────────────────────────────────────
         //
@@ -1673,8 +1675,8 @@ impl Engine {
                     }
                     let dx = ship.pos.x - bolt.pos.x;
                     let dy = ship.pos.y - bolt.pos.y;
-                    if dx * dx + dy * dy < ship_r_sq {
-                        if apply_lance_damage(
+                    if dx * dx + dy * dy < ship_r_sq
+                        && apply_lance_damage(
                             ship,
                             lance_dmg,
                             &bolt.owner,
@@ -1684,7 +1686,6 @@ impl Engine {
                             ship.relics_carried     = 0;
                             ship.respawn_ticks_left = respawn_d;
                         }
-                    }
                 }
 
                 // Drop relics for lance-killed ships.
@@ -1783,7 +1784,7 @@ impl Engine {
         // 7b. Relic replenishment: spawn one Relic every relic_spawn_period ticks,
         //     matching harness.py `if tick % spawn_period == 0`.
         if self.params.relic_spawn_period > 0
-            && self.tick % self.params.relic_spawn_period == 0
+            && self.tick.is_multiple_of(self.params.relic_spawn_period)
         {
             self.spawn_relic_if_below_cap();
         }
