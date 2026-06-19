@@ -28,3 +28,4 @@ pub mod bot;
 pub mod pacer;
 pub mod routes;
 pub mod runner;
+pub mod ws;
