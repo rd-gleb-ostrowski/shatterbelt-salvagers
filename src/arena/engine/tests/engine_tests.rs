@@ -3650,3 +3650,864 @@ fn determinism_kill_respawn_scenario() {
         );
     }
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Issue 09: Self-buff Sigils — Afterburner & Bulwark
+//
+// TDD tracer-bullet order:
+//  73. Afterburner discharge raises speed above normal max_speed (boosted cap).
+//  74. No aether deducted while Afterburner active.
+//  75. Afterburner discharge does not change heading (inertia kept).
+//  76. Afterburner expires after afterburner_dur steps; speed cap reverts.
+//  77. Afterburner active state visible in SelfView.afterburner_ticks_left.
+//  78. Bulwark discharge refills/overcharges Shield to shield_max.
+//  79. Bulwark grants invuln = true for bulwark_immunity ticks.
+//  80. Cannon damage does nothing during Bulwark immunity.
+//  81. Collision damage does nothing during Bulwark immunity.
+//  82. Bulwark expires: invuln = false, BulwarkExpired event emitted.
+//  83. Golden: Afterburner reaches max_speed * afterburner_speed_mult.
+//  84. Golden: Bulwark shields and invuln window exact magnitudes.
+//  85. Determinism: same seed → same sigil-effect outcomes.
+// ═══════════════════════════════════════════════════════════════════════════
+
+use arena_engine::Sigil;
+
+// ─── helpers ─────────────────────────────────────────────────────────────────
+
+/// Minimal engine for sigil-effect tests: one ship at centre, no relics,
+/// no asteroids, no relic replenishment, cannon on ice.
+fn sigil_effect_engine() -> Engine {
+    let mut p = Params::default();
+    p.relic_field_cap = 0;
+    p.relic_spawn_period = 9999;
+    p.n_asteroids = 0;
+    p.cannon_start_hot = 9999;
+    // Start with zero aether so we can measure it cleanly later.
+    p.aether_max = 100.0;
+    p.aether_regen = 0.0; // no regen — isolates the "free during AB" test
+    let spec = ShipSpec {
+        id: "ship-1".to_string(),
+        class: ShipClass::Skiff,
+        anchor_pos: Vec2 { x: 500.0, y: 600.0 },
+    };
+    Engine::new(42, p, vec![spec])
+}
+
+/// Two-ship engine for Bulwark cannon-immunity tests.
+///
+/// Shooter at (0,0) heading East; ship-1 at (21,0) — 1-tick kill range.
+/// `cannon_start_hot = 0` so the cannon fires immediately.
+/// `aether_regen = 100` so the shooter never runs out of aether.
+fn bulwark_cannon_engine() -> Engine {
+    let mut p = Params::default();
+    p.relic_field_cap = 0;
+    p.relic_spawn_period = 9999;
+    p.n_asteroids = 0;
+    p.cannon_start_hot = 0;
+    p.cannon_cooldown = 0; // rapid fire
+    p.cannon_damage = 20.0;
+    p.shield_max = 60.0;
+    p.hull_max = 100.0;
+    p.shield_regen_delay = 9999;
+    p.aether_max = 10000.0; // shooter never runs out of aether
+    p.aether_regen = 100.0;
+    let specs = vec![
+        ShipSpec {
+            id: "shooter".to_string(),
+            class: ShipClass::Skiff,
+            anchor_pos: Vec2 { x: 0.0, y: 0.0 },
+        },
+        ShipSpec {
+            id: "ship-1".to_string(),
+            class: ShipClass::Skiff,
+            anchor_pos: Vec2 { x: 21.0, y: 0.0 },
+        },
+    ];
+    Engine::new(42, p, specs)
+}
+
+// ─── test 73: Afterburner discharge raises speed above normal max_speed ───────
+//
+// With no Afterburner the speed cap is max_speed = 12.0.
+// With Afterburner (afterburner_speed_mult = 1.5) the cap is 18.0.
+// After enough thrust ticks, the Afterburner ship must exceed 12.0.
+
+#[test]
+fn afterburner_discharge_raises_speed_above_normal_cap() {
+    let params = Params::default();
+
+    // Reference: ship with NO Afterburner, full thrust to terminal velocity.
+    let make_base = || {
+        let mut p = params.clone();
+        p.relic_field_cap = 0;
+        p.relic_spawn_period = 9999;
+        p.n_asteroids = 0;
+        let spec = ShipSpec {
+            id: "s".to_string(),
+            class: ShipClass::Skiff,
+            anchor_pos: Vec2 { x: 500.0, y: 600.0 },
+        };
+        Engine::new(1, p, vec![spec])
+    };
+
+    let mut base = make_base();
+    let thrust = Intent { thrust: Some(1.0), ..Default::default() };
+    for _ in 0..60 {
+        base.step(vec![("s".to_string(), thrust.clone())]);
+    }
+    let base_spd = {
+        let v = base.god_view().ships[0].vel;
+        (v.x * v.x + v.y * v.y).sqrt()
+    };
+    // Baseline must be at or very near max_speed.
+    assert!(
+        (base_spd - params.max_speed).abs() < 0.5,
+        "baseline ship should reach max_speed={}, got {base_spd}",
+        params.max_speed
+    );
+
+    // Afterburner ship: grant + discharge Afterburner, then full thrust.
+    let mut ab = make_base();
+    ab.set_sigil_for_test("s", Some(Sigil::Afterburner));
+    let discharge = Intent { sigil: Some(true), thrust: Some(1.0), ..Default::default() };
+    ab.step(vec![("s".to_string(), discharge)]);
+    let thrust_intent = Intent { thrust: Some(1.0), ..Default::default() };
+    // Run for the full Afterburner window so the ship reaches the boosted cap.
+    for _ in 0..params.afterburner_dur {
+        ab.step(vec![("s".to_string(), thrust_intent.clone())]);
+    }
+    let ab_spd = {
+        let v = ab.god_view().ships[0].vel;
+        (v.x * v.x + v.y * v.y).sqrt()
+    };
+
+    assert!(
+        ab_spd > params.max_speed + 0.5,
+        "Afterburner ship speed ({ab_spd}) must exceed normal max_speed={}",
+        params.max_speed
+    );
+    let boosted_cap = params.max_speed * params.afterburner_speed_mult;
+    assert!(
+        ab_spd <= boosted_cap + 0.1,
+        "Afterburner speed ({ab_spd}) must not exceed boosted cap {boosted_cap}"
+    );
+}
+
+// ─── test 74: no aether deducted while Afterburner active ─────────────────────
+
+#[test]
+fn afterburner_no_aether_cost_while_active() {
+    let mut p = Params::default();
+    p.relic_field_cap = 0;
+    p.relic_spawn_period = 9999;
+    p.n_asteroids = 0;
+    p.aether_max = 100.0;
+    p.aether_regen = 0.0;   // no regen — isolates cost
+    p.thrust_cost_full = 5.0; // high cost so change is visible without AB
+
+    let spec = ShipSpec {
+        id: "s".to_string(),
+        class: ShipClass::Skiff,
+        anchor_pos: Vec2 { x: 500.0, y: 600.0 },
+    };
+    let mut engine = Engine::new(1, p.clone(), vec![spec]);
+    let aether_start = engine.god_view().ships[0].aether.cur;
+    assert!((aether_start - p.aether_max).abs() < 0.01, "aether must start full");
+
+    // Grant + discharge Afterburner, then thrust for afterburner_dur ticks.
+    engine.set_sigil_for_test("s", Some(Sigil::Afterburner));
+    let discharge = Intent { sigil: Some(true), thrust: Some(1.0), ..Default::default() };
+    engine.step(vec![("s".to_string(), discharge)]);
+    let aether_after_discharge = engine.god_view().ships[0].aether.cur;
+    // Discharge tick: physics runs BEFORE discharge (no AB yet), so aether is
+    // still deducted for that tick.
+
+    // During the afterburner_dur boost window: thrust but no aether cost.
+    let thrust_intent = Intent { thrust: Some(1.0), ..Default::default() };
+    for _ in 0..p.afterburner_dur {
+        let aether_before_tick = engine.god_view().ships[0].aether.cur;
+        engine.step(vec![("s".to_string(), thrust_intent.clone())]);
+        let aether_after_tick = engine.god_view().ships[0].aether.cur;
+        assert!(
+            (aether_after_tick - aether_before_tick).abs() < 0.01,
+            "aether must not decrease during Afterburner window; \
+             before={aether_before_tick}, after={aether_after_tick}"
+        );
+    }
+
+    // One step after the window: Afterburner expired, cost resumes.
+    let aether_before_post = engine.god_view().ships[0].aether.cur;
+    engine.step(vec![("s".to_string(), thrust_intent.clone())]);
+    let aether_after_post = engine.god_view().ships[0].aether.cur;
+    assert!(
+        aether_after_post < aether_before_post,
+        "aether must decrease again after Afterburner expires; \
+         before={aether_before_post}, after={aether_after_post}"
+    );
+    let _ = aether_after_discharge; // suppress unused warning
+}
+
+// ─── test 75: Afterburner discharge does not change heading ───────────────────
+
+#[test]
+fn afterburner_discharge_does_not_change_heading() {
+    let mut p = Params::default();
+    p.relic_field_cap = 0;
+    p.relic_spawn_period = 9999;
+    p.n_asteroids = 0;
+
+    let spec = ShipSpec {
+        id: "s".to_string(),
+        class: ShipClass::Skiff,
+        anchor_pos: Vec2 { x: 500.0, y: 600.0 },
+    };
+    let mut engine = Engine::new(1, p.clone(), vec![spec]);
+
+    // Set a non-zero heading first.
+    let turn_intent = Intent { turn: Some(0.5), ..Default::default() };
+    engine.step(vec![("s".to_string(), turn_intent)]);
+    let heading_before = engine.god_view().ships[0].heading;
+    assert!(heading_before > 0.0, "heading must be non-zero before discharge");
+
+    // Discharge Afterburner — heading must not snap.
+    engine.set_sigil_for_test("s", Some(Sigil::Afterburner));
+    let discharge_no_turn = Intent { sigil: Some(true), turn: Some(0.0), ..Default::default() };
+    engine.step(vec![("s".to_string(), discharge_no_turn)]);
+    let heading_after = engine.god_view().ships[0].heading;
+
+    assert!(
+        (heading_after - heading_before).abs() < 1e-4,
+        "Afterburner discharge must not snap heading; before={heading_before}, after={heading_after}"
+    );
+}
+
+// ─── test 76: Afterburner expires after afterburner_dur steps ─────────────────
+
+#[test]
+fn afterburner_expires_after_dur_steps() {
+    let params = Params::default();
+    let mut p = params.clone();
+    p.relic_field_cap = 0;
+    p.relic_spawn_period = 9999;
+    p.n_asteroids = 0;
+    p.aether_regen = 0.0; // no regen so aether can go to 0 to stop thrust post-AB
+
+    let spec = ShipSpec {
+        id: "s".to_string(),
+        class: ShipClass::Skiff,
+        anchor_pos: Vec2 { x: 500.0, y: 600.0 },
+    };
+    let mut engine = Engine::new(1, p.clone(), vec![spec]);
+
+    // Discharge Afterburner.
+    engine.set_sigil_for_test("s", Some(Sigil::Afterburner));
+    let discharge = Intent { sigil: Some(true), ..Default::default() };
+    engine.step(vec![("s".to_string(), discharge)]);
+
+    // Run exactly afterburner_dur boost steps with max thrust.
+    let thrust_intent = Intent { thrust: Some(1.0), ..Default::default() };
+    for _ in 0..params.afterburner_dur {
+        engine.step(vec![("s".to_string(), thrust_intent.clone())]);
+    }
+
+    // At this point: afterburner_ticks_left should be 0, speed cap = boosted.
+    // But the last boosted step brought speed to the boosted cap.
+    // Now run ONE more step with thrust — speed must be capped at max_speed.
+    // We need enough aether for the post-expiry step to show the cap.
+    // Set aether artificially to ensure thrust is effective post-AB.
+    // (Actually, since aether_regen=0, after the AB window the ship may be out of
+    //  aether, meaning thrust is ineffective — but we test damping instead.)
+
+    // Actually: during AB window aether is free (no cost). After window, cost applies.
+    // With aether_regen=0 and aether_max=100 and thrust_cost_full=1.0, the ship's
+    // aether is still ~100 right after AB expires (no cost during window), so
+    // the next thrust step IS effective and will be capped at max_speed.
+    engine.step(vec![("s".to_string(), thrust_intent.clone())]);
+
+    let v = engine.god_view().ships[0].vel;
+    let spd = (v.x * v.x + v.y * v.y).sqrt();
+    assert!(
+        spd <= params.max_speed + 0.1,
+        "after Afterburner expires speed must be capped at max_speed={}; got {spd}",
+        params.max_speed
+    );
+    // Must also be at or near max_speed (ship is thrusting hard).
+    assert!(
+        spd >= params.max_speed - 0.5,
+        "after Afterburner expires speed must be near max_speed={}; got {spd}",
+        params.max_speed
+    );
+}
+
+// ─── test 77: Afterburner active visible in SelfView.afterburner_ticks_left ───
+
+#[test]
+fn afterburner_active_visible_in_self_view() {
+    let params = Params::default();
+    let mut p = params.clone();
+    p.relic_field_cap = 0;
+    p.relic_spawn_period = 9999;
+    p.n_asteroids = 0;
+
+    let spec = ShipSpec {
+        id: "s".to_string(),
+        class: ShipClass::Skiff,
+        anchor_pos: Vec2 { x: 500.0, y: 600.0 },
+    };
+    let mut engine = Engine::new(1, p.clone(), vec![spec]);
+
+    // Before discharge: ticks_left == 0.
+    let obs0 = engine.observation(&"s".to_string()).unwrap();
+    assert_eq!(
+        obs0.self_view.afterburner_ticks_left, 0,
+        "afterburner_ticks_left must be 0 before discharge"
+    );
+
+    // Discharge.
+    engine.set_sigil_for_test("s", Some(Sigil::Afterburner));
+    let discharge = Intent { sigil: Some(true), ..Default::default() };
+    engine.step(vec![("s".to_string(), discharge)]);
+
+    // After discharge: ticks_left > 0.
+    let obs1 = engine.observation(&"s".to_string()).unwrap();
+    assert!(
+        obs1.self_view.afterburner_ticks_left > 0,
+        "afterburner_ticks_left must be > 0 after discharge; got {}",
+        obs1.self_view.afterburner_ticks_left
+    );
+
+    // Also visible in god_view.
+    let gv = engine.god_view().ships[0].afterburner_ticks_left;
+    assert_eq!(
+        gv, obs1.self_view.afterburner_ticks_left,
+        "god_view.afterburner_ticks_left must match SelfView"
+    );
+
+    // After the full window: ticks_left == 0.
+    let no_op = Intent::default();
+    for _ in 0..params.afterburner_dur {
+        engine.step(vec![("s".to_string(), no_op.clone())]);
+    }
+    let obs_end = engine.observation(&"s".to_string()).unwrap();
+    assert_eq!(
+        obs_end.self_view.afterburner_ticks_left, 0,
+        "afterburner_ticks_left must be 0 after window expires"
+    );
+}
+
+// ─── test 78: Bulwark discharge refills Shield to shield_max ──────────────────
+
+#[test]
+fn bulwark_discharge_refills_shield_to_max() {
+    let mut p = Params::default();
+    p.relic_field_cap = 0;
+    p.relic_spawn_period = 9999;
+    p.n_asteroids = 0;
+    p.cannon_start_hot = 0;
+    p.cannon_damage = 20.0;
+    p.shield_max = 60.0;
+    p.shield_regen_delay = 9999;
+
+    let specs = vec![
+        ShipSpec {
+            id: "shooter".to_string(),
+            class: ShipClass::Skiff,
+            anchor_pos: Vec2 { x: 0.0, y: 0.0 },
+        },
+        ShipSpec {
+            id: "ship-1".to_string(),
+            class: ShipClass::Skiff,
+            anchor_pos: Vec2 { x: 21.0, y: 0.0 },
+        },
+    ];
+    let mut engine = Engine::new(42, p.clone(), vec![specs[0].clone(), specs[1].clone()]);
+
+    // Damage ship-1's shield.
+    engine.step(vec![("shooter".to_string(), fire_intent())]);
+    let shield_after_hit = find_ship(&engine, "ship-1").shield.cur;
+    assert!(
+        shield_after_hit < p.shield_max,
+        "shield must have been reduced; got {shield_after_hit}"
+    );
+
+    // Discharge Bulwark on ship-1 — shield must jump to shield_max.
+    engine.set_sigil_for_test("ship-1", Some(Sigil::Bulwark));
+    let discharge = Intent { sigil: Some(true), ..Default::default() };
+    engine.step(vec![("ship-1".to_string(), discharge)]);
+
+    let shield_after_bulwark = find_ship(&engine, "ship-1").shield.cur;
+    assert!(
+        (shield_after_bulwark - p.shield_max).abs() < 0.01,
+        "Bulwark must refill shield to shield_max={}; got {shield_after_bulwark}",
+        p.shield_max
+    );
+}
+
+// ─── test 79: Bulwark grants invuln = true for bulwark_immunity ticks ─────────
+
+#[test]
+fn bulwark_grants_invuln_for_immunity_ticks() {
+    let params = Params::default();
+    let mut engine = sigil_effect_engine();
+
+    // Discharge Bulwark.
+    engine.set_sigil_for_test("ship-1", Some(Sigil::Bulwark));
+    let discharge = Intent { sigil: Some(true), ..Default::default() };
+    engine.step(vec![("ship-1".to_string(), discharge)]);
+
+    // invuln must be immediately true.
+    let obs = engine.observation(&"ship-1".to_string()).unwrap();
+    assert!(
+        obs.self_view.invuln,
+        "invuln must be true immediately after Bulwark discharge"
+    );
+
+    // invuln must persist for exactly bulwark_immunity ticks.
+    let no_op = Intent::default();
+    for tick_i in 0..params.bulwark_immunity {
+        let obs_i = engine.observation(&"ship-1".to_string()).unwrap();
+        assert!(
+            obs_i.self_view.invuln,
+            "invuln must be true at tick {tick_i} of bulwark window"
+        );
+        engine.step(vec![("ship-1".to_string(), no_op.clone())]);
+    }
+
+    // After the full window: invuln = false.
+    let obs_end = engine.observation(&"ship-1".to_string()).unwrap();
+    assert!(
+        !obs_end.self_view.invuln,
+        "invuln must expire after bulwark_immunity={} ticks",
+        params.bulwark_immunity
+    );
+}
+
+// ─── test 80: Cannon damage blocked during Bulwark immunity ───────────────────
+
+#[test]
+fn cannon_damage_blocked_during_bulwark() {
+    let mut engine = bulwark_cannon_engine();
+    let p = Params::default();
+
+    // Discharge Bulwark on ship-1.
+    engine.set_sigil_for_test("ship-1", Some(Sigil::Bulwark));
+    let discharge = Intent { sigil: Some(true), ..Default::default() };
+    engine.step(vec![
+        ("ship-1".to_string(), discharge),
+        ("shooter".to_string(), fire_intent()),
+    ]);
+
+    // Check that no damage events were received (Bulwark active = invuln).
+    // We need to run one more step because the discharge tick's cannon fire
+    // should have been blocked by the Bulwark invuln set in 5_sigil.
+    let shield_after = find_ship(&engine, "ship-1").shield.cur;
+    assert!(
+        (shield_after - p.shield_max).abs() < 0.01,
+        "shield must be at max (Bulwark refill); no cannon damage while invuln; \
+         got shield={shield_after}"
+    );
+
+    // Hull must be untouched.
+    let hull_after = find_ship(&engine, "ship-1").hull.cur;
+    assert!(
+        (hull_after - p.hull_max).abs() < 0.01,
+        "hull must be untouched during Bulwark; got {hull_after}"
+    );
+
+    // Fire for the entire Bulwark immunity window — no damage.
+    let fire = fire_intent();
+    for tick_i in 0..p.bulwark_immunity {
+        assert!(
+            find_ship(&engine, "ship-1").invuln,
+            "ship-1 must be invuln at tick {tick_i} of window"
+        );
+        let events = engine.step(vec![("shooter".to_string(), fire.clone())]);
+        let ship1_evs = &events.iter().find(|(id, _)| id == "ship-1").unwrap().1;
+        let took_dmg = ship1_evs.iter().any(|e| {
+            matches!(
+                e,
+                Event::TookShield { .. }
+                    | Event::TookHull { .. }
+                    | Event::ShieldDown
+                    | Event::Died { .. }
+            )
+        });
+        assert!(
+            !took_dmg,
+            "no cannon damage during Bulwark window at tick {tick_i}; \
+             got {ship1_evs:?}"
+        );
+    }
+
+    // After window: ship-1 no longer invuln — next shot must land.
+    assert!(
+        !find_ship(&engine, "ship-1").invuln,
+        "ship-1 must no longer be invuln after bulwark_immunity ticks"
+    );
+    let hull_pre = find_ship(&engine, "ship-1").hull.cur;
+    let events_post = engine.step(vec![("shooter".to_string(), fire_intent())]);
+    let post_evs = &events_post.iter().find(|(id, _)| id == "ship-1").unwrap().1;
+    let took_dmg_post = post_evs.iter().any(|e| {
+        matches!(e, Event::TookShield { .. } | Event::TookHull { .. } | Event::Died { .. })
+    });
+    assert!(
+        took_dmg_post,
+        "cannon must deal damage after Bulwark expires; events={post_evs:?}"
+    );
+    let hull_post = find_ship(&engine, "ship-1").hull.cur;
+    // Shield absorbed the shot (it may have regenerated some by now, but shield > 0
+    // post-Bulwark refill means hull is untouched and shield takes the hit).
+    let shield_post = find_ship(&engine, "ship-1").shield.cur;
+    assert!(
+        hull_post <= hull_pre || shield_post < p.shield_max,
+        "damage must have landed after Bulwark expires; hull: {hull_pre}→{hull_post}, \
+         shield: {}→{shield_post}", p.shield_max
+    );
+}
+
+// ─── test 81: Collision damage blocked during Bulwark immunity ────────────────
+
+#[test]
+fn collision_damage_blocked_during_bulwark() {
+    let mut p = Params::default();
+    p.collision_enabled = true;
+    p.n_asteroids = 0;
+    p.relic_field_cap = 0;
+    p.relic_spawn_period = 9999;
+    p.cannon_start_hot = 9999;
+    p.arena_w = 200.0;
+    p.arena_h = 400.0;
+    p.shield_regen_delay = 9999;
+    p.coll_threshold = 0.0; // any speed causes damage
+
+    let spec = ShipSpec {
+        id: "s".to_string(),
+        class: ShipClass::Skiff,
+        anchor_pos: Vec2 { x: 100.0, y: 200.0 },
+    };
+    let mut engine = Engine::new(1, p.clone(), vec![spec]);
+
+    // Discharge Bulwark.
+    engine.set_sigil_for_test("s", Some(Sigil::Bulwark));
+    let discharge = Intent { sigil: Some(true), ..Default::default() };
+    engine.step(vec![("s".to_string(), discharge)]);
+
+    let shield_start = engine.god_view().ships[0].shield.cur;
+    assert!(
+        (shield_start - p.shield_max).abs() < 0.01,
+        "Bulwark must refill shield"
+    );
+
+    // Thrust into the wall while invuln — no collision damage.
+    let thrust_east = Intent { thrust: Some(1.0), turn: Some(0.0), ..Default::default() };
+    let mut wall_hit = false;
+    for _ in 0..200 {
+        let events = engine.step(vec![("s".to_string(), thrust_east.clone())]);
+        if engine.god_view().ships[0].vel.x < 0.0 {
+            wall_hit = true;
+            let s_evs = &events.iter().find(|(id, _)| id == "s").unwrap().1;
+            let took_coll = s_evs.iter().any(|e| {
+                matches!(
+                    e,
+                    Event::CollisionTookShield { .. } | Event::CollisionTookHull { .. }
+                )
+            });
+            assert!(
+                !took_coll,
+                "Bulwark must block collision events during immunity; got {s_evs:?}"
+            );
+            break;
+        }
+    }
+    assert!(wall_hit, "ship must eventually hit a wall (Bulwark active)");
+    let shield_after = engine.god_view().ships[0].shield.cur;
+    assert!(
+        (shield_after - p.shield_max).abs() < 0.01,
+        "shield must be unchanged after Bulwark collision block; \
+         start={shield_start}, after={shield_after}"
+    );
+}
+
+// ─── test 82: Bulwark expires → invuln=false, BulwarkExpired event emitted ────
+
+#[test]
+fn bulwark_expires_invuln_false_and_event_emitted() {
+    let params = Params::default();
+    let mut engine = sigil_effect_engine();
+
+    // Discharge Bulwark.
+    engine.set_sigil_for_test("ship-1", Some(Sigil::Bulwark));
+    let discharge = Intent { sigil: Some(true), ..Default::default() };
+    engine.step(vec![("ship-1".to_string(), discharge)]);
+
+    // Run bulwark_immunity - 1 steps (last step with invuln still active).
+    let no_op = Intent::default();
+    for _ in 0..(params.bulwark_immunity - 1) {
+        engine.step(vec![("ship-1".to_string(), no_op.clone())]);
+    }
+    assert!(
+        find_ship(&engine, "ship-1").invuln,
+        "ship-1 must still be invuln one step before window ends"
+    );
+
+    // Final step of the window: BulwarkExpired event emitted; invuln cleared.
+    let events = engine.step(vec![("ship-1".to_string(), no_op.clone())]);
+    let ship_evs = &events.iter().find(|(id, _)| id == "ship-1").unwrap().1;
+
+    // BulwarkExpired event must be present.
+    let expired = ship_evs.iter().any(|e| matches!(e, Event::BulwarkExpired));
+    assert!(
+        expired,
+        "BulwarkExpired must be emitted when immunity window ends; got {ship_evs:?}"
+    );
+
+    // invuln must now be false.
+    assert!(
+        !find_ship(&engine, "ship-1").invuln,
+        "invuln must be false after Bulwark expires"
+    );
+}
+
+// ─── test 83: golden — Afterburner reaches max_speed * afterburner_speed_mult ─
+//
+// Parameters (from params.py / Params::default()):
+//   max_speed = 12.0, afterburner_speed_mult = 1.5, afterburner_dur = 30
+//   afterburner_thrust_mult = 3.0
+//
+// After enough thrust ticks with Afterburner active, the ship's speed must
+// settle at ≈ max_speed * afterburner_speed_mult = 18.0.
+//
+// Source: params.py afterburner_speed_mult = 1.5, max_speed = 12.0 → 18.0.
+
+#[test]
+fn golden_afterburner_reaches_boosted_speed_cap() {
+    let params = Params::default();
+    let mut p = params.clone();
+    p.relic_field_cap = 0;
+    p.relic_spawn_period = 9999;
+    p.n_asteroids = 0;
+    p.aether_regen = 1.2; // same as default (aether free during AB anyway)
+
+    let spec = ShipSpec {
+        id: "pilot".to_string(),
+        class: ShipClass::Skiff,
+        anchor_pos: Vec2 { x: 1000.0, y: 600.0 },
+    };
+    let mut engine = Engine::new(7, p.clone(), vec![spec]);
+
+    // Discharge Afterburner.
+    engine.set_sigil_for_test("pilot", Some(Sigil::Afterburner));
+    let discharge = Intent { sigil: Some(true), thrust: Some(1.0), ..Default::default() };
+    engine.step(vec![("pilot".to_string(), discharge)]);
+
+    // Thrust hard for the full Afterburner window.
+    let thrust_intent = Intent { thrust: Some(1.0), ..Default::default() };
+    for _ in 0..params.afterburner_dur {
+        engine.step(vec![("pilot".to_string(), thrust_intent.clone())]);
+    }
+
+    let v = engine.god_view().ships[0].vel;
+    let spd = (v.x * v.x + v.y * v.y).sqrt();
+
+    // Golden magnitude: speed must be within ±10% of the boosted cap.
+    let expected_cap = params.max_speed * params.afterburner_speed_mult; // 12 * 1.5 = 18.0
+    assert!(
+        spd > params.max_speed + 0.5,
+        "golden: Afterburner speed ({spd}) must exceed normal max_speed={}",
+        params.max_speed
+    );
+    assert!(
+        spd <= expected_cap + 0.5,
+        "golden: Afterburner speed ({spd}) must not exceed boosted cap {expected_cap}"
+    );
+    assert!(
+        spd >= expected_cap - expected_cap * 0.10,
+        "golden: Afterburner speed ({spd}) must be near boosted cap {expected_cap} (±10%)"
+    );
+}
+
+// ─── test 84: golden — Bulwark: exact magnitudes ─────────────────────────────
+//
+// Parameters (from params.py / Params::default()):
+//   shield_max = 60.0, bulwark_immunity = 45
+//
+// Setup:
+//   - Damage ship-1's shield to 0.
+//   - Discharge Bulwark → shield must jump to exactly 60.0.
+//   - Cannon fires for 45 consecutive ticks → NO damage (invuln=true).
+//   - Tick 46 (after immunity) → cannon lands, events emitted.
+//
+// Source: params.py shield_max=60, bulwark_immunity=45.
+
+#[test]
+fn golden_bulwark_exact_magnitudes() {
+    let params = Params::default();
+    let mut p = params.clone();
+    p.relic_field_cap = 0;
+    p.relic_spawn_period = 9999;
+    p.n_asteroids = 0;
+    p.cannon_start_hot = 0;
+    p.cannon_cooldown = 0;  // rapid fire
+    p.cannon_damage = 20.0;
+    p.shield_max = 60.0;
+    p.hull_max = 100.0;
+    p.shield_regen_delay = 9999;
+    p.aether_max = 10000.0;  // shooter never runs out
+    p.aether_regen = 100.0;
+
+    let specs = vec![
+        ShipSpec {
+            id: "shooter".to_string(),
+            class: ShipClass::Skiff,
+            anchor_pos: Vec2 { x: 0.0, y: 0.0 },
+        },
+        ShipSpec {
+            id: "ship-1".to_string(),
+            class: ShipClass::Skiff,
+            anchor_pos: Vec2 { x: 21.0, y: 0.0 },
+        },
+    ];
+    let mut engine = Engine::new(7, p.clone(), vec![specs[0].clone(), specs[1].clone()]);
+
+    // Strip ship-1's shield to 0 (3 shots = 3 × 20 = 60 = shield_max).
+    for _ in 0..3 {
+        engine.step(vec![("shooter".to_string(), fire_intent())]);
+    }
+    assert!(
+        find_ship(&engine, "ship-1").shield.cur <= 0.01,
+        "shield must be depleted before Bulwark test; got {}",
+        find_ship(&engine, "ship-1").shield.cur
+    );
+
+    // Discharge Bulwark → shield must jump to exactly shield_max.
+    engine.set_sigil_for_test("ship-1", Some(Sigil::Bulwark));
+    let discharge = Intent { sigil: Some(true), ..Default::default() };
+    engine.step(vec![("ship-1".to_string(), discharge)]);
+
+    let shield_after = find_ship(&engine, "ship-1").shield.cur;
+    assert!(
+        (shield_after - p.shield_max).abs() < 0.01,
+        "golden: Bulwark must refill shield to exactly shield_max={}; got {shield_after}",
+        p.shield_max
+    );
+    assert!(
+        find_ship(&engine, "ship-1").invuln,
+        "golden: invuln must be true immediately after Bulwark discharge"
+    );
+
+    // Fire for exactly bulwark_immunity ticks — ALL must be blocked.
+    let fire = fire_intent();
+    let mut blocked_count = 0u32;
+    for tick_i in 0..p.bulwark_immunity {
+        assert!(
+            find_ship(&engine, "ship-1").invuln,
+            "golden: invuln must be true at tick {tick_i} of bulwark window"
+        );
+        let events = engine.step(vec![("shooter".to_string(), fire.clone())]);
+        let evs = &events.iter().find(|(id, _)| id == "ship-1").unwrap().1;
+        let took = evs.iter().any(|e| {
+            matches!(
+                e,
+                Event::TookShield { .. }
+                    | Event::TookHull { .. }
+                    | Event::Died { .. }
+                    | Event::ShieldDown
+            )
+        });
+        if !took {
+            blocked_count += 1;
+        }
+    }
+    assert_eq!(
+        blocked_count, p.bulwark_immunity,
+        "golden: ALL {bulwark_immunity} ticks must be blocked; got {blocked_count}",
+        bulwark_immunity = p.bulwark_immunity
+    );
+
+    // After the window: invuln=false and damage lands.
+    assert!(
+        !find_ship(&engine, "ship-1").invuln,
+        "golden: invuln must be false after bulwark_immunity={} ticks",
+        p.bulwark_immunity
+    );
+    let events_post = engine.step(vec![("shooter".to_string(), fire_intent())]);
+    let post_evs = &events_post.iter().find(|(id, _)| id == "ship-1").unwrap().1;
+    let took_post = post_evs.iter().any(|e| {
+        matches!(
+            e,
+            Event::TookShield { .. } | Event::TookHull { .. } | Event::Died { .. }
+        )
+    });
+    assert!(
+        took_post,
+        "golden: cannon must deal damage after Bulwark expires; events={post_evs:?}"
+    );
+}
+
+// ─── test 85: determinism — same seed + sigil-discharge sequence ──────────────
+
+#[test]
+fn determinism_sigil_effects() {
+    let make = || {
+        let mut p = Params::default();
+        p.relic_field_cap = 0;
+        p.relic_spawn_period = 9999;
+        p.n_asteroids = 0;
+        p.aether_regen = 1.2;
+        let spec = ShipSpec {
+            id: "pilot".to_string(),
+            class: ShipClass::Skiff,
+            anchor_pos: Vec2 { x: 500.0, y: 600.0 },
+        };
+        Engine::new(55, p, vec![spec])
+    };
+
+    let run_ab = || {
+        let mut e = make();
+        e.set_sigil_for_test("pilot", Some(Sigil::Afterburner));
+        let discharge = Intent { sigil: Some(true), thrust: Some(1.0), ..Default::default() };
+        e.step(vec![("pilot".to_string(), discharge)]);
+        let thrust = Intent { thrust: Some(1.0), ..Default::default() };
+        for _ in 0..50 {
+            e.step(vec![("pilot".to_string(), thrust.clone())]);
+        }
+        e.god_view()
+    };
+
+    let v1 = run_ab();
+    let v2 = run_ab();
+
+    assert_eq!(v1.tick, v2.tick, "tick must be identical");
+    let (s1, s2) = (&v1.ships[0], &v2.ships[0]);
+    assert_eq!(s1.vel.x, s2.vel.x, "vel.x must be identical");
+    assert_eq!(s1.vel.y, s2.vel.y, "vel.y must be identical");
+    assert_eq!(
+        s1.afterburner_ticks_left, s2.afterburner_ticks_left,
+        "afterburner_ticks_left must be identical"
+    );
+    assert_eq!(s1.aether.cur, s2.aether.cur, "aether must be identical");
+
+    // Bulwark determinism.
+    let run_bw = || {
+        let mut e = make();
+        e.set_sigil_for_test("pilot", Some(Sigil::Bulwark));
+        let discharge = Intent { sigil: Some(true), ..Default::default() };
+        e.step(vec![("pilot".to_string(), discharge)]);
+        for _ in 0..60 {
+            e.step(vec![]);
+        }
+        e.god_view()
+    };
+
+    let bv1 = run_bw();
+    let bv2 = run_bw();
+    assert_eq!(
+        bv1.ships[0].invuln, bv2.ships[0].invuln,
+        "invuln must be identical after Bulwark scenario"
+    );
+    assert_eq!(
+        bv1.ships[0].shield.cur, bv2.ships[0].shield.cur,
+        "shield.cur must be identical after Bulwark scenario"
+    );
+}
+

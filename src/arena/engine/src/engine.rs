@@ -34,17 +34,45 @@ const SIGILS: &[Sigil] = &[
 /// **Effect-dispatch seam** — called immediately after the Sigil is removed
 /// from `ship.sigil` during a discharge Intent.
 ///
-/// Every arm is a no-op placeholder.  Issues 09 and 10 fill them:
-///   - Issue 09 (Afterburner, Bulwark): mobility & defence effects.
-///   - Issue 10 (Singularity, AetherMine, ArcLance): control/trap/offence effects.
+/// `ship` is mutated for state changes; `params` provides tuning constants;
+/// `events` accumulates additional per-ship events beyond `SigilDischarged`
+/// (e.g. the implicit start of the Afterburner window — the expiry events are
+/// emitted by the tick-down block at the end of `Engine::step`).
 ///
-/// Signature is intentional: `ship` is available for state mutations and
-/// `_params` is available for tuning constants; `_events` can be added as a
-/// parameter when an effect needs to emit additional events.
-fn dispatch_sigil_effect(sigil: &Sigil, _ship: &mut ShipState, _params: &Params) {
+/// Signature for issue 10 (Singularity, AetherMine, ArcLance):
+///   fn dispatch_sigil_effect(sigil, ship, params, events)
+/// where `events` is the ship's own per-tick `Vec<Event>`.  Issue 10 will also
+/// need access to `self.relics` / `self.rng` / world state for placement;
+/// those can be passed as additional parameters or handled by returning a
+/// command enum — document in ADR when the shape is finalised.
+fn dispatch_sigil_effect(
+    sigil: &Sigil,
+    ship: &mut ShipState,
+    params: &Params,
+    _events: &mut Vec<Event>,
+) {
     match sigil {
-        Sigil::Afterburner => { /* Issue 09: apply sustained thrust-surge buff */ }
-        Sigil::Bulwark     => { /* Issue 09: overcharge Shield + grant invuln ticks */ }
+        Sigil::Afterburner => {
+            // Sustained thrust/speed boost for afterburner_dur ticks.
+            // "+1" compensates for the tick-down that runs later in the same
+            // step, so the ship gets exactly afterburner_dur boosted physics
+            // ticks starting from the step after discharge.
+            ship.afterburner_ticks_left = params.afterburner_dur + 1;
+        }
+        Sigil::Bulwark => {
+            // Overcharge Shield to shield_max and grant damage immunity for
+            // bulwark_immunity ticks (reuses the existing invuln mechanism so
+            // both cannon and collision damage are blocked by the same guard).
+            //
+            // "+1" compensates for the tick-down that runs later in the same
+            // step as the discharge (5_sigil runs before the tick-down), giving
+            // the ship exactly bulwark_immunity protected ticks starting from
+            // the discharge step onwards.
+            ship.shield.cur = params.shield_max;
+            ship.invuln = true;
+            ship.invuln_ticks_left = params.bulwark_immunity + 1;
+            ship.bulwark_ticks_left = params.bulwark_immunity + 1;
+        }
         Sigil::Singularity => { /* Issue 10: deploy gravity-well at sigil_target */ }
         Sigil::AetherMine  => { /* Issue 10: drop proximity mine at ship position */ }
         Sigil::ArcLance    => { /* Issue 10: fire piercing bolt toward sigil_target */ }
@@ -201,6 +229,14 @@ struct ShipState {
     /// A value of 0 with `invuln = true` means the flag was set externally
     /// (e.g. `set_invuln_for_test`) and persists indefinitely.
     invuln_ticks_left: u32,
+    /// Ticks remaining for the Afterburner boost window.
+    /// Set to `params.afterburner_dur + 1` on discharge; decremented each tick.
+    /// 0 means inactive.  When it reaches 0, `AfterburnerExpired` is emitted.
+    afterburner_ticks_left: u32,
+    /// Ticks remaining for the Bulwark immunity window (mirrors `invuln_ticks_left`
+    /// when set by Bulwark; decremented in sync).  0 means no Bulwark active.
+    /// When it reaches 0, `BulwarkExpired` is emitted.
+    bulwark_ticks_left: u32,
 }
 
 impl ShipState {
@@ -246,6 +282,7 @@ impl ShipState {
             sigil: self.sigil.clone(),
             cannon_cooldown: self.cannon_cooldown,
             relics_carried: self.relics_carried,
+            afterburner_ticks_left: self.afterburner_ticks_left,
         }
     }
 
@@ -265,6 +302,7 @@ impl ShipState {
             sigil: self.sigil.clone(),
             cannon_cooldown: self.cannon_cooldown,
             relics_carried: self.relics_carried,
+            afterburner_ticks_left: self.afterburner_ticks_left,
         }
     }
 
@@ -407,6 +445,8 @@ impl Engine {
                     body_handle,
                     respawn_ticks_left: 0,
                     invuln_ticks_left: 0,
+                    afterburner_ticks_left: 0,
+                    bulwark_ticks_left: 0,
                 }
             })
             .collect();
@@ -554,6 +594,9 @@ impl Engine {
                     ship.cannon_cooldown     = cannon_start_hot;
                     ship.ticks_since_last_hit = shield_regen_dly;
                     ship.persisted           = PersistedIntent::default();
+                    // Clear any active sigil buffs on respawn.
+                    ship.afterburner_ticks_left = 0;
+                    ship.bulwark_ticks_left     = 0;
                     just_respawned.push(ship.id.clone());
                     respawn_bodies.push((ship.body_handle, ship.anchor_pos));
                 }
@@ -613,12 +656,27 @@ impl Engine {
             ship.heading = (ship.heading + turn * p.max_turn).rem_euclid(TAU);
             ship.ang_vel = turn * p.max_turn;
 
-            // b. Thrust is ineffective at zero aether.
-            let effective_thrust = if ship.aether.cur > 0.0 { thrust } else { 0.0 };
+            // b. Afterburner: boost thrust_accel and max_speed; bypass aether gate.
+            //    While active, thrust is always effective (no aether check) and
+            //    no aether is deducted.
+            let ab_active = ship.afterburner_ticks_left > 0;
+            let effective_thrust_accel = if ab_active {
+                p.thrust_accel * p.afterburner_thrust_mult
+            } else {
+                p.thrust_accel
+            };
+            let effective_max_speed = if ab_active {
+                p.max_speed * p.afterburner_speed_mult
+            } else {
+                p.max_speed
+            };
+
+            // b. Thrust is ineffective at zero aether — unless Afterburner is active.
+            let effective_thrust = if ab_active || ship.aether.cur > 0.0 { thrust } else { 0.0 };
 
             // c. Accelerate along heading, then damp.
             let base_accel = if effective_thrust >= 0.0 {
-                p.thrust_accel
+                effective_thrust_accel
             } else {
                 p.reverse_accel
             };
@@ -631,8 +689,8 @@ impl Engine {
 
             // d. Cap speed.
             let spd = (nvx * nvx + nvy * nvy).sqrt();
-            if spd > p.max_speed {
-                let scale = p.max_speed / spd;
+            if spd > effective_max_speed {
+                let scale = effective_max_speed / spd;
                 nvx *= scale;
                 nvy *= scale;
             }
@@ -640,8 +698,12 @@ impl Engine {
             // Store new velocity in ship state.
             ship.vel = Vec2::new(nvx, nvy);
 
-            // e. Aether: deduct thrust cost, then regen (clamped).
-            let aether_cost = effective_thrust.abs() * p.thrust_cost_full;
+            // e. Aether: deduct thrust cost (free while Afterburner active), then regen.
+            let aether_cost = if ab_active {
+                0.0
+            } else {
+                effective_thrust.abs() * p.thrust_cost_full
+            };
             ship.aether.cur =
                 (ship.aether.cur - aether_cost + p.aether_regen).clamp(0.0, ship.aether.max);
 
@@ -995,7 +1057,10 @@ impl Engine {
                     }
                     if let Some(sigil) = ship.sigil.take() {
                         // Effect-dispatch seam: issues 09 & 10 fill the arms.
-                        dispatch_sigil_effect(&sigil, ship, &self.params);
+                        let ship_ev_vec = ship_events
+                            .entry(ship.id.clone())
+                            .or_default();
+                        dispatch_sigil_effect(&sigil, ship, &self.params, ship_ev_vec);
                         ship_events
                             .entry(ship.id.clone())
                             .or_default()
@@ -1244,6 +1309,47 @@ impl Engine {
             }
         }
 
+        // ── Issue 09: Bulwark immunity tick-down ──────────────────────────────
+        //
+        // Runs in sync with the invuln tick-down above.  When `bulwark_ticks_left`
+        // reaches 0 the `BulwarkExpired` event is emitted to the ship.
+        for ship in &mut self.ships {
+            if ship.bulwark_ticks_left == 0 {
+                continue;
+            }
+            ship.bulwark_ticks_left -= 1;
+            if ship.bulwark_ticks_left == 0 {
+                ship_events
+                    .entry(ship.id.clone())
+                    .or_default()
+                    .push(Event::BulwarkExpired);
+            }
+        }
+
+        // ── Issue 09: Afterburner boost tick-down ─────────────────────────────
+        //
+        // Counts down separately from invuln.  Physics reads `afterburner_ticks_left`
+        // at the START of each step (before the tick-down runs), so the "+1" set
+        // at discharge ensures exactly `afterburner_dur` boosted physics steps.
+        //   discharge step : tl = dur+1.  Physics: normal (discharge in 5_sigil,
+        //                    after physics).  End-of-step: dur+1 → dur.
+        //   boost step 1   : tl = dur.  Physics: boosted.  End: dur → dur-1.
+        //   …
+        //   boost step dur : tl = 1. Physics: boosted. End: 1 → 0. AfterburnerExpired.
+        //   step dur+1     : tl = 0. Physics: normal.
+        for ship in &mut self.ships {
+            if ship.afterburner_ticks_left == 0 {
+                continue;
+            }
+            ship.afterburner_ticks_left -= 1;
+            if ship.afterburner_ticks_left == 0 {
+                ship_events
+                    .entry(ship.id.clone())
+                    .or_default()
+                    .push(Event::AfterburnerExpired);
+            }
+        }
+
         // 6. Record the applied (persisted) intent for every ship this tick.
         let frame: IntentFrame = self
             .ships
@@ -1417,6 +1523,17 @@ impl Engine {
     pub fn set_relics_carried_for_test(&mut self, ship_id: &str, count: u32) {
         if let Some(ship) = self.ships.iter_mut().find(|s| s.id == ship_id) {
             ship.relics_carried = count;
+        }
+    }
+
+    /// Test-only helper: directly set the held Sigil on a ship by id.
+    ///
+    /// Allows Sigil-effect tests to bypass the relic-pickup flow and grant
+    /// a specific Sigil directly.  Mirrors the precedent of
+    /// `set_invuln_for_test` / `set_relics_carried_for_test`.
+    pub fn set_sigil_for_test(&mut self, ship_id: &str, sigil: Option<Sigil>) {
+        if let Some(ship) = self.ships.iter_mut().find(|s| s.id == ship_id) {
+            ship.sigil = sigil;
         }
     }
 

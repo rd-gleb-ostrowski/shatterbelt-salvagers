@@ -170,4 +170,12 @@ pub enum Event {
     /// The held Sigil was consumed via a discharge Intent.
     /// Emitted on the same tick the Sigil disappears from the ship's state.
     SigilDischarged { which: Sigil },
+
+    // ── Issue 09: Self-buff Sigil effects ─────────────────────────────────
+    /// The Afterburner timed window has elapsed; thrust and speed cap revert.
+    /// Emitted at the end of the last boosted tick.
+    AfterburnerExpired,
+    /// The Bulwark damage-immunity window has elapsed; `invuln` is now false.
+    /// Emitted at the end of the last protected tick.
+    BulwarkExpired,
 }

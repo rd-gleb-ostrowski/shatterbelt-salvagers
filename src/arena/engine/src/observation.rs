@@ -25,6 +25,8 @@ pub struct SelfView {
     /// Ticks until the rune-cannon may fire again.
     pub cannon_cooldown: u32,
     pub relics_carried: u32,
+    /// Remaining ticks of Afterburner boost, or 0 when inactive.
+    pub afterburner_ticks_left: u32,
 }
 
 // ─── Other-ship view (PROTOCOL §6 "ships" array) ─────────────────────────────
@@ -93,6 +95,8 @@ pub struct GodShipView {
     pub sigil: Option<Sigil>,
     pub cannon_cooldown: u32,
     pub relics_carried: u32,
+    /// Remaining ticks of Afterburner boost, or 0 when inactive.
+    pub afterburner_ticks_left: u32,
 }
 
 // ─── God-mode view (Viewer / recording) ──────────────────────────────────────
