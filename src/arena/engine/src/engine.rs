@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::f32::consts::TAU;
 
-use rand::Rng;
+use rand::RngExt;
 use rand::SeedableRng;
 use rand_pcg::Pcg64;
 use rapier2d::prelude::*;
@@ -10,6 +10,8 @@ use crate::intent::Intent;
 use crate::observation::{GodShipView, GodView, Observation, OtherShipView, SelfView};
 use crate::params::Params;
 use crate::types::*;
+// Explicit import so the engine's own Vec2 wins over rapier2d/glam's Vec2 from the glob above.
+use crate::types::Vec2;
 
 // ─── Physics world ────────────────────────────────────────────────────────────
 
@@ -57,7 +59,7 @@ impl PhysicsWorld {
     /// Add a ship rigid body at `pos`; return its handle for later lookup.
     fn add_ship_body(&mut self, pos: Vec2) -> RigidBodyHandle {
         let rb = RigidBodyBuilder::dynamic()
-            .translation(vector![pos.x, pos.y])
+            .translation(rapier2d::math::Vector::new(pos.x, pos.y))
             .gravity_scale(0.0)
             .linear_damping(0.0)   // manual damping; see PhysicsWorld docs
             .angular_damping(0.0)
@@ -72,19 +74,18 @@ impl PhysicsWorld {
     /// post‑damping, post‑cap values for this tick.  rapier then integrates
     /// `pos += vel * dt` (dt = 1.0), so `pos += vel`.
     fn step(&mut self) {
-        let gravity = vector![0.0_f32, 0.0_f32];
+        let gravity = rapier2d::math::Vector::ZERO;
         self.pipeline.step(
-            &gravity,
+            gravity,
             &self.integration_params,
             &mut self.islands,
-            &mut self.broad_phase as &mut dyn BroadPhase,
+            &mut self.broad_phase,
             &mut self.narrow_phase,
             &mut self.bodies,
             &mut self.colliders,
             &mut self.impulse_joints,
             &mut self.multibody_joints,
             &mut self.ccd_solver,
-            None,
             &(),
             &(),
         );
@@ -350,8 +351,8 @@ impl Engine {
             let hi_x = (params.arena_w - 100.0).max(lo_x + f32::EPSILON);
             let lo_y = 100.0_f32;
             let hi_y = (params.arena_h - 100.0).max(lo_y + f32::EPSILON);
-            let x: f32 = rng.gen_range(lo_x..hi_x);
-            let y: f32 = rng.gen_range(lo_y..hi_y);
+            let x: f32 = rng.random_range(lo_x..hi_x);
+            let y: f32 = rng.random_range(lo_y..hi_y);
             relics.push(RelicState {
                 id: format!("relic-{relic_id_counter}"),
                 pos: Vec2::new(x, y),
@@ -465,7 +466,7 @@ impl Engine {
         // 3. Push computed velocities into rapier bodies.
         for (handle, vx, vy) in &vel_updates {
             if let Some(body) = self.physics.bodies.get_mut(*handle) {
-                body.set_linvel(vector![*vx, *vy], true);
+                body.set_linvel(rapier2d::math::Vector::new(*vx, *vy), true);
             }
         }
 
@@ -477,7 +478,7 @@ impl Engine {
             let handle = self.ships[i].body_handle;
             let (px, py) = if let Some(body) = self.physics.bodies.get(handle) {
                 let t = body.translation();
-                (t[0], t[1])
+                (t.x, t.y)
             } else {
                 continue;
             };
@@ -845,8 +846,8 @@ impl Engine {
         let hi_x = (self.params.arena_w - 100.0).max(lo_x + f32::EPSILON);
         let lo_y = 100.0_f32;
         let hi_y = (self.params.arena_h - 100.0).max(lo_y + f32::EPSILON);
-        let x: f32 = self.rng.gen_range(lo_x..hi_x);
-        let y: f32 = self.rng.gen_range(lo_y..hi_y);
+        let x: f32 = self.rng.random_range(lo_x..hi_x);
+        let y: f32 = self.rng.random_range(lo_y..hi_y);
         let id = format!("relic-{}", self.relic_id_counter);
         self.relic_id_counter += 1;
         self.relics.push(RelicState { id, pos: Vec2::new(x, y) });
