@@ -17,11 +17,14 @@
 //!
 //! | Seam | Interface | Future issue |
 //! |------|-----------|-------------|
+//! | Registration & tokens | [`auth::TokenRegistry`] + [`routes::build_router`] | 02 (this issue) |
 //! | Bot transport | [`runner::BotDriver`] trait | 03 (WS bots), 06 (resolver) |
 //! | Tick pacing | [`runner::TickPacer`] trait | already used by [`pacer::LivePacer`] |
 //! | Engine state | `runner.engine()` | 07 (observer god_view), 08 (intent_log) |
-//! | Match outcome | [`runner::MatchOutcome`] | 02 (registration), 14 (ladder) |
+//! | Match outcome | [`runner::MatchOutcome`] | 14 (ladder) |
 
+pub mod auth;
 pub mod bot;
 pub mod pacer;
+pub mod routes;
 pub mod runner;
