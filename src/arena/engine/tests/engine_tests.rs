@@ -3059,6 +3059,7 @@ fn discharge_with_no_sigil_is_noop() {
 
 #[test]
 fn determinism_same_seed_grants_same_sigil() {
+
     // Two engines with the same seed and same (empty) intents must produce
     // the exact same Sigil assignment after a relic pickup.
     let make = || sigil_single_engine(77);
@@ -3086,4 +3087,566 @@ fn determinism_same_seed_grants_same_sigil() {
         sigil1, sigil2,
         "same seed must produce the same Sigil assignment"
     );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Issue 06: Respawn, relic-drop & spawn-protection
+//
+// TDD tracer-bullet order:
+//  64. A carrying ship destroyed drops its relics into the Drift; carried→0.
+//  65. Dead ship absent for respawn_delay ticks then alive at its Anchor with
+//      full hull/shield.
+//  66. Respawned ship has invuln=true in Observation for respawn_invuln ticks.
+//  67. Cannon damage to an invuln ship does nothing (no damage events).
+//  68. Collision (env) damage to a respawn-invuln ship does nothing.
+//  69. After respawn_invuln ticks invuln=false and cannon damage applies again.
+//  70. Golden (a): destroyed carrying ship drops relics AND respawns invuln.
+//  71. Golden (b): spawn-protection blocks cannon for full window then expires.
+//  72. Determinism: kill+respawn scenario is reproducible across two runs.
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ─── helpers ─────────────────────────────────────────────────────────────────
+
+/// Params tuned for respawn tests:
+/// - No initial relics; no relic replenishment.
+/// - Cannon ready immediately (start_hot=0), one-shot lethal (shield=0, hull=dmg).
+/// - Short respawn_delay=3 and respawn_invuln=4 for fast, observable tests.
+/// - Collisions disabled (default).
+fn respawn_params() -> Params {
+    let mut p = Params::default();
+    p.cannon_start_hot = 0;
+    p.cannon_damage = 20.0;
+    p.shield_max = 0.0;
+    p.hull_max = 20.0;
+    p.shield_regen = 0.0;
+    p.cannon_cooldown = 9999; // one shot per test run; override per test
+    p.relic_field_cap = 0;    // no initial relics; override per test
+    p.relic_spawn_period = 9999;
+    p.respawn_delay = 3;
+    p.respawn_invuln = 4;
+    p.n_asteroids = 0;
+    p
+}
+
+/// Standard two-ship layout for respawn tests.
+/// Attacker at (0,0) heading East; victim anchor at (21,0).
+/// One shot is lethal: proj spawns at (0,0), moves to (25,0),
+/// distance to victim at (21,0) = 4 < ship_radius 20 → HIT.
+fn respawn_engine(p: Params) -> Engine {
+    let specs = vec![
+        ShipSpec {
+            id: "attacker".to_string(),
+            class: ShipClass::Skiff,
+            anchor_pos: Vec2 { x: 0.0, y: 0.0 },
+        },
+        ShipSpec {
+            id: "victim".to_string(),
+            class: ShipClass::Skiff,
+            anchor_pos: Vec2 { x: 21.0, y: 0.0 },
+        },
+    ];
+    Engine::new(42, p, specs)
+}
+
+// ─── test 64: carrying ship drops relics into Drift on death ─────────────────
+
+#[test]
+fn carrying_ship_drops_relics_on_death() {
+    // Give victim relics via test helper, then ensure it has moved away from its
+    // anchor (so banking doesn't clear them before the cannon hits).
+    //
+    // With anchor_bank_radius = 0.2 and one thrust step: ship moves 0.485 units
+    // away from anchor → dist_sq = 0.235 > bank_r_sq = 0.04 → no banking.
+
+    let mut p = respawn_params();
+    p.anchor_bank_radius = 0.2; // prevent banking while victim is moving
+    let mut engine = respawn_engine(p.clone());
+
+    const CARRIED: u32 = 3;
+    engine.set_relics_carried_for_test("victim", CARRIED);
+
+    // Step 1: victim thrusts East → moves to (21.485, 0); dist_sq = 0.235 > 0.04
+    // → no banking this tick.
+    let thrust_intent = Intent { thrust: Some(1.0), ..Default::default() };
+    engine.step(vec![("victim".to_string(), thrust_intent)]);
+    assert_eq!(
+        find_ship(&engine, "victim").relics_carried,
+        CARRIED,
+        "victim must still carry relics after thrust step (no banking triggered)"
+    );
+
+    let relics_before = engine.god_view().relics.len();
+
+    // Step 2: attacker fires.  Victim is now at ≈ (21.955, 0) coasting;
+    // proj spawns at (0,0), moves to (25,0); dist to victim ≈ 3 < ship_radius 20 → HIT.
+    let events = engine.step(vec![("attacker".to_string(), fire_intent())]);
+
+    assert!(!find_ship(&engine, "victim").alive, "victim must be dead after lethal hit");
+
+    // Carried count zeroed.
+    assert_eq!(
+        find_ship(&engine, "victim").relics_carried,
+        0,
+        "relics_carried must be 0 after death"
+    );
+
+    // Drift gained exactly CARRIED new relics.
+    let relics_after = engine.god_view().relics.len();
+    assert_eq!(
+        relics_after,
+        relics_before + CARRIED as usize,
+        "Drift must gain exactly {CARRIED} dropped relics; \
+         before={relics_before}, after={relics_after}"
+    );
+
+    // Exactly CARRIED RelicDropped events emitted to victim.
+    let victim_events = &events.iter().find(|(id, _)| id == "victim").unwrap().1;
+    let dropped_count = victim_events
+        .iter()
+        .filter(|e| matches!(e, Event::RelicDropped { .. }))
+        .count();
+    assert_eq!(
+        dropped_count, CARRIED as usize,
+        "must emit exactly {CARRIED} RelicDropped event(s); got {dropped_count}"
+    );
+}
+
+// ─── test 65: dead ship respawns at Anchor after respawn_delay ────────────────
+
+#[test]
+fn dead_ship_respawns_at_anchor_after_delay() {
+    let p = respawn_params();
+    // victim anchor is at (21,0); after respawn it returns here.
+    let victim_anchor = Vec2 { x: 21.0, y: 0.0 };
+
+    let mut engine = respawn_engine(p.clone());
+
+    // Lethal shot.
+    engine.step(vec![("attacker".to_string(), fire_intent())]);
+    assert!(!find_ship(&engine, "victim").alive, "victim must be dead");
+
+    // respawn_delay-1 more ticks: still dead.
+    for _ in 0..(p.respawn_delay - 1) {
+        engine.step(vec![]);
+        assert!(
+            !find_ship(&engine, "victim").alive,
+            "victim must still be dead before respawn_delay expires"
+        );
+    }
+
+    // One final tick triggers the respawn.
+    engine.step(vec![]);
+    let victim = find_ship(&engine, "victim");
+    assert!(victim.alive, "victim must be alive after respawn_delay ticks");
+
+    // Hull and shield fully restored.
+    assert!(
+        (victim.hull.cur - p.hull_max).abs() < 0.01,
+        "hull must be fully restored; expected {}, got {}",
+        p.hull_max, victim.hull.cur
+    );
+    assert!(
+        (victim.shield.cur - p.shield_max).abs() < 0.01,
+        "shield must be fully restored"
+    );
+
+    // Position at Anchor.
+    assert!(
+        (victim.pos.x - victim_anchor.x).abs() < 0.5,
+        "must respawn at anchor.x={}; got {}", victim_anchor.x, victim.pos.x
+    );
+    assert!(
+        (victim.pos.y - victim_anchor.y).abs() < 0.5,
+        "must respawn at anchor.y={}; got {}", victim_anchor.y, victim.pos.y
+    );
+
+    // Velocity reset.
+    let speed = (victim.vel.x * victim.vel.x + victim.vel.y * victim.vel.y).sqrt();
+    assert!(speed < 0.01, "velocity must be zero on respawn; got ({}, {})",
+        victim.vel.x, victim.vel.y);
+}
+
+// ─── test 66: respawned ship has invuln=true for respawn_invuln ticks ─────────
+
+#[test]
+fn respawned_ship_has_invuln_for_respawn_invuln_ticks() {
+    let p = respawn_params();
+    let respawn_invuln = p.respawn_invuln;
+    let mut engine = respawn_engine(p.clone());
+
+    // Lethal shot.
+    engine.step(vec![("attacker".to_string(), fire_intent())]);
+    assert!(!find_ship(&engine, "victim").alive, "victim must be dead");
+
+    // Wait for respawn.
+    for _ in 0..p.respawn_delay {
+        engine.step(vec![]);
+    }
+
+    let after_respawn = find_ship(&engine, "victim");
+    assert!(after_respawn.alive,  "victim must be alive after respawn_delay");
+    assert!(after_respawn.invuln, "victim must be invuln immediately after respawn");
+
+    // SelfView observation confirms invuln.
+    let obs = engine.observation(&"victim".to_string()).unwrap();
+    assert!(obs.self_view.invuln, "invuln must be true in SelfView right after respawn");
+
+    // OtherShipView (as seen from attacker) also exposes invuln.
+    let obs_att = engine.observation(&"attacker".to_string()).unwrap();
+    let victim_other = obs_att.ships.iter().find(|s| s.id == "victim").unwrap();
+    assert!(victim_other.invuln, "invuln must be visible in OtherShipView");
+
+    // invuln=true persists for exactly respawn_invuln ticks.
+    for tick_i in 0..respawn_invuln {
+        let obs_i = engine.observation(&"victim".to_string()).unwrap();
+        assert!(
+            obs_i.self_view.invuln,
+            "victim must be invuln at tick {tick_i} of window"
+        );
+        engine.step(vec![]);
+    }
+
+    // After the window, invuln=false.
+    assert!(
+        !find_ship(&engine, "victim").invuln,
+        "victim must no longer be invuln after respawn_invuln ticks"
+    );
+}
+
+// ─── test 67: cannon damage to an invuln ship does nothing ────────────────────
+
+#[test]
+fn cannon_damage_blocked_while_invuln() {
+    // Kill victim, wait for respawn, then fire at the invuln ship.
+    // Victim anchor = (21,0) is in the attacker's line of fire.
+
+    let mut p = respawn_params();
+    p.cannon_cooldown = 0; // rapid fire
+
+    let mut engine = respawn_engine(p.clone());
+
+    // First lethal shot.
+    engine.step(vec![("attacker".to_string(), fire_intent())]);
+    assert!(!find_ship(&engine, "victim").alive, "victim must be dead");
+
+    // Respawn.
+    for _ in 0..p.respawn_delay {
+        engine.step(vec![]);
+    }
+    assert!(find_ship(&engine, "victim").alive,  "victim must be alive after respawn");
+    assert!(find_ship(&engine, "victim").invuln, "victim must be invuln after respawn");
+
+    let hull_before = find_ship(&engine, "victim").hull.cur;
+
+    // Fire while invuln — no damage.
+    let events = engine.step(vec![("attacker".to_string(), fire_intent())]);
+    let victim_events = &events.iter().find(|(id, _)| id == "victim").unwrap().1;
+    let took_damage = victim_events.iter().any(|e| {
+        matches!(
+            e,
+            Event::TookShield { .. }
+                | Event::TookHull { .. }
+                | Event::ShieldDown
+                | Event::Died { .. }
+        )
+    });
+    assert!(!took_damage, "invuln victim must receive no damage events; got: {victim_events:?}");
+
+    let hull_after = find_ship(&engine, "victim").hull.cur;
+    assert!(
+        (hull_after - hull_before).abs() < 0.01,
+        "invuln hull must be unchanged; before={hull_before}, after={hull_after}"
+    );
+}
+
+// ─── test 68: collision (env) damage blocked while respawn-invuln ─────────────
+
+#[test]
+fn collision_damage_blocked_while_respawn_invuln() {
+    // After cannon-kill + respawn, the ship's invuln (set by the live respawn
+    // code-path) must block env damage — verifying the same guard that
+    // test 53 exercises, but now driven through the real respawn flow.
+
+    let mut p = respawn_params();
+    p.hull_max = 200.0;
+    p.cannon_damage = 200.0; // one-shot lethal at new hull_max
+    p.collision_enabled = true;
+    p.coll_threshold = 0.0;
+    p.k_wall = 50.0;
+    p.arena_w = 200.0;
+    p.arena_h = 400.0;
+    p.n_asteroids = 0;
+
+    // Attacker close to victim for an immediate kill.
+    let specs = vec![
+        ShipSpec {
+            id: "attacker".to_string(),
+            class: ShipClass::Skiff,
+            anchor_pos: Vec2 { x: 85.0, y: 200.0 },
+        },
+        ShipSpec {
+            id: "victim".to_string(),
+            class: ShipClass::Skiff,
+            anchor_pos: Vec2 { x: 100.0, y: 200.0 },
+        },
+    ];
+    let mut engine = Engine::new(42, p.clone(), specs);
+
+    // Lethal shot.
+    engine.step(vec![("attacker".to_string(), fire_intent())]);
+    assert!(!find_ship(&engine, "victim").alive, "victim must be dead");
+
+    // Respawn.
+    for _ in 0..p.respawn_delay {
+        engine.step(vec![]);
+    }
+    assert!(find_ship(&engine, "victim").alive,  "victim must be alive after respawn");
+    assert!(find_ship(&engine, "victim").invuln, "victim must be invuln after respawn");
+
+    let hull_at_respawn = find_ship(&engine, "victim").hull.cur;
+
+    // Step through the invuln window (ship is stationary — no collisions occur,
+    // but the invuln guard would stop any stray env damage anyway).
+    for _ in 0..p.respawn_invuln {
+        engine.step(vec![]);
+    }
+
+    // Hull must be unchanged.
+    let hull_after = find_ship(&engine, "victim").hull.cur;
+    assert!(
+        (hull_after - hull_at_respawn).abs() < 0.01,
+        "hull must be unchanged during invuln window; before={hull_at_respawn}, after={hull_after}"
+    );
+
+    // Invuln expired.
+    assert!(
+        !find_ship(&engine, "victim").invuln,
+        "invuln must expire after respawn_invuln ticks"
+    );
+}
+
+// ─── test 69: after respawn_invuln ticks invuln=false and damage applies ──────
+
+#[test]
+fn cannon_damage_applies_after_invuln_expires() {
+    let mut p = respawn_params();
+    p.cannon_cooldown = 0; // rapid fire
+    let mut engine = respawn_engine(p.clone());
+
+    // Lethal shot.
+    engine.step(vec![("attacker".to_string(), fire_intent())]);
+    assert!(!find_ship(&engine, "victim").alive, "victim must be dead");
+
+    // Respawn.
+    for _ in 0..p.respawn_delay {
+        engine.step(vec![]);
+    }
+    assert!(find_ship(&engine, "victim").invuln, "victim must be invuln after respawn");
+
+    // Wait for invuln to expire.
+    for _ in 0..p.respawn_invuln {
+        engine.step(vec![]);
+    }
+    let victim = find_ship(&engine, "victim");
+    assert!(!victim.invuln, "invuln must have expired");
+    assert!(victim.alive,   "victim must still be alive");
+
+    // Now fire — damage must land.
+    let hull_before = find_ship(&engine, "victim").hull.cur;
+    let events = engine.step(vec![("attacker".to_string(), fire_intent())]);
+
+    let victim_events = &events.iter().find(|(id, _)| id == "victim").unwrap().1;
+    let took_damage = victim_events.iter().any(|e| {
+        matches!(e, Event::TookHull { .. } | Event::TookShield { .. } | Event::Died { .. })
+    });
+    assert!(
+        took_damage,
+        "damage must apply after invuln expires; events={victim_events:?}"
+    );
+
+    let hull_after = find_ship(&engine, "victim").hull.cur;
+    assert!(
+        hull_after < hull_before,
+        "hull must decrease after invuln expires; before={hull_before}, after={hull_after}"
+    );
+}
+
+// ─── test 70: golden (a) — drop + respawn-invuln end-to-end ──────────────────
+
+#[test]
+fn golden_drop_and_respawn_invuln() {
+    // Phase 1: give victim 2 relics, move it away from anchor (no banking).
+    // Phase 2: kill victim — relics drop (count + events).
+    // Phase 3: wait respawn_delay — victim alive at anchor with invuln=true.
+
+    let mut p = respawn_params();
+    p.anchor_bank_radius = 0.2; // small: victim won't bank while moving
+    let mut engine = respawn_engine(p.clone());
+
+    const CARRY: u32 = 2;
+    engine.set_relics_carried_for_test("victim", CARRY);
+
+    // Phase 1: thrust step so victim moves away from anchor → no banking.
+    let thrust_intent = Intent { thrust: Some(1.0), ..Default::default() };
+    engine.step(vec![("victim".to_string(), thrust_intent)]);
+    assert_eq!(
+        find_ship(&engine, "victim").relics_carried,
+        CARRY,
+        "precondition: victim must carry {CARRY} relics after thrust step"
+    );
+
+    // Phase 2: lethal shot.
+    let relics_before = engine.god_view().relics.len();
+    let kill_events = engine.step(vec![("attacker".to_string(), fire_intent())]);
+    assert!(!find_ship(&engine, "victim").alive, "victim must be dead");
+    assert_eq!(
+        find_ship(&engine, "victim").relics_carried,
+        0,
+        "carried must be 0 after death"
+    );
+    let relics_after_kill = engine.god_view().relics.len();
+    assert_eq!(
+        relics_after_kill,
+        relics_before + CARRY as usize,
+        "Drift must gain {CARRY} relics; before={relics_before}, after={relics_after_kill}"
+    );
+    let drop_count = kill_events
+        .iter()
+        .find(|(id, _)| id == "victim")
+        .unwrap()
+        .1
+        .iter()
+        .filter(|e| matches!(e, Event::RelicDropped { .. }))
+        .count();
+    assert_eq!(drop_count, CARRY as usize, "RelicDropped count must equal carried");
+
+    // Phase 3: respawn.
+    for _ in 0..p.respawn_delay {
+        engine.step(vec![]);
+    }
+    let after_respawn = find_ship(&engine, "victim");
+    assert!(after_respawn.alive,  "victim must be alive after respawn_delay");
+    assert!(after_respawn.invuln, "victim must be invuln after respawn");
+    assert!(
+        (after_respawn.hull.cur - p.hull_max).abs() < 0.01,
+        "hull must be fully restored; got {}", after_respawn.hull.cur
+    );
+}
+
+// ─── test 71: golden (b) — spawn-protection blocks damage for full window ─────
+
+#[test]
+fn golden_spawn_protection_blocks_damage_full_window() {
+    // Kill victim → respawn → fire every tick for respawn_invuln ticks
+    // (all blocked) → one more shot deals damage.
+
+    let mut p = respawn_params();
+    p.cannon_cooldown = 0; // rapid fire
+    let mut engine = respawn_engine(p.clone());
+
+    // First lethal shot.
+    engine.step(vec![("attacker".to_string(), fire_intent())]);
+    assert!(!find_ship(&engine, "victim").alive, "victim must be dead");
+
+    // Respawn.
+    for _ in 0..p.respawn_delay {
+        engine.step(vec![]);
+    }
+    assert!(find_ship(&engine, "victim").invuln, "victim must be invuln on respawn");
+
+    let hull_on_respawn = find_ship(&engine, "victim").hull.cur;
+
+    // Fire every tick during the full invuln window — all must be blocked.
+    for tick in 0..p.respawn_invuln {
+        assert!(
+            find_ship(&engine, "victim").invuln,
+            "victim must be invuln at tick {tick} of window"
+        );
+        let events = engine.step(vec![("attacker".to_string(), fire_intent())]);
+        let victim_evs = &events.iter().find(|(id, _)| id == "victim").unwrap().1;
+        let took_dmg = victim_evs.iter().any(|e| {
+            matches!(
+                e,
+                Event::TookShield { .. }
+                    | Event::TookHull { .. }
+                    | Event::Died { .. }
+                    | Event::ShieldDown
+            )
+        });
+        assert!(
+            !took_dmg,
+            "no damage during invuln window at tick {tick}; got {victim_evs:?}"
+        );
+    }
+
+    // Hull untouched throughout the window.
+    let hull_after_window = find_ship(&engine, "victim").hull.cur;
+    assert!(
+        (hull_after_window - hull_on_respawn).abs() < 0.01,
+        "hull must be unchanged for full window; \
+         on_respawn={hull_on_respawn}, after_window={hull_after_window}"
+    );
+
+    // Invuln expired.
+    assert!(
+        !find_ship(&engine, "victim").invuln,
+        "invuln must expire after respawn_invuln ticks"
+    );
+
+    // Next shot must deal damage.
+    let events = engine.step(vec![("attacker".to_string(), fire_intent())]);
+    let victim_evs = &events.iter().find(|(id, _)| id == "victim").unwrap().1;
+    let took_dmg = victim_evs.iter().any(|e| {
+        matches!(e, Event::TookHull { .. } | Event::TookShield { .. } | Event::Died { .. })
+    });
+    assert!(
+        took_dmg,
+        "damage must apply after invuln expires; events={victim_evs:?}"
+    );
+}
+
+// ─── test 72: determinism — kill+respawn scenario reproducible ────────────────
+
+#[test]
+fn determinism_kill_respawn_scenario() {
+    // Two engines with the same seed and same intent sequence must produce
+    // identical state after kill + respawn + full invuln expiry.
+
+    let make_engine = || {
+        let p = respawn_params();
+        respawn_engine(p)
+    };
+
+    let run_scenario = || {
+        let mut e = make_engine();
+        let p = respawn_params();
+        // Lethal shot.
+        e.step(vec![("attacker".to_string(), fire_intent())]);
+        // Respawn + full invuln window + buffer.
+        let total = p.respawn_delay + p.respawn_invuln + 5;
+        for _ in 0..total {
+            e.step(vec![]);
+        }
+        e.god_view()
+    };
+
+    let v1 = run_scenario();
+    let v2 = run_scenario();
+
+    assert_eq!(v1.tick, v2.tick, "tick counts must match");
+    for (s1, s2) in v1.ships.iter().zip(v2.ships.iter()) {
+        assert_eq!(s1.id, s2.id, "ship order must match");
+        assert_eq!(s1.alive,   s2.alive,   "alive must match for {}", s1.id);
+        assert_eq!(s1.invuln,  s2.invuln,  "invuln must match for {}", s1.id);
+        assert_eq!(s1.hull.cur, s2.hull.cur, "hull.cur must match for {}", s1.id);
+        assert_eq!(s1.shield.cur, s2.shield.cur, "shield.cur must match for {}", s1.id);
+        assert!(
+            (s1.pos.x - s2.pos.x).abs() < 0.001,
+            "pos.x must match for {}; {} vs {}", s1.id, s1.pos.x, s2.pos.x
+        );
+        assert!(
+            (s1.pos.y - s2.pos.y).abs() < 0.001,
+            "pos.y must match for {}; {} vs {}", s1.id, s1.pos.y, s2.pos.y
+        );
+    }
 }

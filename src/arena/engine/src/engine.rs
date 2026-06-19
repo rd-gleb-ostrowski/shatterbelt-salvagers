@@ -192,6 +192,15 @@ struct ShipState {
     /// Position and velocity are the source of truth in rapier;
     /// `ship.pos` / `ship.vel` are synced back after each physics step.
     body_handle: RigidBodyHandle,
+    /// Ticks remaining before this dead ship respawns at its Anchor.
+    /// Set to `params.respawn_delay` on death; counted down each tick.
+    /// 0 means the ship is alive (or not yet scheduled).
+    respawn_ticks_left: u32,
+    /// Ticks remaining for spawn-protection invulnerability after respawn.
+    /// Counted down each tick while > 0; when it reaches 0 `invuln` is cleared.
+    /// A value of 0 with `invuln = true` means the flag was set externally
+    /// (e.g. `set_invuln_for_test`) and persists indefinitely.
+    invuln_ticks_left: u32,
 }
 
 impl ShipState {
@@ -396,6 +405,8 @@ impl Engine {
                     // ship starts with full shield so the first regen check is a no-op.
                     ticks_since_last_hit: params.shield_regen_delay,
                     body_handle,
+                    respawn_ticks_left: 0,
+                    invuln_ticks_left: 0,
                 }
             })
             .collect();
@@ -501,6 +512,79 @@ impl Engine {
     ///   7. Advance tick.
     ///   7b. Relic replenishment: spawn one Relic if tick % relic_spawn_period == 0.
     pub fn step(&mut self, intents: Vec<(ShipId, Intent)>) -> Vec<(ShipId, Vec<Event>)> {
+        // ── Issue 06: respawn tick-down ───────────────────────────────────────
+        //
+        // For each dead ship with a pending respawn timer, decrement the counter.
+        // When it reaches 0, restore the ship to full health at its Anchor and
+        // grant spawn-protection invulnerability for `respawn_invuln` ticks.
+        //
+        // Ordering matters: invuln tick-down runs AFTER respawn so that a
+        // newly-respawned ship starts its invuln window with the full count
+        // intact (not decremented in the same step it was set).
+        let mut just_respawned: Vec<ShipId> = Vec::new();
+        {
+            let hull_max         = self.params.hull_max;
+            let shield_max       = self.params.shield_max;
+            let aether_max       = self.params.aether_max;
+            let respawn_invuln   = self.params.respawn_invuln;
+            let cannon_start_hot = self.params.cannon_start_hot;
+            let shield_regen_dly = self.params.shield_regen_delay;
+
+            let mut respawn_bodies: Vec<(RigidBodyHandle, Vec2)> = Vec::new();
+            for ship in &mut self.ships {
+                if ship.alive || ship.respawn_ticks_left == 0 {
+                    continue;
+                }
+                ship.respawn_ticks_left -= 1;
+                if ship.respawn_ticks_left == 0 {
+                    ship.alive               = true;
+                    ship.pos                 = ship.anchor_pos;
+                    ship.vel                 = Vec2::zero();
+                    ship.ang_vel             = 0.0;
+                    ship.heading             = 0.0;
+                    ship.hull                = Resource::full(hull_max);
+                    ship.shield              = Resource::full(shield_max);
+                    ship.aether              = Resource::full(aether_max);
+                    ship.sigil               = None;
+                    ship.invuln              = true;
+                    // "+1" so that after the countdown tick that runs later in
+                    // THIS same step the counter is exactly `respawn_invuln`,
+                    // giving the full configured quota of blocked fire steps.
+                    ship.invuln_ticks_left   = respawn_invuln + 1;
+                    ship.cannon_cooldown     = cannon_start_hot;
+                    ship.ticks_since_last_hit = shield_regen_dly;
+                    ship.persisted           = PersistedIntent::default();
+                    just_respawned.push(ship.id.clone());
+                    respawn_bodies.push((ship.body_handle, ship.anchor_pos));
+                }
+            }
+            // Sync rapier bodies for respawned ships so physics starts from the
+            // correct anchor position next tick.
+            for (handle, anchor) in respawn_bodies {
+                if let Some(body) = self.physics.bodies.get_mut(handle) {
+                    body.set_translation(
+                        rapier2d::math::Vector::new(anchor.x, anchor.y),
+                        true,
+                    );
+                    body.set_linvel(rapier2d::math::Vector::new(0.0, 0.0), true);
+                }
+            }
+        }
+
+        // ── Issue 06: invuln tick-down ────────────────────────────────────────
+        //
+        // Count down spawn-protection (and future Bulwark immunity) for alive
+        // invuln ships.  `invuln_ticks_left = 0` with `invuln = true` means the
+        // flag was set externally (e.g. `set_invuln_for_test`) and never expires.
+        //
+        // NOTE: This block was deliberately removed from the START of step and
+        // moved to AFTER combat (see below) so that:
+        //   a) Ships respawned in this tick get their full respawn_invuln quota
+        //      of blocked fire steps — the countdown only consumes one tick
+        //      during the respawn step itself (before combat runs), not before.
+        //   b) The "+1" on respawn_ticks_left compensates for the one tick that
+        //      the countdown consumes during the respawn step.
+
         // 1. Merge incoming intents into each ship's persisted state.
         for (id, intent) in &intents {
             if let Some(ship) = self.ships.iter_mut().find(|s| s.id == *id) {
@@ -590,6 +674,11 @@ impl Engine {
         let mut ship_events: HashMap<ShipId, Vec<Event>> =
             self.ships.iter().map(|s| (s.id.clone(), Vec::new())).collect();
 
+        // Emit Respawned event to each ship that came back to life this tick.
+        for id in just_respawned {
+            ship_events.entry(id).or_default().push(Event::Respawned);
+        }
+
         // 5_coll_0. Asteroid drift (always applies, collision_enabled or not).
         //
         // Asteroids move by their constant drift velocity each tick and wrap
@@ -604,6 +693,12 @@ impl Engine {
         }
 
         if self.params.collision_enabled {
+        // Collect env deaths (id, death-pos, relics-carried) so we can drop
+        // their relics and schedule respawn after the collision loops end.
+        // We clear ship.relics_carried inline to avoid double-drops.
+        let respawn_delay_env = self.params.respawn_delay;
+        let mut env_death_drops: Vec<(ShipId, Vec2, u32)> = Vec::new();
+
         // 5_coll_1. Wall collision detection & response.
         //
         // Only triggered when the ship is actively moving INTO the wall
@@ -629,7 +724,11 @@ impl Engine {
                     ship.pos.x = ship_r;
                     let impact = ship.vel.x.abs();
                     let damage = (impact - threshold).max(0.0) * k_wall;
-                    apply_env_damage(ship, damage, &mut ship_events);
+                    if apply_env_damage(ship, damage, &mut ship_events) {
+                        env_death_drops.push((ship.id.clone(), ship.pos, ship.relics_carried));
+                        ship.relics_carried     = 0;
+                        ship.respawn_ticks_left = respawn_delay_env;
+                    }
                     ship.vel.x = -ship.vel.x * 0.5;
                 }
                 // Right wall (x = arena_w).
@@ -637,7 +736,11 @@ impl Engine {
                     ship.pos.x = arena_w - ship_r;
                     let impact = ship.vel.x.abs();
                     let damage = (impact - threshold).max(0.0) * k_wall;
-                    apply_env_damage(ship, damage, &mut ship_events);
+                    if apply_env_damage(ship, damage, &mut ship_events) {
+                        env_death_drops.push((ship.id.clone(), ship.pos, ship.relics_carried));
+                        ship.relics_carried     = 0;
+                        ship.respawn_ticks_left = respawn_delay_env;
+                    }
                     ship.vel.x = -ship.vel.x * 0.5;
                 }
                 // Top wall (y = 0, y increases downward per PROTOCOL §3).
@@ -645,7 +748,11 @@ impl Engine {
                     ship.pos.y = ship_r;
                     let impact = ship.vel.y.abs();
                     let damage = (impact - threshold).max(0.0) * k_wall;
-                    apply_env_damage(ship, damage, &mut ship_events);
+                    if apply_env_damage(ship, damage, &mut ship_events) {
+                        env_death_drops.push((ship.id.clone(), ship.pos, ship.relics_carried));
+                        ship.relics_carried     = 0;
+                        ship.respawn_ticks_left = respawn_delay_env;
+                    }
                     ship.vel.y = -ship.vel.y * 0.5;
                 }
                 // Bottom wall (y = arena_h).
@@ -653,7 +760,11 @@ impl Engine {
                     ship.pos.y = arena_h - ship_r;
                     let impact = ship.vel.y.abs();
                     let damage = (impact - threshold).max(0.0) * k_wall;
-                    apply_env_damage(ship, damage, &mut ship_events);
+                    if apply_env_damage(ship, damage, &mut ship_events) {
+                        env_death_drops.push((ship.id.clone(), ship.pos, ship.relics_carried));
+                        ship.relics_carried     = 0;
+                        ship.respawn_ticks_left = respawn_delay_env;
+                    }
                     ship.vel.y = -ship.vel.y * 0.5;
                 }
             }
@@ -699,7 +810,11 @@ impl Engine {
                     ship.pos.y = asteroid.pos.y + ny * rr;
                     // Damage: impact speed = |vn|.
                     let damage = (vn.abs() - threshold).max(0.0) * k_ast;
-                    apply_env_damage(ship, damage, &mut ship_events);
+                    if apply_env_damage(ship, damage, &mut ship_events) {
+                        env_death_drops.push((ship.id.clone(), ship.pos, ship.relics_carried));
+                        ship.relics_carried     = 0;
+                        ship.respawn_ticks_left = respawn_delay_env;
+                    }
                     // Elastic velocity reflection about the normal axis.
                     ship.vel.x -= 2.0 * vn * nx;
                     ship.vel.y -= 2.0 * vn * ny;
@@ -750,8 +865,16 @@ impl Engine {
                 let ship_i = &mut left[ev.i];
                 let ship_j = &mut right[0];
 
-                apply_env_damage(ship_i, ev.damage, &mut ship_events);
-                apply_env_damage(ship_j, ev.damage, &mut ship_events);
+                if apply_env_damage(ship_i, ev.damage, &mut ship_events) {
+                    env_death_drops.push((ship_i.id.clone(), ship_i.pos, ship_i.relics_carried));
+                    ship_i.relics_carried     = 0;
+                    ship_i.respawn_ticks_left = respawn_delay_env;
+                }
+                if apply_env_damage(ship_j, ev.damage, &mut ship_events) {
+                    env_death_drops.push((ship_j.id.clone(), ship_j.pos, ship_j.relics_carried));
+                    ship_j.relics_carried     = 0;
+                    ship_j.respawn_ticks_left = respawn_delay_env;
+                }
 
                 // Exchange the relative velocity component along the collision normal.
                 ship_i.vel.x -= ev.closing * ev.nx;
@@ -777,6 +900,31 @@ impl Engine {
                 );
             }
         }
+
+        // Issue 06: process env deaths — drop carried relics into the Drift and
+        // emit RelicDropped events.  Runs after all collision processing so that
+        // `self.relics` (not borrowed during collision loops) is freely accessible.
+        {
+            let scatter_env = self.params.ship_radius * 1.5;
+            for (id, pos, count) in env_death_drops {
+                for _ in 0..count {
+                    let angle: f32 = self.rng.random_range(0.0..TAU);
+                    let r: f32     = self.rng.random_range(0.0..scatter_env);
+                    let relic_pos  = Vec2::new(
+                        pos.x + angle.cos() * r,
+                        pos.y + angle.sin() * r,
+                    );
+                    let relic_id = format!("relic-{}", self.relic_id_counter);
+                    self.relic_id_counter += 1;
+                    self.relics.push(RelicState { id: relic_id.clone(), pos: relic_pos });
+                    ship_events
+                        .entry(id.clone())
+                        .or_default()
+                        .push(Event::RelicDropped { relic_id, pos: relic_pos });
+                }
+            }
+        }
+
         } // end if self.params.collision_enabled
 
         // 5_a. Combat: shield regen, cannon cooldown tick-down, and firing.
@@ -1021,20 +1169,78 @@ impl Engine {
 
         // 5e. Kill resolution: award kill_bounty to each killer and emit KilledShip.
         //
-        // A kill is only attributed when a rune-cannon projectile dealt the lethal
-        // blow; environmental / collision deaths (issue 07+) produce `Died { by: None }`
-        // with no bounty — there are no such kills to process here yet.
-        //
-        // Seam for issue 06: after awarding the bounty, drop the victim's relics and
-        // schedule their respawn (respawn_delay / invuln fields live on ShipState).
+        // Issue 06: after awarding the bounty, drop the victim's carried relics back
+        // into the Drift (with small RNG scatter for visual spread) and schedule their
+        // respawn.  Scatter uses the engine's seeded RNG so the drop is deterministic.
         {
-            let kill_bounty = self.params.kill_bounty;
+            let kill_bounty    = self.params.kill_bounty;
+            let respawn_delay  = self.params.respawn_delay;
+            let scatter_radius = self.params.ship_radius * 1.5;
+
             for (victim_id, killer_id) in kills {
                 *self.scores.entry(killer_id.clone()).or_insert(0.0) += kill_bounty;
                 ship_events
                     .entry(killer_id)
                     .or_default()
-                    .push(Event::KilledShip { victim: victim_id });
+                    .push(Event::KilledShip { victim: victim_id.clone() });
+
+                // Collect drop info and mutate victim fields while holding the
+                // mutable borrow; release it before pushing to self.relics.
+                let (drop_pos, drop_count) = {
+                    let victim = self.ships.iter_mut().find(|s| s.id == victim_id);
+                    if let Some(v) = victim {
+                        let pos   = v.pos;
+                        let count = v.relics_carried;
+                        v.relics_carried       = 0;
+                        v.respawn_ticks_left   = respawn_delay;
+                        (pos, count)
+                    } else {
+                        continue;
+                    }
+                };
+
+                // Drop each carried relic back into the Drift with a small scatter.
+                for _ in 0..drop_count {
+                    let angle: f32 = self.rng.random_range(0.0..TAU);
+                    let r: f32     = self.rng.random_range(0.0..scatter_radius);
+                    let relic_pos  = Vec2::new(
+                        drop_pos.x + angle.cos() * r,
+                        drop_pos.y + angle.sin() * r,
+                    );
+                    let relic_id = format!("relic-{}", self.relic_id_counter);
+                    self.relic_id_counter += 1;
+                    self.relics.push(RelicState { id: relic_id.clone(), pos: relic_pos });
+                    ship_events
+                        .entry(victim_id.clone())
+                        .or_default()
+                        .push(Event::RelicDropped { relic_id, pos: relic_pos });
+                }
+            }
+        }
+
+        // ── Issue 06: invuln tick-down ────────────────────────────────────────
+        //
+        // Runs AFTER combat so that a ship's invuln flag is still set during the
+        // combat block on every tick it is counted as "protected".  With this
+        // placement and `invuln_ticks_left = respawn_invuln + 1` at respawn, the
+        // full `respawn_invuln` quota of fire-step blocks is guaranteed:
+        //
+        //   respawn step  : ticks_left = N+1.  Combat runs (blocked if shot at).
+        //                   End-of-step: N+1 → N.
+        //   fire step 0   : ticks_left = N. Combat: blocked. End: N → N-1.
+        //   …
+        //   fire step N-1 : ticks_left = 1. Combat: blocked. End: 1 → 0. invuln = false.
+        //   fire step N   : invuln = false. Damage applies.
+        //
+        // `invuln_ticks_left = 0` with `invuln = true` means the flag was set
+        // externally (e.g. `set_invuln_for_test`) and intentionally never expires.
+        for ship in &mut self.ships {
+            if !ship.alive || !ship.invuln || ship.invuln_ticks_left == 0 {
+                continue;
+            }
+            ship.invuln_ticks_left -= 1;
+            if ship.invuln_ticks_left == 0 {
+                ship.invuln = false;
             }
         }
 
@@ -1196,9 +1402,21 @@ impl Engine {
     ///
     /// This allows collision tests to verify that invulnerable ships receive no
     /// collision damage, without waiting for issue 06 (spawn protection) to land.
+    /// Setting `invuln = true` with `invuln_ticks_left = 0` (default) means the
+    /// flag persists indefinitely — it won't be expired by the invuln countdown.
     pub fn set_invuln_for_test(&mut self, ship_id: &str, invuln: bool) {
         if let Some(ship) = self.ships.iter_mut().find(|s| s.id == ship_id) {
             ship.invuln = invuln;
+        }
+    }
+
+    /// Test-only helper: directly set `relics_carried` on a ship by id.
+    ///
+    /// Allows relic-drop tests to put the ship into a carrying state without
+    /// running through a full pickup + non-banking scenario.
+    pub fn set_relics_carried_for_test(&mut self, ship_id: &str, count: u32) {
+        if let Some(ship) = self.ships.iter_mut().find(|s| s.id == ship_id) {
+            ship.relics_carried = count;
         }
     }
 
@@ -1277,7 +1495,8 @@ fn apply_cannon_damage(
     by: &ShipId,
     events: &mut HashMap<ShipId, Vec<Event>>,
 ) -> Option<ShipId> {
-    if !ship.alive || damage <= 0.0 {
+    // Invuln ships (spawn-protection or Bulwark) take no damage from any source.
+    if !ship.alive || damage <= 0.0 || ship.invuln {
         return None;
     }
 
@@ -1325,10 +1544,8 @@ fn apply_cannon_damage(
                 .entry(ship.id.clone())
                 .or_default()
                 .push(Event::Died { by: Some(by.clone()) });
-            // Seam for issue 06:
-            //   1. Drop carried relics at ship.pos and emit RelicDropped events.
-            //   2. Schedule respawn at anchor after params.respawn_delay ticks.
-            //   3. Set ship.invuln = true for params.respawn_invuln ticks post-respawn.
+            // Relic drop + respawn scheduling handled in the 5e kill-resolution
+            // block (Engine::step), which has access to self.relics and self.rng.
             return Some(by.clone());
         }
     }
@@ -1345,11 +1562,13 @@ fn apply_cannon_damage(
 ///   cannon variants (no `by` field — collision damage is environmental).
 /// - Lethal hits emit `Died { by: None }` and do NOT award a kill bounty.
 ///
-/// Returns `true` when the hit was lethal (Hull reached 0).
+/// Returns `true` when the hit was lethal (Hull reached 0).  Callers are
+/// responsible for scheduling respawn and dropping carried relics when `true`
+/// is returned (see the env_death_drops pattern in `Engine::step`).
 ///
 /// Seam for issue 10 (Aether Mine detonation): call `apply_env_damage` with
-/// `params.mine_damage` once proximity triggers, passing the same `ship_events`
-/// map — the damage path is identical and already decoupled from the caller.
+/// `params.mine_damage` once proximity triggers, then check the return value
+/// to schedule respawn — the damage path is identical and decoupled.
 fn apply_env_damage(
     ship: &mut ShipState,
     damage: f32,

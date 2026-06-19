@@ -145,7 +145,13 @@ pub enum Event {
     /// The killer's score has already been updated with `params.kill_bounty` when
     /// this event is delivered.
     KilledShip { victim: ShipId },
-    // Seam — issue 06 adds: RelicDropped { relic_id: String, pos: Vec2 }
+    /// A relic that the ship was carrying was dropped into the Drift when the
+    /// ship was destroyed.  Emitted to the destroyed ship (the carrier) for
+    /// each relic dropped.
+    RelicDropped { relic_id: String, pos: Vec2 },
+    /// This ship has just respawned at its Anchor after the `respawn_delay`
+    /// tick count elapsed since its destruction.
+    Respawned,
 
     // ── Issue 07: Collision damage ─────────────────────────────────────────
     /// The ship's Shield absorbed `amount` damage from a collision (wall,
