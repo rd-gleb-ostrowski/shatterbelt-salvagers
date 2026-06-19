@@ -58,6 +58,7 @@ fn test_app_with_hub(
         match_seed: 42,
         match_params: Params { max_ticks: TEST_MAX_TICKS, ..Params::default() },
         observer_hub: hub.clone(),
+        recording_store: arena_server::recording::RecordingStore::new(),
     });
     (app, hub)
 }

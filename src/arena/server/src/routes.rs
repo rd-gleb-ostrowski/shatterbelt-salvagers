@@ -7,6 +7,8 @@
 //! | `POST` | `/register` | event password in body | Register a team → token |
 //! | `GET`  | `/ws`       | token in `join` message | WS Bot connect & play |
 //! | `POST` | `/bots`     | `Authorization: Bearer <token>` | Upload a WASM Bot artifact |
+//! | `GET`  | `/recordings` | — | List all recorded matches |
+//! | `POST` | `/recordings/{id}/replay` | — | Replay a recording through the observer hub |
 //!
 //! ## Seams for future issues
 //!
@@ -14,18 +16,20 @@
 //!   the stored bytes and instantiate the WASM module before a match.
 //! - **Issue 06 (connection resolver):** `state.wasm_store.get(team).is_some()`
 //!   drives the WS → WASM → Default priority decision (ADR-0001).
+//! - **Issue 10 (TrueSkill):** consume `state.recording_store.list()` winner +
+//!   scores after each match to update ratings.
 //! - **Issue 11 (facilitator / Admin):** add a `facilitator_password: String`
-//!   field to [`AppState`] and gate Admin-only routes on it. The Admin can call
-//!   `state.wasm_store.store(team, bytes)` to upload/replace on behalf of a team.
+//!   field to [`AppState`] and gate Admin-only routes on it.  `GET /recordings`
+//!   and `POST /recordings/{id}/replay` are already available as seams.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use axum::{
-    extract::State,
+    extract::{Path, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
-    routing::{any, post},
+    routing::{any, get, post},
     Json, Router,
 };
 use bytes::Bytes;
@@ -35,6 +39,9 @@ use arena_engine::Params;
 
 use crate::auth::TokenRegistry;
 use crate::observer::{ObserverHub, ws_viewer_handler};
+use crate::pacer::NoopPacer;
+use crate::recording::RecordingStore;
+use crate::replay::run_replay;
 use crate::store::WasmBotStore;
 use crate::ws::ws_bot_handler;
 
@@ -49,6 +56,7 @@ use crate::ws::ws_bot_handler;
 /// ## Adding future state
 ///
 /// Extend this struct rather than reaching for global statics:
+/// - Issue 10: read `recording_store` to update TrueSkill ratings.
 /// - Issue 11: add `facilitator_password: String` here.
 /// - Issue 07 (observer broadcast): `observer_hub` added here (this issue).
 #[derive(Clone)]
@@ -90,6 +98,23 @@ pub struct AppState {
     /// The admin replaces this hub (or swaps which match feeds it) to push a
     /// specific match to the projector.
     pub observer_hub: ObserverHub,
+
+    /// In-memory store of finished-match recordings (issue 08).
+    ///
+    /// Every match completion appends a [`Recording`](crate::recording::Recording)
+    /// here.  The HTTP handler `GET /recordings` lists them; `POST
+    /// /recordings/{id}/replay` replays one through the observer hub.
+    ///
+    /// ## Seam: issue 10 (TrueSkill ladder)
+    ///
+    /// After a match finishes, read `winner` + `scores` from the stored
+    /// [`RecordingMeta`](crate::recording::RecordingMeta) to drive rating updates.
+    ///
+    /// ## Seam: issue 11 (Admin UI)
+    ///
+    /// Expose `recording_store.list()` and `recording_store.get(id)` via
+    /// admin-gated HTTP endpoints for download / replay.
+    pub recording_store: Arc<RecordingStore>,
 }
 
 // ── Router configuration ──────────────────────────────────────────────────────
@@ -115,6 +140,11 @@ pub struct RouterConfig {
     /// Retain a clone before passing to [`build_router_config`] if you need to
     /// subscribe to the hub directly in tests.
     pub observer_hub: ObserverHub,
+    /// Recording store. Defaults to a fresh [`RecordingStore`] in [`build_router`].
+    ///
+    /// Retain the `Arc` clone before passing to [`build_router_config`] if you
+    /// need to inspect recordings after a match in tests.
+    pub recording_store: Arc<RecordingStore>,
 }
 
 // ── Wire types ────────────────────────────────────────────────────────────────
@@ -232,6 +262,76 @@ async fn post_bots(
     StatusCode::OK.into_response()
 }
 
+// ── Recording handlers ────────────────────────────────────────────────────────
+
+/// JSON response shape for a single recording entry in `GET /recordings`.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RecordingListItem {
+    match_id: String,
+    seed: u64,
+    tick_count: u32,
+    winner: Option<String>,
+}
+
+/// `GET /recordings` — list all finished-match recordings.
+///
+/// Returns a JSON array of lightweight metadata objects.  The `matchId` can
+/// be used with `POST /recordings/{id}/replay` to replay a match.
+///
+/// ## Seam: issue 11 (Admin UI)
+///
+/// Gate this behind `Authorization: Facilitator <password>` in issue 11.
+async fn get_recordings(State(state): State<AppState>) -> impl IntoResponse {
+    let items: Vec<RecordingListItem> = state
+        .recording_store
+        .list()
+        .into_iter()
+        .map(|m| RecordingListItem {
+            match_id: m.match_id,
+            seed: m.seed,
+            tick_count: m.tick_count,
+            winner: m.winner,
+        })
+        .collect();
+    (StatusCode::OK, Json(items))
+}
+
+/// `POST /recordings/{id}/replay` — replay a recorded match through the observer hub.
+///
+/// Reconstructs the match from its stored seed + intent log via
+/// [`arena_engine::harness::replay_match`] and publishes every tick's god-view
+/// frame to the [`ObserverHub`].  Viewers subscribed to `/observe` will receive
+/// the replay frames in real time.
+///
+/// Uses [`NoopPacer`] (instant replay) so the HTTP handler returns quickly.
+/// For real-time replay at 30 Hz, issue 11 can spawn a background task with
+/// [`LivePacer`](crate::pacer::LivePacer).
+///
+/// # Responses
+///
+/// | Status | Meaning |
+/// |--------|---------|
+/// | **200 OK** | Replay completed; frames published to observer hub. |
+/// | **404 Not Found** | No recording with the given `id`. |
+async fn post_replay(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let recording = match state.recording_store.get(&id) {
+        Some(r) => r,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "recording not found"})),
+            )
+                .into_response();
+        }
+    };
+    run_replay(&recording, &state.observer_hub, Box::new(NoopPacer));
+    StatusCode::OK.into_response()
+}
+
 /// Extract a Bearer token from the `Authorization` header.
 ///
 /// Returns `None` if the header is absent, not valid UTF-8, or not of the form
@@ -279,6 +379,7 @@ pub fn build_router(event_password: String, registry: Arc<TokenRegistry>) -> Rou
         match_seed: 42,
         match_params: Params::default(),
         observer_hub: ObserverHub::new(),
+        recording_store: RecordingStore::new(),
     })
 }
 
@@ -295,12 +396,15 @@ pub fn build_router_config(config: RouterConfig) -> Router {
         match_seed: config.match_seed,
         match_params: config.match_params,
         observer_hub: config.observer_hub,
+        recording_store: config.recording_store,
     };
     Router::new()
         .route("/register", post(post_register))
         .route("/bots", post(post_bots))
         .route("/ws", any(ws_bot_handler))
         .route("/observe", any(ws_viewer_handler))
+        .route("/recordings", get(get_recordings))
+        .route("/recordings/{id}/replay", post(post_replay))
         .with_state(state)
 }
 

@@ -54,6 +54,7 @@ use uuid::Uuid;
 use arena_engine::{Engine, Intent, ShipClass, ShipId, ShipSpec, Vec2};
 
 use crate::bot::DefaultBotDriver;
+use crate::recording::{Recording, RecordingMeta};
 use crate::routes::AppState;
 use crate::runner::BotDriver;
 
@@ -543,7 +544,7 @@ async fn handle_ws_bot(mut socket: WebSocket, state: AppState) {
         },
     ];
 
-    let mut engine = Engine::new(seed, params.clone(), specs);
+    let mut engine = Engine::new(seed, params.clone(), specs.clone());
     let mut default_driver = DefaultBotDriver::new(&params);
 
     // ── 3. matchStart ─────────────────────────────────────────────────────────
@@ -607,6 +608,36 @@ async fn handle_ws_bot(mut socket: WebSocket, state: AppState) {
         .iter()
         .map(|id| (id.clone(), engine.score(id).unwrap_or(0.0)))
         .collect();
+
+    // ── Issue 08: record the finished match ───────────────────────────────────
+    //
+    // Persist the seed, scaled params, specs, and full applied-intent log so
+    // the match can be replayed exactly via `harness::replay_match`.
+    //
+    // Seam (issue 10 / TrueSkill): `recording.meta.winner` and
+    // `recording.meta.scores` are available here for rating updates.
+    {
+        let match_id = Uuid::new_v4().to_string();
+        let score_vec: Vec<(ShipId, f32)> = ship_ids
+            .iter()
+            .map(|id| (id.clone(), engine.score(id).unwrap_or(0.0)))
+            .collect();
+        let recording = Recording {
+            match_id: match_id.clone(),
+            seed,
+            params: params.clone(),
+            specs: specs.clone(),
+            intent_log: engine.intent_log().to_vec(),
+            meta: RecordingMeta {
+                match_id,
+                seed,
+                tick_count: engine.tick(),
+                winner: engine.winner(),
+                scores: score_vec,
+            },
+        };
+        state.recording_store.record(recording);
+    }
 
     let match_end = MatchEndMsg {
         type_: "matchEnd",

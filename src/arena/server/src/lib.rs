@@ -30,6 +30,8 @@ pub mod auth;
 pub mod bot;
 pub mod observer;
 pub mod pacer;
+pub mod recording;
+pub mod replay;
 pub mod resolver;
 pub mod routes;
 pub mod runner;
