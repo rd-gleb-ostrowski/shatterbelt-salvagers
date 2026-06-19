@@ -45,6 +45,7 @@ fn test_app(registry: std::sync::Arc<TokenRegistry>) -> axum::Router {
         tick_deadline: Duration::from_millis(TEST_DEADLINE_MS),
         match_seed: 42,
         match_params: Params { max_ticks: TEST_MAX_TICKS, ..Params::default() },
+        observer_hub: arena_server::observer::ObserverHub::new(),
     })
 }
 

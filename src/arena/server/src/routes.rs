@@ -34,6 +34,7 @@ use serde::{Deserialize, Serialize};
 use arena_engine::Params;
 
 use crate::auth::TokenRegistry;
+use crate::observer::{ObserverHub, ws_viewer_handler};
 use crate::store::WasmBotStore;
 use crate::ws::ws_bot_handler;
 
@@ -49,7 +50,7 @@ use crate::ws::ws_bot_handler;
 ///
 /// Extend this struct rather than reaching for global statics:
 /// - Issue 11: add `facilitator_password: String` here.
-/// - Issue 07 (observer broadcast): add a `tokio::sync::broadcast::Sender` here.
+/// - Issue 07 (observer broadcast): `observer_hub` added here (this issue).
 #[derive(Clone)]
 pub struct AppState {
     /// Pre-shared event password configured at server startup.
@@ -78,6 +79,17 @@ pub struct AppState {
     ///
     /// Tests use `Params { max_ticks: N, ..Params::default() }` for short matches.
     pub match_params: Params,
+
+    /// God-mode observer broadcast hub (issue 07).
+    ///
+    /// The match tick loop calls `observer_hub.publish_god_view()` after each
+    /// tick; Viewer WS clients subscribe via `GET /observe`.
+    ///
+    /// ## Seam: issue 11 (admin projector)
+    ///
+    /// The admin replaces this hub (or swaps which match feeds it) to push a
+    /// specific match to the projector.
+    pub observer_hub: ObserverHub,
 }
 
 // ── Router configuration ──────────────────────────────────────────────────────
@@ -98,6 +110,11 @@ pub struct RouterConfig {
     pub match_seed: u64,
     /// Engine params. Defaults to [`Params::default`] in [`build_router`].
     pub match_params: Params,
+    /// God-mode observer hub. Defaults to a fresh [`ObserverHub`] in [`build_router`].
+    ///
+    /// Retain a clone before passing to [`build_router_config`] if you need to
+    /// subscribe to the hub directly in tests.
+    pub observer_hub: ObserverHub,
 }
 
 // ── Wire types ────────────────────────────────────────────────────────────────
@@ -261,6 +278,7 @@ pub fn build_router(event_password: String, registry: Arc<TokenRegistry>) -> Rou
         tick_deadline: Duration::from_millis(33),
         match_seed: 42,
         match_params: Params::default(),
+        observer_hub: ObserverHub::new(),
     })
 }
 
@@ -276,11 +294,13 @@ pub fn build_router_config(config: RouterConfig) -> Router {
         tick_deadline: config.tick_deadline,
         match_seed: config.match_seed,
         match_params: config.match_params,
+        observer_hub: config.observer_hub,
     };
     Router::new()
         .route("/register", post(post_register))
         .route("/bots", post(post_bots))
         .route("/ws", any(ws_bot_handler))
+        .route("/observe", any(ws_viewer_handler))
         .with_state(state)
 }
 

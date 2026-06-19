@@ -22,11 +22,13 @@
 //! | Connection resolution | [`resolver::ConnectionResolver`] + [`resolver::WsConnectionRegistry`] | 06 (this issue), 09 (headless), 11 (admin) |
 //! | Tick pacing | [`runner::TickPacer`] trait | already used by [`pacer::LivePacer`] |
 //! | Engine state | `runner.engine()` | 07 (observer god_view), 08 (intent_log) |
+//! | Observer stream | [`observer::ObserverHub`] | 07 (this issue), 08 (recording tap), 11 (admin projector) |
 //! | Match outcome | [`runner::MatchOutcome`] | 14 (ladder) |
 //! | WASM artifact storage | [`store::WasmBotStore`] | 04 (this issue), 05 (wasmtime host), 06 (resolver), 11 (admin) |
 
 pub mod auth;
 pub mod bot;
+pub mod observer;
 pub mod pacer;
 pub mod resolver;
 pub mod routes;

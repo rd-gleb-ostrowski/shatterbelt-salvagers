@@ -595,8 +595,9 @@ async fn handle_ws_bot(mut socket: WebSocket, state: AppState) {
             }
         }
 
-        // Issue 07 seam: call engine.god_view() here to broadcast to Viewers.
+        // Issue 07: broadcast the full world state to Viewer clients after each tick.
         engine.step(intents);
+        state.observer_hub.publish_god_view(&engine.god_view());
     }
 
     // ── 5. matchEnd ───────────────────────────────────────────────────────────
@@ -699,15 +700,15 @@ pub fn obs_to_tick_json(tick: u32, obs: &arena_engine::Observation) -> String {
     serde_json::to_string(&msg).unwrap_or_default()
 }
 
-fn vec2_to_json(v: Vec2) -> Vec2Json {
+pub(crate) fn vec2_to_json(v: Vec2) -> Vec2Json {
     Vec2Json { x: v.x, y: v.y }
 }
 
-fn resource_to_json(r: arena_engine::Resource) -> ResourceJson {
+pub(crate) fn resource_to_json(r: arena_engine::Resource) -> ResourceJson {
     ResourceJson { cur: r.cur, max: r.max }
 }
 
-fn sigil_to_str(s: &arena_engine::Sigil) -> String {
+pub(crate) fn sigil_to_str(s: &arena_engine::Sigil) -> String {
     use arena_engine::Sigil;
     match s {
         Sigil::Afterburner => "Afterburner",
@@ -719,7 +720,7 @@ fn sigil_to_str(s: &arena_engine::Sigil) -> String {
     .to_owned()
 }
 
-fn ship_class_to_str(c: &arena_engine::ShipClass) -> String {
+pub(crate) fn ship_class_to_str(c: &arena_engine::ShipClass) -> String {
     match c {
         ShipClass::Skiff => "skiff".to_owned(),
     }
@@ -760,14 +761,14 @@ fn other_ship_to_json(s: &arena_engine::OtherShipView) -> OtherShipViewJson {
     }
 }
 
-fn anchor_to_json(a: &arena_engine::AnchorView) -> AnchorViewJson {
+pub(crate) fn anchor_to_json(a: &arena_engine::AnchorView) -> AnchorViewJson {
     AnchorViewJson {
         ship_id: a.ship_id.clone(),
         pos: vec2_to_json(a.pos),
     }
 }
 
-fn relic_to_json(r: &arena_engine::RelicView) -> RelicViewJson {
+pub(crate) fn relic_to_json(r: &arena_engine::RelicView) -> RelicViewJson {
     RelicViewJson {
         id: r.id.clone(),
         pos: vec2_to_json(r.pos),
@@ -776,7 +777,7 @@ fn relic_to_json(r: &arena_engine::RelicView) -> RelicViewJson {
     }
 }
 
-fn asteroid_to_json(a: &arena_engine::AsteroidView) -> AsteroidViewJson {
+pub(crate) fn asteroid_to_json(a: &arena_engine::AsteroidView) -> AsteroidViewJson {
     AsteroidViewJson {
         id: a.id.clone(),
         pos: vec2_to_json(a.pos),
@@ -785,7 +786,7 @@ fn asteroid_to_json(a: &arena_engine::AsteroidView) -> AsteroidViewJson {
     }
 }
 
-fn projectile_to_json(p: &arena_engine::ProjectileView) -> ProjectileViewJson {
+pub(crate) fn projectile_to_json(p: &arena_engine::ProjectileView) -> ProjectileViewJson {
     ProjectileViewJson {
         id: p.id.clone(),
         pos: vec2_to_json(p.pos),
@@ -794,7 +795,7 @@ fn projectile_to_json(p: &arena_engine::ProjectileView) -> ProjectileViewJson {
     }
 }
 
-fn singularity_to_json(s: &arena_engine::SingularityView) -> SingularityViewJson {
+pub(crate) fn singularity_to_json(s: &arena_engine::SingularityView) -> SingularityViewJson {
     SingularityViewJson {
         id: s.id.clone(),
         pos: vec2_to_json(s.pos),
@@ -803,7 +804,7 @@ fn singularity_to_json(s: &arena_engine::SingularityView) -> SingularityViewJson
     }
 }
 
-fn mine_to_json(m: &arena_engine::MineView) -> MineViewJson {
+pub(crate) fn mine_to_json(m: &arena_engine::MineView) -> MineViewJson {
     MineViewJson {
         id: m.id.clone(),
         pos: vec2_to_json(m.pos),
