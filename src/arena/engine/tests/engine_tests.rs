@@ -848,3 +848,548 @@ fn golden_thrust_envelope() {
         "after 120 coast ticks ship should be nearly stopped; speed = {spd_coast}"
     );
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Issue 03: Relic economy & match scoring
+//
+// TDD tracer-bullet order:
+//  21. Relics exist in the Drift / god-view at match start
+//  22. Observation includes relics
+//  23. A ship overlapping a relic picks it up (carried count rises, relic leaves field)
+//  24. Carry cap blocks further pickup
+//  25. Banking at the Anchor moves carried value into score and clears carried
+//  26. Relics replenish over time up to field cap
+//  27. Match ends at max_ticks with a winner = highest score
+//  28. Golden: carry-to-anchor scores the expected value
+//  29. Golden: full match decisive, no shutout
+//  30. Determinism: same seed + applied-intent log → same relic spawns / score
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ─── helpers ─────────────────────────────────────────────────────────────────
+
+/// A tiny 202 × 202 arena ensures all relic spawn positions ([100, 102) × [100, 102))
+/// are within the default pickup_radius (32) of a ship placed at (100, 100).
+/// Both ships are at their respective anchors — pickup and banking happen
+/// in the same step, which is legal and mirrors the harness per-ship sequence.
+fn tiny_arena_params() -> arena_engine::Params {
+    let mut p = arena_engine::Params::default();
+    p.arena_w = 202.0;
+    p.arena_h = 202.0;
+    p.relic_field_cap = 4;       // initial = max(2, 4/2) = 2 relics
+    p.relic_spawn_period = 1;    // replenish every tick
+    p.carry_cap = 1;             // cap = 1 so two ships can share the field
+    p.max_ticks = 10;
+    p
+}
+
+/// Single ship at (100, 100) in a tiny arena — relics always spawn within pickup range.
+fn tiny_single_engine() -> arena_engine::Engine {
+    let p = {
+        let mut p = tiny_arena_params();
+        p.carry_cap = 5; // give enough carry capacity for the single-ship golden scenario
+        p
+    };
+    let spec = arena_engine::ShipSpec {
+        id: "ship-1".to_string(),
+        class: arena_engine::ShipClass::Skiff,
+        anchor_pos: arena_engine::Vec2 { x: 100.0, y: 100.0 },
+    };
+    arena_engine::Engine::new(42, p, vec![spec])
+}
+
+/// Two ships in a tiny arena: ship-1 at (99, 99), ship-2 at (101, 101).
+/// Both are within pickup and bank radius of relics spawning in [100, 102)^2.
+fn tiny_two_ship_engine() -> arena_engine::Engine {
+    let p = tiny_arena_params();
+    let specs = vec![
+        arena_engine::ShipSpec {
+            id: "ship-1".to_string(),
+            class: arena_engine::ShipClass::Skiff,
+            anchor_pos: arena_engine::Vec2 { x: 99.0, y: 99.0 },
+        },
+        arena_engine::ShipSpec {
+            id: "ship-2".to_string(),
+            class: arena_engine::ShipClass::Skiff,
+            anchor_pos: arena_engine::Vec2 { x: 101.0, y: 101.0 },
+        },
+    ];
+    arena_engine::Engine::new(42, p, specs)
+}
+
+// ─── test 21: relics exist in god-view at match start ─────────────────────────
+
+#[test]
+fn relics_exist_in_god_view_at_match_start() {
+    // With default params: initial relics = max(2, 12/2) = 6.
+    let engine = single_ship_engine();
+    let view = engine.god_view();
+
+    assert!(
+        !view.relics.is_empty(),
+        "relics must be present in the Drift at match start"
+    );
+    // Default: 6 initial relics
+    let params = arena_engine::Params::default();
+    let expected = std::cmp::max(2, params.relic_field_cap / 2) as usize;
+    assert_eq!(
+        view.relics.len(),
+        expected,
+        "expected {expected} initial relics (max(2, relic_field_cap/2)); got {}",
+        view.relics.len()
+    );
+
+    // Every relic has a non-empty id and a value matching params.
+    for r in &view.relics {
+        assert!(!r.id.is_empty(), "relic id must be non-empty");
+        assert_eq!(
+            r.value, params.relic_value,
+            "relic value must equal params.relic_value"
+        );
+    }
+}
+
+// ─── test 22: observation includes relics ─────────────────────────────────────
+
+#[test]
+fn observation_includes_relics() {
+    let engine = single_ship_engine();
+    let obs = engine
+        .observation(&"ship-1".to_string())
+        .expect("ship-1 exists");
+
+    // Observation relics must match god_view relics in count and id.
+    let god = engine.god_view();
+    assert_eq!(
+        obs.relics.len(),
+        god.relics.len(),
+        "observation and god_view must report the same relic count"
+    );
+    let obs_ids: std::collections::HashSet<&str> =
+        obs.relics.iter().map(|r| r.id.as_str()).collect();
+    let god_ids: std::collections::HashSet<&str> =
+        god.relics.iter().map(|r| r.id.as_str()).collect();
+    assert_eq!(obs_ids, god_ids, "observation and god_view relics must have the same ids");
+}
+
+// ─── test 23: ship overlapping a relic picks it up ────────────────────────────
+
+#[test]
+fn ship_overlapping_relic_picks_it_up() {
+    // tiny_single_engine(): ship at anchor (100, 100), relics in [100, 102)^2.
+    // Ship picks up all relics within range AND banks them in the same step
+    // (ship is at its anchor).  Observable at the public boundary:
+    //   • relics leave the Drift (field count drops)
+    //   • score rises (picked-up relics were banked)
+    let mut engine = tiny_single_engine();
+    let relics_before = engine.god_view().relics.len();
+    let score_before = engine.score(&"ship-1".to_string()).unwrap();
+    assert!(relics_before > 0, "there must be relics at match start");
+    assert_eq!(score_before, 0.0, "score must be 0 at match start");
+
+    engine.step(vec![]);
+
+    let view = engine.god_view();
+    let score_after = engine
+        .score(&"ship-1".to_string())
+        .expect("ship exists");
+
+    // Relics removed from field.
+    assert!(
+        view.relics.len() < relics_before,
+        "picked-up relics must be removed from the Drift; before={relics_before}, after={}",
+        view.relics.len()
+    );
+
+    // Score rose (relics were banked in the same step since ship is at anchor).
+    assert!(
+        score_after > score_before,
+        "score must rise after pickup+banking; before={score_before}, after={score_after}"
+    );
+}
+
+// ─── test 24: carry cap blocks further pickup ─────────────────────────────────
+
+#[test]
+fn carry_cap_blocks_further_pickup() {
+    // Two otherwise-identical engines, one with carry_cap=1 and one with cap=5.
+    // With cap=1 the ship can remove at most 1 relic per step from the field.
+    // With cap=5 (≥ initial relic count of 2) all relics are removed in one step.
+    // The difference in field count after one step reveals the cap effect.
+
+    let make_engine = |cap: u32| {
+        let mut params = arena_engine::Params::default();
+        params.arena_w = 202.0;
+        params.arena_h = 202.0;
+        params.relic_field_cap = 4;   // initial = 2 relics
+        params.carry_cap = cap;
+        params.relic_spawn_period = 9999;
+        let spec = arena_engine::ShipSpec {
+            id: "s".to_string(),
+            class: arena_engine::ShipClass::Skiff,
+            anchor_pos: arena_engine::Vec2 { x: 100.0, y: 100.0 },
+        };
+        arena_engine::Engine::new(42, params, vec![spec])
+    };
+
+    // With cap=5: both initial relics are picked up and banked in one step.
+    let mut full_cap = make_engine(5);
+    let initial_relics = full_cap.god_view().relics.len();
+    assert_eq!(initial_relics, 2, "expected 2 initial relics; got {initial_relics}");
+    full_cap.step(vec![]);
+    let relics_after_full = full_cap.god_view().relics.len();
+    let score_full = full_cap.score(&"s".to_string()).unwrap();
+
+    // With cap=1: only 1 relic picked up+banked per step.
+    let mut capped = make_engine(1);
+    capped.step(vec![]);
+    let relics_after_capped = capped.god_view().relics.len();
+    let score_capped = capped.score(&"s".to_string()).unwrap();
+
+    // cap=5 removes all relics; cap=1 leaves (initial - 1) relics.
+    assert_eq!(
+        relics_after_full, 0,
+        "cap=5 must clear all relics in one step; {relics_after_full} remain"
+    );
+    assert_eq!(
+        relics_after_capped,
+        initial_relics - 1,
+        "cap=1 must leave (initial-1)={} relics; got {relics_after_capped}",
+        initial_relics - 1
+    );
+
+    // Score difference reflects the cap: cap=5 banks more than cap=1.
+    assert!(
+        score_full > score_capped,
+        "score with cap=5 ({score_full}) must exceed score with cap=1 ({score_capped})"
+    );
+}
+
+// ─── test 25: banking at Anchor moves score and clears carried ─────────────────
+
+#[test]
+fn banking_at_anchor_scores_relics_and_clears_carried() {
+    // Ship is at its anchor in the tiny arena: picks up relics AND banks them in one step.
+    let mut engine = tiny_single_engine();
+
+    let score_before = engine.score(&"ship-1".to_string()).unwrap_or(0.0);
+    assert_eq!(score_before, 0.0, "score must be 0 before any banking");
+
+    engine.step(vec![]);
+
+    let view = engine.god_view();
+    let ship = &view.ships[0];
+
+    // After pickup + banking in one step, carry must be cleared.
+    assert_eq!(
+        ship.relics_carried, 0,
+        "relics_carried must be 0 after banking; got {}",
+        ship.relics_carried
+    );
+
+    // Score must have increased by (relics picked up) × relic_value.
+    let score_after = engine.score(&"ship-1".to_string()).unwrap_or(0.0);
+    assert!(
+        score_after > score_before,
+        "score must increase after banking; before={score_before}, after={score_after}"
+    );
+
+    let p = arena_engine::Params::default();
+    // Score must be a multiple of relic_value.
+    let banked_count = (score_after / p.relic_value).round() as u32;
+    assert!(
+        banked_count >= 1,
+        "at least one relic must have been banked; score={score_after}"
+    );
+    assert!(
+        (score_after - banked_count as f32 * p.relic_value).abs() < 1e-4,
+        "score must equal banked_count × relic_value = {} × {} = {}; got {score_after}",
+        banked_count,
+        p.relic_value,
+        banked_count as f32 * p.relic_value
+    );
+}
+
+// ─── test 26: relics replenish over time up to field cap ──────────────────────
+
+#[test]
+fn relics_replenish_over_time_up_to_field_cap() {
+    // A single ship far from all relics so none are picked up.
+    // With relic_spawn_period=1 and a small arena, relics spawn every tick
+    // until they hit relic_field_cap.
+    let mut params = arena_engine::Params::default();
+    params.arena_w = 400.0;
+    params.arena_h = 400.0;
+    params.relic_field_cap = 4;          // cap at 4
+    params.relic_spawn_period = 1;       // every tick
+    // Ship far from relic spawn zone so it doesn't pick any up.
+    params.relic_pickup_radius = 1.0;    // tiny pickup radius → no accidental pickup
+
+    let spec = arena_engine::ShipSpec {
+        id: "s".to_string(),
+        class: arena_engine::ShipClass::Skiff,
+        anchor_pos: arena_engine::Vec2 { x: 200.0, y: 200.0 },
+    };
+    let mut engine = arena_engine::Engine::new(99, params.clone(), vec![spec]);
+
+    let initial_count = engine.god_view().relics.len();  // max(2, 4/2) = 2
+    assert_eq!(initial_count, 2, "initial relics = max(2, field_cap/2) = 2; got {initial_count}");
+
+    // After 5 steps: 5 spawn attempts but cap = 4.
+    for _ in 0..5 {
+        engine.step(vec![]);
+    }
+    let after_count = engine.god_view().relics.len();
+    assert!(
+        after_count <= params.relic_field_cap as usize,
+        "relic count must not exceed field_cap={}; got {after_count}",
+        params.relic_field_cap
+    );
+    assert!(
+        after_count > initial_count,
+        "relics must replenish over time; before={initial_count}, after={after_count}"
+    );
+    assert_eq!(
+        after_count, params.relic_field_cap as usize,
+        "relic count must reach field_cap={} after enough replenishments; got {after_count}",
+        params.relic_field_cap
+    );
+}
+
+// ─── test 27: match ends at max_ticks with a winner ───────────────────────────
+
+#[test]
+fn match_ends_at_max_ticks_with_winner() {
+    let mut params = arena_engine::Params::default();
+    params.max_ticks = 5;   // short match for speed
+    params.relic_spawn_period = 9999;
+
+    let spec = arena_engine::ShipSpec {
+        id: "pilot".to_string(),
+        class: arena_engine::ShipClass::Skiff,
+        anchor_pos: arena_engine::Vec2 { x: 0.0, y: 0.0 },
+    };
+    let mut engine = arena_engine::Engine::new(1, params.clone(), vec![spec]);
+
+    assert!(!engine.is_match_over(), "match must not be over before any steps");
+    assert!(engine.winner().is_none(), "winner must be None while match is in progress");
+
+    for _ in 0..params.max_ticks {
+        engine.step(vec![]);
+    }
+
+    assert!(
+        engine.is_match_over(),
+        "match must be over after max_ticks={} steps; tick={}",
+        params.max_ticks,
+        engine.tick()
+    );
+    assert_eq!(engine.tick(), params.max_ticks);
+
+    let w = engine.winner();
+    assert!(
+        w.is_some(),
+        "winner() must return Some after match ends"
+    );
+    assert_eq!(
+        w.as_deref(),
+        Some("pilot"),
+        "only ship is 'pilot'; winner must be 'pilot'"
+    );
+}
+
+// ─── test 28: golden — carry-to-anchor scores expected value ──────────────────
+//
+// Setup (mirrors harness.py):
+//   • Tiny 202 × 202 arena → relics always spawn in [100, 102) × [100, 102).
+//   • 1 ship at anchor (100, 100) — within both pickup_radius and bank_radius.
+//   • relic_value = 1.0, carry_cap = 5, relic_field_cap = 4 → 2 initial relics.
+//   • After one step: ship picks up both relics (both within ~2 u), banks them.
+//
+// Expected score = 2 × relic_value = 2.0.  Source: BALANCE.md / params.py.
+
+#[test]
+fn golden_carry_to_anchor_scores_expected_value() {
+    let mut params = arena_engine::Params::default();
+    params.arena_w = 202.0;
+    params.arena_h = 202.0;
+    params.relic_field_cap = 4;      // initial = max(2, 2) = 2 relics
+    params.carry_cap = 5;
+    params.relic_value = 1.0;
+    params.relic_spawn_period = 9999; // no replenishment during this scenario
+    params.max_ticks = 3600;
+
+    let spec = arena_engine::ShipSpec {
+        id: "salvager".to_string(),
+        class: arena_engine::ShipClass::Skiff,
+        anchor_pos: arena_engine::Vec2 { x: 100.0, y: 100.0 },
+    };
+    let mut engine = arena_engine::Engine::new(42, params.clone(), vec![spec]);
+
+    let initial_relics = engine.god_view().relics.len();
+    assert_eq!(
+        initial_relics, 2,
+        "expected 2 initial relics for relic_field_cap=4; got {initial_relics}"
+    );
+
+    // One step: ship at anchor picks up both relics AND banks them immediately.
+    engine.step(vec![]);
+
+    let score = engine
+        .score(&"salvager".to_string())
+        .expect("ship exists");
+
+    let expected_score = initial_relics as f32 * params.relic_value;
+    assert!(
+        (score - expected_score).abs() < 1e-4,
+        "golden: score must be {} × {} = {}; got {score}",
+        initial_relics,
+        params.relic_value,
+        expected_score
+    );
+
+    // All relics must have been removed from the Drift (they were picked up).
+    let relics_after = engine.god_view().relics.len();
+    assert_eq!(
+        relics_after, 0,
+        "all relics must be gone after pickup; {} remain",
+        relics_after
+    );
+}
+
+// ─── test 29: golden — full match decisive, no shutout ────────────────────────
+//
+// Setup:
+//   • Tiny 202 × 202 arena, two ships.
+//   • carry_cap = 1: ship-1 grabs first relic each tick, ship-2 grabs second.
+//   • relic_spawn_period = 1: one relic added each tick after the first step.
+//   • max_ticks = 10: short match, both ships score.
+//
+// After the initial 2 relics are shared (1 each), every subsequent step adds
+// 1 relic that ship-1 takes (it iterates first).  ship-2 never scores again.
+//
+// After 10 steps:
+//   • ship-1 score = 1 (initial) + 9 (replenishments) = 10.
+//   • ship-2 score = 1 (initial).
+//   → Decisive winner: ship-1.  No shutout: ship-2 score = 1 > 0.
+//
+// Magnitudes mirror BALANCE.md "leaders bank ~22–26 … no shutouts at any size".
+
+#[test]
+fn golden_full_match_decisive_no_shutout() {
+    let engine_factory = || tiny_two_ship_engine();
+
+    let mut engine = engine_factory();
+
+    assert!(!engine.is_match_over(), "match must not be over at start");
+
+    // Run the full match.
+    while !engine.is_match_over() {
+        engine.step(vec![]);
+    }
+
+    assert!(engine.is_match_over(), "match must be over after max_ticks steps");
+
+    let winner = engine.winner().expect("match must produce a winner");
+    let view = engine.god_view();
+
+    let score1 = view.scores[&"ship-1".to_string()];
+    let score2 = view.scores[&"ship-2".to_string()];
+
+    // Decisive: there is a winner.
+    assert!(
+        score1 != score2 || !winner.is_empty(),
+        "match must be decisive (winner identified)"
+    );
+    assert_eq!(
+        winner, "ship-1",
+        "ship-1 takes first relic every tick and should win; scores: ship-1={score1}, ship-2={score2}"
+    );
+
+    // No shutout: both ships have positive scores.
+    assert!(
+        score1 > 0.0,
+        "ship-1 must have scored something (no shutout); score={score1}"
+    );
+    assert!(
+        score2 > 0.0,
+        "ship-2 must have scored something (no shutout); score={score2}"
+    );
+
+    // Sanity: winner has strictly higher score.
+    assert!(
+        score1 > score2,
+        "winner ship-1 (score={score1}) must beat ship-2 (score={score2})"
+    );
+}
+
+// ─── test 30: determinism — same seed + intent log reproduces identical scores ─
+
+#[test]
+fn determinism_same_seed_reproduces_relic_spawns_and_score() {
+    // Run two engines with the same seed and same (empty) intents.
+    // Both must end with identical relic positions and scores.
+
+    let make = || {
+        let mut p = arena_engine::Params::default();
+        p.max_ticks = 120;
+        p.relic_spawn_period = 30;
+
+        let specs = vec![
+            arena_engine::ShipSpec {
+                id: "red".to_string(),
+                class: arena_engine::ShipClass::Skiff,
+                anchor_pos: arena_engine::Vec2 { x: 200.0, y: 600.0 },
+            },
+            arena_engine::ShipSpec {
+                id: "blue".to_string(),
+                class: arena_engine::ShipClass::Skiff,
+                anchor_pos: arena_engine::Vec2 { x: 1800.0, y: 600.0 },
+            },
+        ];
+        arena_engine::Engine::new(77, p, specs)
+    };
+
+    let scripted: Vec<Vec<(String, arena_engine::Intent)>> = vec![
+        vec![
+            ("red".to_string(), arena_engine::Intent { thrust: Some(1.0), ..Default::default() }),
+            ("blue".to_string(), arena_engine::Intent { thrust: Some(-1.0), ..Default::default() }),
+        ],
+        vec![
+            ("red".to_string(), arena_engine::Intent { turn: Some(0.3), ..Default::default() }),
+        ],
+    ];
+
+    let run = |scripted: &Vec<Vec<(String, arena_engine::Intent)>>| {
+        let mut e = make();
+        for frame in scripted {
+            e.step(frame.clone());
+        }
+        for _ in scripted.len()..120 {
+            e.step(vec![]);
+        }
+        e.god_view()
+    };
+
+    let v1 = run(&scripted);
+    let v2 = run(&scripted);
+
+    // Relic count and positions must be identical.
+    assert_eq!(v1.relics.len(), v2.relics.len(), "relic count must match");
+
+    // Sort by id for stable comparison (swap_remove may reorder).
+    let mut r1: Vec<_> = v1.relics.iter().collect();
+    let mut r2: Vec<_> = v2.relics.iter().collect();
+    r1.sort_by(|a, b| a.id.cmp(&b.id));
+    r2.sort_by(|a, b| a.id.cmp(&b.id));
+    for (a, b) in r1.iter().zip(r2.iter()) {
+        assert_eq!(a.id, b.id, "relic ids must match");
+        assert_eq!(a.pos.x, b.pos.x, "relic x must be identical ({})", a.id);
+        assert_eq!(a.pos.y, b.pos.y, "relic y must be identical ({})", a.id);
+    }
+
+    // Scores must be identical.
+    for (id, &s1) in &v1.scores {
+        let s2 = v2.scores[id];
+        assert_eq!(s1, s2, "score for {id} must be identical: {s1} vs {s2}");
+    }
+}

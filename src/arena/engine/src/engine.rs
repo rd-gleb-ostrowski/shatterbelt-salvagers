@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::f32::consts::TAU;
 
+use rand::Rng;
 use rand::SeedableRng;
 use rand_pcg::Pcg64;
 use rapier2d::prelude::*;
@@ -215,6 +216,25 @@ impl ShipState {
 /// not just what the bot sent.  Use this for exact match replay.
 pub type IntentFrame = Vec<(ShipId, Intent)>;
 
+// ─── Internal Relic state ─────────────────────────────────────────────────────
+
+/// A Relic lying in the Drift (engine-internal; converted to `RelicView` on query).
+struct RelicState {
+    id: String,
+    pos: Vec2,
+}
+
+impl RelicState {
+    fn to_view(&self, relic_value: f32) -> RelicView {
+        RelicView {
+            id: self.id.clone(),
+            pos: self.pos,
+            vel: Vec2::zero(), // Relics are static in issue 03; movement added later
+            value: relic_value,
+        }
+    }
+}
+
 // ─── Engine ──────────────────────────────────────────────────────────────────
 
 /// The deterministic, headless heart of a Shatterbelt Salvagers Match.
@@ -230,10 +250,14 @@ pub struct Engine {
     ships: Vec<ShipState>,
     scores: HashMap<ShipId, f32>,
     intent_log: Vec<IntentFrame>,
-    /// Seeded RNG — used for spawning/Sigil assignment in later issues.
+    /// Seeded RNG — used for relic spawning and Sigil assignment.
     rng: Pcg64,
     /// rapier2d physics world — position/velocity source of truth for ships.
     physics: PhysicsWorld,
+    /// Relics currently lying in the Drift.
+    relics: Vec<RelicState>,
+    /// Monotonically-increasing counter for unique relic IDs.
+    relic_id_counter: u32,
 }
 
 impl Engine {
@@ -246,7 +270,6 @@ impl Engine {
     /// `scale_drift(&params, n_ships)` before construction if you want
     /// Dynamic-Drift scaling.
     pub fn new(seed: u64, params: Params, specs: Vec<ShipSpec>) -> Self {
-        let rng = Pcg64::seed_from_u64(seed);
         let mut physics = PhysicsWorld::new();
 
         let ships: Vec<ShipState> = specs
@@ -278,6 +301,27 @@ impl Engine {
         let scores: HashMap<ShipId, f32> =
             ships.iter().map(|s| (s.id.clone(), 0.0_f32)).collect();
 
+        // Spawn initial Relics: max(2, relic_field_cap / 2), matching harness.py.
+        let initial_relic_count = std::cmp::max(2, params.relic_field_cap / 2) as usize;
+        let mut relics: Vec<RelicState> = Vec::with_capacity(initial_relic_count);
+        let mut relic_id_counter: u32 = 0;
+
+        // RNG is seeded before ship-body construction so the order is deterministic.
+        let mut rng = Pcg64::seed_from_u64(seed);
+        for _ in 0..initial_relic_count {
+            let lo_x = 100.0_f32;
+            let hi_x = (params.arena_w - 100.0).max(lo_x + f32::EPSILON);
+            let lo_y = 100.0_f32;
+            let hi_y = (params.arena_h - 100.0).max(lo_y + f32::EPSILON);
+            let x: f32 = rng.gen_range(lo_x..hi_x);
+            let y: f32 = rng.gen_range(lo_y..hi_y);
+            relics.push(RelicState {
+                id: format!("relic-{relic_id_counter}"),
+                pos: Vec2::new(x, y),
+            });
+            relic_id_counter += 1;
+        }
+
         Engine {
             seed,
             params,
@@ -287,6 +331,8 @@ impl Engine {
             intent_log: Vec::new(),
             rng,
             physics,
+            relics,
+            relic_id_counter,
         }
     }
 
@@ -308,8 +354,11 @@ impl Engine {
     ///   3. Set the computed velocity on each ship's rapier body.
     ///   4. Step rapier (moves bodies by `vel * dt`, dt = 1.0).
     ///   5. Sync positions back from rapier bodies into `ship.pos`.
+    ///   5b. Relic pickup: each alive ship picks up nearby Relics up to carry_cap.
+    ///   5c. Relic banking: each ship at its Anchor banks carried Relics into score.
     ///   6. Record applied intents.
     ///   7. Advance tick.
+    ///   7b. Relic replenishment: spawn one Relic if tick % relic_spawn_period == 0.
     pub fn step(&mut self, intents: Vec<(ShipId, Intent)>) -> Vec<(ShipId, Vec<Event>)> {
         // 1. Merge incoming intents into each ship's persisted state.
         for (id, intent) in &intents {
@@ -396,6 +445,66 @@ impl Engine {
             self.ships[i].pos = Vec2::new(px, py);
         }
 
+        // 5b. Relic pickup: for each alive ship, consume nearby Relics up to carry_cap.
+        //
+        // Matching harness.py per-ship order: iterate ships in order; each ship
+        // processes ALL relics in the field and grabs what it can before the next
+        // ship gets a turn.  `mem::take` temporarily moves relics out so we can
+        // borrow `self.ships` mutably without aliasing.
+        {
+            let pickup_r_sq = self.params.relic_pickup_radius * self.params.relic_pickup_radius;
+            let carry_cap   = self.params.carry_cap;
+            let mut relics  = std::mem::take(&mut self.relics);
+
+            for ship in &mut self.ships {
+                if !ship.alive { continue; }
+
+                // Walk the relic list; swap_remove any that this ship picks up.
+                let mut i = 0;
+                while i < relics.len() {
+                    if ship.relics_carried >= carry_cap {
+                        break;
+                    }
+                    let dx = relics[i].pos.x - ship.pos.x;
+                    let dy = relics[i].pos.y - ship.pos.y;
+                    if dx * dx + dy * dy <= pickup_r_sq {
+                        ship.relics_carried += 1;
+                        relics.swap_remove(i);
+                        // Do NOT increment i: the swapped-in element needs checking.
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+
+            self.relics = relics;
+        }
+
+        // 5c. Relic banking: each alive ship at its Anchor banks carried Relics.
+        //
+        // Banking happens after pickup in the same tick, matching harness.py.
+        // Score updates are deferred to avoid borrowing both ships and scores.
+        {
+            let bank_r_sq   = self.params.anchor_bank_radius * self.params.anchor_bank_radius;
+            let relic_value = self.params.relic_value;
+            let mut score_deltas: Vec<(ShipId, f32)> = Vec::new();
+
+            for ship in &mut self.ships {
+                if !ship.alive || ship.relics_carried == 0 { continue; }
+                let dx = ship.pos.x - ship.anchor_pos.x;
+                let dy = ship.pos.y - ship.anchor_pos.y;
+                if dx * dx + dy * dy <= bank_r_sq {
+                    let banked = ship.relics_carried as f32 * relic_value;
+                    score_deltas.push((ship.id.clone(), banked));
+                    ship.relics_carried = 0;
+                }
+            }
+
+            for (id, delta) in score_deltas {
+                *self.scores.entry(id).or_insert(0.0) += delta;
+            }
+        }
+
         // 6. Record the applied (persisted) intent for every ship this tick.
         let frame: IntentFrame = self
             .ships
@@ -404,11 +513,16 @@ impl Engine {
             .collect();
         self.intent_log.push(frame);
 
-        // RNG is available for stochastic rules in later issues.
-        let _ = &mut self.rng;
-
         // 7. Advance tick.
         self.tick += 1;
+
+        // 7b. Relic replenishment: spawn one Relic every relic_spawn_period ticks,
+        //     matching harness.py `if tick % spawn_period == 0`.
+        if self.params.relic_spawn_period > 0
+            && self.tick % self.params.relic_spawn_period == 0
+        {
+            self.spawn_relic_if_below_cap();
+        }
 
         // 8. Return empty events per ship (populated by later issues).
         self.ships
@@ -455,7 +569,11 @@ impl Engine {
             self_view: ship.to_self_view(),
             anchors,
             ships: other_ships,
-            relics: vec![],
+            relics: self
+                .relics
+                .iter()
+                .map(|r| r.to_view(self.params.relic_value))
+                .collect(),
             asteroids: vec![],
             projectiles: vec![],
             singularities: vec![],
@@ -489,7 +607,11 @@ impl Engine {
                     pos: s.anchor_pos,
                 })
                 .collect(),
-            relics: vec![],
+            relics: self
+                .relics
+                .iter()
+                .map(|r| r.to_view(self.params.relic_value))
+                .collect(),
             asteroids: vec![],
             projectiles: vec![],
             singularities: vec![],
@@ -503,6 +625,60 @@ impl Engine {
     /// exactly once physics/rules are in place (ADR-0003).
     pub fn intent_log(&self) -> &[IntentFrame] {
         &self.intent_log
+    }
+
+    // ─── Match result accessors ───────────────────────────────────────────────
+
+    /// `true` once the match has reached `params.max_ticks`.
+    ///
+    /// The Arena Server should stop calling `step` after this returns `true`.
+    pub fn is_match_over(&self) -> bool {
+        self.tick >= self.params.max_ticks
+    }
+
+    /// The ship with the highest score at match end, or `None` if the match
+    /// is still in progress.
+    ///
+    /// On a score tie the ship that appears first in the engine's ship order
+    /// (i.e. the order passed to `Engine::new`) is returned — deterministic
+    /// given the same construction arguments.
+    pub fn winner(&self) -> Option<ShipId> {
+        if !self.is_match_over() {
+            return None;
+        }
+        // Iterate in ship construction order so ties break deterministically.
+        self.ships
+            .iter()
+            .filter_map(|s| self.scores.get(&s.id).map(|&sc| (s.id.clone(), sc)))
+            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(id, _)| id)
+    }
+
+    /// The current banked score for `ship_id`, or `None` if the id is unknown.
+    pub fn score(&self, ship_id: &ShipId) -> Option<f32> {
+        self.scores.get(ship_id).copied()
+    }
+
+    // ─── Private helpers ──────────────────────────────────────────────────────
+
+    /// Spawn one Relic in the Drift if the field is below `relic_field_cap`.
+    ///
+    /// Position is uniform-random in the interior margin `[100, arena - 100]`,
+    /// matching `harness.py World.spawn_relic`.  Uses the engine's seeded RNG
+    /// so relic spawns are deterministic given the same seed + intent log.
+    fn spawn_relic_if_below_cap(&mut self) {
+        if self.relics.len() >= self.params.relic_field_cap as usize {
+            return;
+        }
+        let lo_x = 100.0_f32;
+        let hi_x = (self.params.arena_w - 100.0).max(lo_x + f32::EPSILON);
+        let lo_y = 100.0_f32;
+        let hi_y = (self.params.arena_h - 100.0).max(lo_y + f32::EPSILON);
+        let x: f32 = self.rng.gen_range(lo_x..hi_x);
+        let y: f32 = self.rng.gen_range(lo_y..hi_y);
+        let id = format!("relic-{}", self.relic_id_counter);
+        self.relic_id_counter += 1;
+        self.relics.push(RelicState { id, pos: Vec2::new(x, y) });
     }
 }
 

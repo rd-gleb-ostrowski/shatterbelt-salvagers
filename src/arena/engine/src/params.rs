@@ -52,6 +52,12 @@ pub struct Params {
     pub carry_cap: u32,
     pub relic_spawn_period: u32,
     pub relic_field_cap: u32,
+    /// Pickup radius: a ship must be within this distance of a Relic to pick it up.
+    /// Mirrors harness.py: ship_radius + 12.
+    pub relic_pickup_radius: f32,
+    /// Banking radius: a ship must be within this distance of its Anchor to bank Relics.
+    /// Mirrors harness.py: 60 units.
+    pub anchor_bank_radius: f32,
     pub respawn_delay: u32,
     pub respawn_invuln: u32,     // ticks of spawn-protection after respawn
 
@@ -118,6 +124,8 @@ impl Default for Params {
             carry_cap: 5,
             relic_spawn_period: 60,
             relic_field_cap: 12,
+            relic_pickup_radius: 32.0,   // ship_radius(20) + 12, mirrors harness.py
+            anchor_bank_radius: 60.0,    // mirrors harness.py
             respawn_delay: 90,
             respawn_invuln: 45,
 
