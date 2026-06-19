@@ -2029,3 +2029,337 @@ fn determinism_with_fire_intent_log() {
     }
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// Issue 05: Destruction & kill bounty
+//
+// TDD tracer-bullet order:
+//  41. A ship whose Hull reaches zero is marked not-alive (destroyed).
+//  42. The killer receives exactly params.kill_bounty when its shot is lethal.
+//  43. A lethal hit emits Died { by: Some(killer) } to victim and
+//      KilledShip { victim } to killer.
+//  44. Kill bounty and banked-relic score combine into total score; winner()
+//      selects the highest-score ship.
+//  45. Golden: cannon kill awards bounty and registers in match outcome.
+//  46. Non-attributed death (env/self): no bounty — not yet testable with the
+//      current engine (no env damage source exists); seam documented below.
+//  47. Determinism: same seed + fire-intent log that produces a kill →
+//      identical state in both runs.
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ─── helpers ─────────────────────────────────────────────────────────────────
+
+/// Two-ship engine where one shot is sufficient to destroy the target.
+///
+/// Layout matches `cannon_engine_with_params` (shooter at (0,0), target at (21,0)).
+/// With shield_max=0 and hull_max == cannon_damage the first hit is lethal.
+fn one_shot_kill_engine() -> Engine {
+    let mut p = ready_params(); // cannon_start_hot = 0
+    p.cannon_damage = 20.0;
+    p.shield_max = 0.0;
+    p.hull_max = 20.0;
+    p.shield_regen = 0.0;
+    p.cannon_cooldown = 9999; // prevent a second shot in these tests
+    p.relic_spawn_period = 9999;
+    cannon_engine_with_params(p)
+}
+
+// ─── test 41: destroyed ship is marked not-alive ──────────────────────────────
+//
+// After the lethal tick the victim's `alive` flag in the god-view must be false.
+// The ship is still *in* the view (respawn is issue 06) but leaves active play:
+// it no longer steps, fires, or appears as a valid target for new projectiles.
+
+#[test]
+fn destroyed_ship_is_marked_not_alive() {
+    let mut engine = one_shot_kill_engine();
+
+    // Pre-condition: both ships alive.
+    assert!(find_ship(&engine, "shooter").alive, "shooter must start alive");
+    assert!(find_ship(&engine, "target").alive, "target must start alive");
+
+    // One tick with fire=true → projectile hits and kills target.
+    engine.step(vec![("shooter".to_string(), fire_intent())]);
+
+    let target = find_ship(&engine, "target");
+    assert!(
+        !target.alive,
+        "target must be not-alive after lethal hit; hull={}",
+        target.hull.cur
+    );
+    assert!(
+        target.hull.cur <= 0.001,
+        "hull must be 0 when not-alive; got {}",
+        target.hull.cur
+    );
+
+    // Shooter must still be alive (it fired, not hit).
+    assert!(
+        find_ship(&engine, "shooter").alive,
+        "shooter must remain alive after making a kill"
+    );
+}
+
+// ─── test 42: killer receives exactly kill_bounty on lethal hit ───────────────
+
+#[test]
+fn killer_receives_kill_bounty_on_lethal_hit() {
+    let mut engine = one_shot_kill_engine();
+    let p = Params::default();
+
+    let score_before = engine.score(&"shooter".to_string()).unwrap();
+    assert_eq!(score_before, 0.0, "shooter score must start at 0");
+
+    engine.step(vec![("shooter".to_string(), fire_intent())]);
+
+    let score_after = engine.score(&"shooter".to_string()).unwrap();
+    // Only the bounty must have been added (no relics banked in this engine setup).
+    assert!(
+        (score_after - p.kill_bounty).abs() < 1e-4,
+        "killer score must increase by exactly kill_bounty={}; got {}",
+        p.kill_bounty,
+        score_after
+    );
+}
+
+// ─── test 43: Died and KilledShip events emitted on lethal hit ────────────────
+
+#[test]
+fn died_and_killed_ship_events_emitted_on_lethal_hit() {
+    let mut engine = one_shot_kill_engine();
+
+    let events = engine.step(vec![("shooter".to_string(), fire_intent())]);
+
+    // Victim receives Died { by: Some("shooter") }.
+    let target_events = &events.iter().find(|(id, _)| id == "target").unwrap().1;
+    let died_ev = target_events.iter().find(|e| matches!(e, Event::Died { .. }));
+    assert!(
+        died_ev.is_some(),
+        "target must receive a Died event; got: {target_events:?}"
+    );
+    if let Some(Event::Died { by }) = died_ev {
+        assert_eq!(
+            by.as_deref(),
+            Some("shooter"),
+            "Died.by must identify the shooter; got {by:?}"
+        );
+    }
+
+    // Killer receives KilledShip { victim: "target" }.
+    let shooter_events = &events.iter().find(|(id, _)| id == "shooter").unwrap().1;
+    let killed_ev = shooter_events
+        .iter()
+        .find(|e| matches!(e, Event::KilledShip { .. }));
+    assert!(
+        killed_ev.is_some(),
+        "shooter must receive a KilledShip event; got: {shooter_events:?}"
+    );
+    if let Some(Event::KilledShip { victim }) = killed_ev {
+        assert_eq!(
+            victim, "target",
+            "KilledShip.victim must be 'target'; got {victim}"
+        );
+    }
+}
+
+// ─── test 44: kill bounty and banked-relic score combine; winner() correct ────
+//
+// Setup: attacker at (100, 100) heading East; defender at (121, 100) — exactly
+// 21 units East, hit in the same tick the projectile is spawned.
+// Relics spawn in [100, 102) — within pickup+bank radius of the attacker.
+// After one step the attacker banks relics AND kills the defender; its total
+// score must equal relics_banked × relic_value + kill_bounty.
+
+#[test]
+fn kill_bounty_combines_with_relic_score_for_winner() {
+    let mut p = Params::default();
+    // Tiny arena: relics spawn in [100, 102) × [100, 102).
+    p.arena_w = 202.0;
+    p.arena_h = 202.0;
+    p.relic_field_cap = 2;       // initial = max(2, 1) = 2 relics
+    p.carry_cap = 5;
+    p.relic_value = 1.0;
+    p.relic_spawn_period = 9999;
+    p.max_ticks = 1;             // match ends after this one step
+    // One-shot kill setup: no shield, thin hull, cannon ready.
+    p.cannon_damage = 20.0;
+    p.shield_max = 0.0;
+    p.hull_max = 20.0;
+    p.shield_regen = 0.0;
+    p.cannon_start_hot = 0;
+    p.cannon_cooldown = 9999;
+
+    // Attacker at (100, 100): within pickup_radius of relics in [100, 102)^2
+    // AND at its anchor → banking happens in the same step.
+    // Defender at (121, 100): 21 units East of attacker → 1-tick kill.
+    let specs = vec![
+        ShipSpec {
+            id: "attacker".to_string(),
+            class: ShipClass::Skiff,
+            anchor_pos: Vec2 { x: 100.0, y: 100.0 },
+        },
+        ShipSpec {
+            id: "defender".to_string(),
+            class: ShipClass::Skiff,
+            anchor_pos: Vec2 { x: 121.0, y: 100.0 },
+        },
+    ];
+    let mut engine = Engine::new(42, p.clone(), specs);
+
+    let relics_before = engine.god_view().relics.len();
+    assert!(relics_before > 0, "need at least 1 initial relic");
+
+    engine.step(vec![("attacker".to_string(), fire_intent())]);
+
+    let attacker_score = engine.score(&"attacker".to_string()).unwrap();
+    let relics_banked = relics_before as f32 * p.relic_value;
+    let expected = relics_banked + p.kill_bounty;
+
+    assert!(
+        (attacker_score - expected).abs() < 1e-3,
+        "total score must be relics({relics_banked}) + kill_bounty({}); expected {expected}, got {attacker_score}",
+        p.kill_bounty
+    );
+
+    // winner() must use the combined (relic + bounty) score.
+    assert!(engine.is_match_over(), "match must be over after max_ticks=1");
+    assert_eq!(
+        engine.winner().as_deref(),
+        Some("attacker"),
+        "attacker (relics + kill bounty) must win over zero-score defender"
+    );
+}
+
+// ─── test 45: golden scenario — kill awards bounty and registers in outcome ────
+//
+// Source: params.py kill_bounty = 2.0.
+//
+// Setup:
+//   • Two ships: "hunter" at (0,0), "prey" at (21,0).
+//   • prey: shield_max=0, hull_max=20, cannon_damage=20 → one-shot kill.
+//   • max_ticks = 1 so that match ends immediately after the kill.
+//
+// Expected:
+//   • hunter.score == kill_bounty == 2.0.
+//   • winner() == "hunter".
+//   • prey.alive == false.
+
+#[test]
+fn golden_kill_awards_bounty_and_registers_in_match_outcome() {
+    let mut p = Params::default();
+    p.cannon_damage = 20.0;
+    p.shield_max = 0.0;
+    p.hull_max = 20.0;
+    p.shield_regen = 0.0;
+    p.cannon_start_hot = 0;
+    p.cannon_cooldown = 9999;
+    p.relic_spawn_period = 9999;
+    p.max_ticks = 1; // match ends after this one step
+
+    let specs = vec![
+        ShipSpec {
+            id: "hunter".to_string(),
+            class: ShipClass::Skiff,
+            anchor_pos: Vec2 { x: 0.0, y: 0.0 },
+        },
+        ShipSpec {
+            id: "prey".to_string(),
+            class: ShipClass::Skiff,
+            anchor_pos: Vec2 { x: 21.0, y: 0.0 },
+        },
+    ];
+    let mut engine = Engine::new(7, p.clone(), specs);
+
+    engine.step(vec![("hunter".to_string(), fire_intent())]);
+
+    // Match must be over (max_ticks = 1 and tick = 1).
+    assert!(engine.is_match_over(), "match must be over after max_ticks=1 step");
+
+    // Prey must be destroyed.
+    let prey = find_ship(&engine, "prey");
+    assert!(!prey.alive, "prey must be not-alive after lethal hit");
+    assert!(prey.hull.cur <= 0.001, "prey hull must be 0");
+
+    // Hunter's score must equal exactly kill_bounty (no relics banked).
+    let hunter_score = engine.score(&"hunter".to_string()).unwrap();
+    assert!(
+        (hunter_score - p.kill_bounty).abs() < 1e-4,
+        "golden: hunter score must be kill_bounty={}; got {hunter_score}",
+        p.kill_bounty
+    );
+
+    // winner() must return "hunter".
+    let winner = engine.winner().expect("winner must be Some at match end");
+    assert_eq!(
+        winner, "hunter",
+        "golden: winner must be 'hunter'; got {winner:?}"
+    );
+}
+
+// ─── test 46 (non-attributed death — seam note) ───────────────────────────────
+//
+// A death with no killer (`Died { by: None }`) must award no bounty.
+//
+// Currently UNTESTABLE: the engine has no environmental damage source.
+// Collision damage (issue 07) and Singularity damage (issue 08) will be the
+// first `by: None` paths; they should call `handle_env_death(&mut ship, &mut events)`
+// which emits `Died { by: None }` and explicitly does NOT award any score bounty.
+// When issue 07 lands, add a test here that drives a ship into a wall hard
+// enough to reach hull=0 and verifies the score map is unchanged.
+
+// ─── test 47: determinism with kill scenario ──────────────────────────────────
+//
+// Two engines with the same seed and same fire-intent log (including a kill)
+// must produce identical state after the kill tick.
+
+#[test]
+fn determinism_with_kill_scenario() {
+    let make = || {
+        let mut p = Params::default();
+        p.cannon_damage = 20.0;
+        p.shield_max = 0.0;
+        p.hull_max = 20.0;
+        p.shield_regen = 0.0;
+        p.cannon_start_hot = 0;
+        p.cannon_cooldown = 9999;
+        p.relic_spawn_period = 9999;
+        p.max_ticks = 30;
+        let specs = vec![
+            ShipSpec {
+                id: "hunter".to_string(),
+                class: ShipClass::Skiff,
+                anchor_pos: Vec2 { x: 0.0, y: 0.0 },
+            },
+            ShipSpec {
+                id: "prey".to_string(),
+                class: ShipClass::Skiff,
+                anchor_pos: Vec2 { x: 21.0, y: 0.0 },
+            },
+        ];
+        Engine::new(55, p, specs)
+    };
+
+    // Script: fire on tick 1 (lethal), coast for 29 more ticks.
+    let run = || {
+        let mut e = make();
+        e.step(vec![("hunter".to_string(), fire_intent())]);
+        for _ in 0..29 {
+            e.step(vec![]);
+        }
+        e.god_view()
+    };
+
+    let v1 = run();
+    let v2 = run();
+
+    assert_eq!(v1.tick, v2.tick, "ticks must match");
+    for (s1, s2) in v1.ships.iter().zip(v2.ships.iter()) {
+        assert_eq!(s1.id, s2.id);
+        assert_eq!(s1.alive, s2.alive, "alive flag must match for {}", s1.id);
+        assert_eq!(s1.hull.cur, s2.hull.cur, "hull must match for {}", s1.id);
+    }
+    // Scores must be identical.
+    for (id, &sc1) in &v1.scores {
+        let sc2 = v2.scores[id];
+        assert_eq!(sc1, sc2, "score for {id} must be identical: {sc1} vs {sc2}");
+    }
+}

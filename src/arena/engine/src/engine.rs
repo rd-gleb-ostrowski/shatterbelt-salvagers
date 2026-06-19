@@ -600,6 +600,10 @@ impl Engine {
         // Matching harness.py: move each projectile THEN check hits in the same tick.
         let mut ship_events: HashMap<ShipId, Vec<Event>> =
             self.ships.iter().map(|s| (s.id.clone(), Vec::new())).collect();
+        // Kills this tick: (victim_id, killer_id).  Processed after the projectile
+        // block so score updates and KilledShip events can access `self.scores`
+        // without conflicting with the `self.ships` mutable borrow inside the block.
+        let mut kills: Vec<(ShipId, ShipId)> = Vec::new();
         {
             let ship_radius_sq =
                 self.params.ship_radius * self.params.ship_radius;
@@ -631,12 +635,15 @@ impl Engine {
                     let dx = ship.pos.x - proj.pos.x;
                     let dy = ship.pos.y - proj.pos.y;
                     if dx * dx + dy * dy < ship_radius_sq {
-                        apply_cannon_damage(
+                        let killed = apply_cannon_damage(
                             ship,
                             cannon_dmg,
                             &proj.owner,
                             &mut ship_events,
                         );
+                        if let Some(killer_id) = killed {
+                            kills.push((ship.id.clone(), killer_id));
+                        }
                         hit = true;
                         break;
                     }
@@ -648,6 +655,25 @@ impl Engine {
             }
 
             self.projectiles = alive_projs;
+        }
+
+        // 5e. Kill resolution: award kill_bounty to each killer and emit KilledShip.
+        //
+        // A kill is only attributed when a rune-cannon projectile dealt the lethal
+        // blow; environmental / collision deaths (issue 07+) produce `Died { by: None }`
+        // with no bounty — there are no such kills to process here yet.
+        //
+        // Seam for issue 06: after awarding the bounty, drop the victim's relics and
+        // schedule their respawn (respawn_delay / invuln fields live on ShipState).
+        {
+            let kill_bounty = self.params.kill_bounty;
+            for (victim_id, killer_id) in kills {
+                *self.scores.entry(killer_id.clone()).or_insert(0.0) += kill_bounty;
+                ship_events
+                    .entry(killer_id)
+                    .or_default()
+                    .push(Event::KilledShip { victim: victim_id });
+            }
         }
 
         // 6. Record the applied (persisted) intent for every ship this tick.
@@ -865,8 +891,11 @@ pub fn scale_drift(base: &Params, n_ships: usize) -> Params {
 ///
 /// Damage hits the **Shield** first; any overflow goes to the **Hull**.
 /// Resets `ship.ticks_since_last_hit` to 0 (pausing shield regen).
-/// Marks `ship.alive = false` when Hull reaches 0 — destruction consequences
-/// (relic-drop, respawn, kill-bounty) are seams left for issue 05/06.
+/// Marks `ship.alive = false` when Hull reaches 0 and emits `Event::Died`.
+///
+/// Returns `Some(killer_id)` when this hit was lethal (Hull reached 0),
+/// or `None` otherwise.  The caller uses this to award the kill bounty and
+/// emit `Event::KilledShip` to the killer.
 ///
 /// Emits `Event::TookShield`, `Event::ShieldDown`, and/or `Event::TookHull`
 /// into `events` for the target ship.
@@ -875,9 +904,9 @@ fn apply_cannon_damage(
     damage: f32,
     by: &ShipId,
     events: &mut HashMap<ShipId, Vec<Event>>,
-) {
+) -> Option<ShipId> {
     if !ship.alive || damage <= 0.0 {
-        return;
+        return None;
     }
 
     // Reset the shield-regen delay: the ship has been hit this tick.
@@ -917,9 +946,20 @@ fn apply_cannon_damage(
                 amount: hull_overflow,
                 by: by.clone(),
             });
-        // Seam for issue 05: hull at 0 → mark not-alive; no drop/respawn yet.
         if ship.hull.cur <= 0.0 {
             ship.alive = false;
+            // Emit Died to the victim.
+            events
+                .entry(ship.id.clone())
+                .or_default()
+                .push(Event::Died { by: Some(by.clone()) });
+            // Seam for issue 06:
+            //   1. Drop carried relics at ship.pos and emit RelicDropped events.
+            //   2. Schedule respawn at anchor after params.respawn_delay ticks.
+            //   3. Set ship.invuln = true for params.respawn_invuln ticks post-respawn.
+            return Some(by.clone());
         }
     }
+
+    None
 }

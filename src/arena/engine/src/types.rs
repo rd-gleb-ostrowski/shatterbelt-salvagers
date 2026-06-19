@@ -123,8 +123,7 @@ pub struct MineView {
 
 /// Per-ship events emitted by `Engine::step` (PROTOCOL.md §7).
 ///
-/// Populated by combat in issue 04.  Kill/death/relic-drop events are added
-/// in issues 05/06.
+/// Populated by combat in issue 04; destruction events added in issue 05.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Event {
     /// The ship's Shield absorbed `amount` damage from the rune-cannon of `by`.
@@ -134,6 +133,17 @@ pub enum Event {
     TookHull { amount: f32, by: ShipId },
     /// The ship's Shield was reduced to exactly 0 this tick (useful for reactive bots).
     ShieldDown,
-    // Seam — issue 05 adds: Died { by: ShipId }, KilledShip { ship_id: ShipId }
+    /// This ship's Hull reached zero and it was destroyed.
+    ///
+    /// `by` is `Some(killer_id)` when a rune-cannon projectile delivered the lethal
+    /// blow; `None` for environmental or self-inflicted death (collision, Singularity,
+    /// etc.) — those damage sources arrive in issue 07+.
+    Died { by: Option<ShipId> },
+    /// This ship's rune-cannon round delivered the lethal blow to `victim`.
+    ///
+    /// Emitted to the killer on the same tick as the victim's `Died` event.
+    /// The killer's score has already been updated with `params.kill_bounty` when
+    /// this event is delivered.
+    KilledShip { victim: ShipId },
     // Seam — issue 06 adds: RelicDropped { relic_id: String, pos: Vec2 }
 }
