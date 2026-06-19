@@ -21,3 +21,5 @@
 !src/**
 !retreat/
 !retreat/**
+!Cargo.toml
+!Cargo.lock
