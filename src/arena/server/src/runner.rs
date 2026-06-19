@@ -52,6 +52,17 @@ use arena_engine::{Engine, Event, Intent, Observation, Params, ShipId, ShipSpec}
 /// - Issue 06 (connection resolver): the WS → WASM → Default priority chain.
 pub trait BotDriver: Send {
     fn decide(&mut self, tick: u32, obs: &Observation) -> Option<Intent>;
+
+    /// A short label identifying the driver kind for observability.
+    ///
+    /// Canonical values: `"default"`, `"wasm"`, `"ws"`.
+    ///
+    /// The default implementation returns `"unknown"`; all concrete types
+    /// shipped in this crate override it.  Tests and issue 12 (bot health)
+    /// use this to distinguish driver kinds without downcasting.
+    fn kind(&self) -> &'static str {
+        "unknown"
+    }
 }
 
 /// Abstracts tick pacing between calls to [`MatchRunner::step_once`].

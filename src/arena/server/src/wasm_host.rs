@@ -235,6 +235,10 @@ impl WasmBotDriver {
 // ── BotDriver impl ────────────────────────────────────────────────────────────
 
 impl BotDriver for WasmBotDriver {
+    fn kind(&self) -> &'static str {
+        "wasm"
+    }
+
     /// Run one tick of the WASM bot.
     ///
     /// ## Fuel reset

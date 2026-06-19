@@ -19,6 +19,7 @@
 //! |------|-----------|-------------|
 //! | Registration & tokens | [`auth::TokenRegistry`] + [`routes::build_router`] | 02 (this issue) |
 //! | Bot transport | [`runner::BotDriver`] trait | 03 (WS bots), 06 (resolver) |
+//! | Connection resolution | [`resolver::ConnectionResolver`] + [`resolver::WsConnectionRegistry`] | 06 (this issue), 09 (headless), 11 (admin) |
 //! | Tick pacing | [`runner::TickPacer`] trait | already used by [`pacer::LivePacer`] |
 //! | Engine state | `runner.engine()` | 07 (observer god_view), 08 (intent_log) |
 //! | Match outcome | [`runner::MatchOutcome`] | 14 (ladder) |
@@ -27,6 +28,7 @@
 pub mod auth;
 pub mod bot;
 pub mod pacer;
+pub mod resolver;
 pub mod routes;
 pub mod runner;
 pub mod store;

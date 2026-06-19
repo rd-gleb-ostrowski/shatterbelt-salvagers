@@ -59,6 +59,10 @@ fn dist(ax: f32, ay: f32, bx: f32, by: f32) -> f32 {
 }
 
 impl BotDriver for DefaultBotDriver {
+    fn kind(&self) -> &'static str {
+        "default"
+    }
+
     /// Compute a fresh intent from the current observation.
     ///
     /// Always returns `Some(intent)` — the Default Bot never misses a deadline.

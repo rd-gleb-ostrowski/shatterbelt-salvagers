@@ -376,6 +376,10 @@ impl WsBotDriver {
 }
 
 impl BotDriver for WsBotDriver {
+    fn kind(&self) -> &'static str {
+        "ws"
+    }
+
     /// Serialize `obs` to a `tick` message, forward to the bot, and wait up to
     /// `deadline` for an `action` reply.
     ///
