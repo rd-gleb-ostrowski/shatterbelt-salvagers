@@ -70,6 +70,30 @@ const FUEL_BOMB_WAT: &str = r#"
 )
 "#;
 
+/// A bot with a `start` section that runs runtime setup at instantiation time —
+/// the shape AssemblyScript and TinyGo emit. It writes to a global so the start
+/// function does real (fuel-consuming) work. The host must fund instantiation
+/// fuel, or this module would trap before `tick` is ever reached.
+const START_SECTION_WAT: &str = r#"
+(module
+  (memory (export "memory") 1)
+  (global $g (mut i32) (i32.const 0))
+  (data (i32.const 256) "{\"thrust\":1.0}")
+  (func $setup
+    ;; some real work at instantiation
+    (global.set $g (i32.add (i32.const 1) (i32.const 2))))
+  (start $setup)
+  (func (export "alloc") (param $len i32) (result i32) i32.const 512)
+  (func (export "init") (param $ptr i32) (param $len i32))
+  (func (export "tick") (param $ptr i32) (param $len i32) (result i64)
+    i64.const 256
+    i64.const 32
+    i64.shl
+    i64.const 14
+    i64.or)
+)
+"#;
+
 /// A bot that calls `log` during `init` with the string `"init_called"` (11 bytes)
 /// and during `tick` with `"tick_called"` (11 bytes), so both can be observed.
 const LOG_BOT_WAT: &str = r#"
@@ -178,6 +202,33 @@ fn const_action_bot_returns_intent() {
     let obs = engine.observation(&"ship-0".to_owned()).unwrap();
 
     let intent = driver.decide(0, &obs).expect("const-action bot must return Some");
+    assert_eq!(intent.thrust, Some(1.0), "thrust must be 1.0");
+}
+
+// ── Test: a module with a `start` section instantiates ───────────────────────
+//
+// AssemblyScript and TinyGo emit a `start` section that runs at instantiation.
+// With `consume_fuel` enabled the store begins at zero fuel, so the host must
+// fund instantiation or any such module traps before `tick`. This guards that.
+//
+// Observable: `WasmBotDriver::new` succeeds and the bot then acts.
+
+#[test]
+fn module_with_start_section_instantiates_and_acts() {
+    let wasm = wat_to_wasm(START_SECTION_WAT);
+    let params = test_params(10);
+    let obs_json = tick0_obs_json("ship-0", &params);
+
+    let mut driver = WasmBotDriver::new(&wasm, &obs_json, 1_000_000)
+        .expect("WasmBotDriver::new must succeed for a module with a start section");
+
+    let specs = two_ships(&params);
+    let engine = arena_engine::Engine::new(42, params, specs);
+    let obs = engine.observation(&"ship-0".to_owned()).unwrap();
+
+    let intent = driver
+        .decide(0, &obs)
+        .expect("start-section bot must return Some");
     assert_eq!(intent.thrust, Some(1.0), "thrust must be 1.0");
 }
 

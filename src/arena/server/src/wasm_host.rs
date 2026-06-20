@@ -162,6 +162,16 @@ impl WasmBotDriver {
             .define_unknown_imports_as_traps(&module)
             .map_err(|e| anyhow!("failed to define unknown imports as traps: {e}"))?;
 
+        // Give the store fuel BEFORE instantiation. Modules from many toolchains
+        // (AssemblyScript, TinyGo, …) emit a `start` section that runs runtime
+        // setup at instantiation time; with `consume_fuel` enabled the store
+        // starts at zero fuel, so without this any such module would trap
+        // immediately. Rust `cdylib` bots have no start section and are
+        // unaffected. The budget is reset again before warm-up below.
+        store
+            .set_fuel(fuel_per_tick.saturating_mul(100))
+            .map_err(|e| anyhow!("fuel unavailable (engine not configured with consume_fuel): {e}"))?;
+
         let instance = linker
             .instantiate(&mut store, &module)
             .map_err(|e| anyhow!("failed to instantiate WASM module: {e}"))?;
@@ -183,7 +193,7 @@ impl WasmBotDriver {
             .map_err(|e| anyhow!("WASM module must export `tick(i32, i32) -> i64`: {e}"))?;
 
         // Warm-up: call `init` with tick-0 observation JSON (ADR-0004).
-        // Give init a generous fuel budget so slow JIT warm-up doesn't exhaust it.
+        // Reset the budget (instantiation's start section may have spent some).
         store
             .set_fuel(fuel_per_tick.saturating_mul(100))
             .map_err(|e| anyhow!("fuel unavailable (engine not configured with consume_fuel): {e}"))?;
