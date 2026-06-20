@@ -13,7 +13,7 @@
  */
 
 import { createAdminClient, type BotHealthSnapshot } from "./lib/adminClient.ts";
-import type { StartMatchResult } from "./lib/adminClient.ts";
+import type { StartMatchResult, LadderStanding, RecordingListItem } from "./lib/adminClient.ts";
 import { setSession, getSession, clearSession } from "./session.ts";
 import {
   formatLastSeen,
@@ -166,6 +166,8 @@ function renderDashboard(): void {
   wireDefaultBotControls();
   startPolling();
   renderMatchControlPanel();
+  renderLadderPanel();
+  renderReplaysPanel();
 }
 
 function renderBotsTable(bots: BotHealthSnapshot[]): void {
@@ -784,6 +786,441 @@ function wireExhibitionControls(): void {
 
   // Load initial status
   void refreshStatus();
+}
+
+// ── Ladder panel (issue 12) ───────────────────────────────────────────────────
+
+/**
+ * Inject the ladder panel into #admin-panels.
+ *
+ * Sections:
+ *   1. Runner control — start/stop the headless ladder runner + live status.
+ *   2. TrueSkill standings — sortable table from GET /ladder/standings.
+ *   3. Reset ratings — POST /ladder/reset (with confirmation).
+ */
+function renderLadderPanel(): void {
+  const container = document.getElementById("admin-panels");
+  if (!container) return;
+
+  const panel = document.createElement("section");
+  panel.className = "panel";
+  panel.id = "ladder-panel";
+  panel.innerHTML = `
+    <h2>Ladder</h2>
+
+    <!-- 1. Runner control -->
+    <div class="subpanel" id="ladder-runner-subpanel">
+      <h3>Headless Runner</h3>
+      <p class="hint">
+        The ladder runner continuously plays headless matches to build up
+        TrueSkill rankings. Start it to accumulate data; stop it to pause.
+      </p>
+      <div class="ladder-runner-controls">
+        <button id="start-runner-btn" class="btn-primary">▶ Start Runner</button>
+        <button id="stop-runner-btn" class="btn-secondary">⏹ Stop Runner</button>
+        <button id="refresh-runner-btn" class="btn-secondary">↺ Refresh Status</button>
+      </div>
+      <p id="runner-status" class="status-line">Status: unknown</p>
+    </div>
+
+    <!-- 2. TrueSkill standings -->
+    <div class="subpanel" id="standings-subpanel">
+      <h3>TrueSkill Standings</h3>
+      <div class="standings-controls">
+        <button id="refresh-standings-btn" class="btn-secondary">↺ Refresh Standings</button>
+      </div>
+      <p id="standings-status" class="status-line" hidden></p>
+      <div class="table-wrap">
+        <table id="standings-table" hidden>
+          <thead>
+            <tr>
+              <th>#</th>
+              <th>Competitor</th>
+              <th title="Conservative skill estimate: µ − 3σ">Skill (µ − 3σ)</th>
+              <th title="TrueSkill mean">µ</th>
+              <th title="TrueSkill sigma">σ</th>
+              <th>Matches</th>
+            </tr>
+          </thead>
+          <tbody id="standings-body"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- 3. Reset ratings -->
+    <div class="subpanel" id="ladder-reset-subpanel">
+      <h3>Reset Ratings</h3>
+      <p class="hint">
+        Resets all TrueSkill ratings to their initial values. This cannot be
+        undone. Recorded matches are not deleted.
+      </p>
+      <button id="reset-ladder-btn" class="btn-danger">⚠ Reset All Ratings</button>
+      <p id="ladder-reset-status" class="status-line" hidden></p>
+    </div>
+  `;
+
+  container.appendChild(panel);
+
+  wireLadderRunnerControls();
+  wireStandingsControls();
+  wireLadderResetControls();
+}
+
+function renderStandingsTable(standings: LadderStanding[]): void {
+  const table = document.getElementById("standings-table");
+  const statusEl = document.getElementById("standings-status");
+  const tbody = document.getElementById("standings-body");
+  if (!table || !statusEl || !tbody) return;
+
+  tbody.innerHTML = "";
+
+  if (standings.length === 0) {
+    statusEl.textContent = "No standings data yet — start the ladder runner to accumulate matches.";
+    statusEl.hidden = false;
+    table.hidden = true;
+    return;
+  }
+
+  statusEl.textContent = `${standings.length} competitor(s) — updated ${new Date().toLocaleTimeString()}`;
+  statusEl.hidden = false;
+
+  standings.forEach((s, i) => {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td class="col-rank">${i + 1}</td>
+      <td class="col-competitor">${escHtml(s.competitor)}</td>
+      <td class="col-skill">${s.conservativeSkill.toFixed(2)}</td>
+      <td class="col-mu">${s.mu.toFixed(2)}</td>
+      <td class="col-sigma">${s.sigma.toFixed(2)}</td>
+      <td class="col-matches">${s.matches}</td>
+    `;
+    tbody.appendChild(tr);
+  });
+
+  table.hidden = false;
+}
+
+function wireLadderRunnerControls(): void {
+  const startBtn = document.getElementById("start-runner-btn") as HTMLButtonElement | null;
+  const stopBtn = document.getElementById("stop-runner-btn") as HTMLButtonElement | null;
+  const refreshBtn = document.getElementById("refresh-runner-btn") as HTMLButtonElement | null;
+  const statusEl = document.getElementById("runner-status") as HTMLElement | null;
+  if (!startBtn || !stopBtn || !refreshBtn || !statusEl) return;
+
+  async function refreshRunnerStatus(): Promise<void> {
+    const session = getSession();
+    if (!session || !statusEl) return;
+    try {
+      const r = await session.client.getLadderRunner();
+      if (r.ok) {
+        statusEl.textContent = `Status: ${r.running ? "▶ Running" : "⏹ Stopped"}`;
+      } else if (r.unauthorized) {
+        statusEl.textContent = "Status: ⚠ Denied — session may have expired.";
+      } else {
+        statusEl.textContent = "Status: ⚠ Could not fetch runner status.";
+      }
+    } catch {
+      statusEl.textContent = "Status: ⚠ Network error.";
+    }
+  }
+
+  startBtn.addEventListener("click", async () => {
+    const session = getSession();
+    if (!session) return;
+    startBtn.disabled = true;
+    try {
+      const r = await session.client.startLadderRunner();
+      statusEl.textContent = r.ok ? "Status: ▶ Runner started." : r.unauthorized ? "Status: ⚠ Denied." : "Status: ⚠ Error starting runner.";
+      if (r.ok) await refreshRunnerStatus();
+    } catch { statusEl.textContent = "Status: ⚠ Network error."; }
+    finally { startBtn.disabled = false; }
+  });
+
+  stopBtn.addEventListener("click", async () => {
+    const session = getSession();
+    if (!session) return;
+    stopBtn.disabled = true;
+    try {
+      const r = await session.client.stopLadderRunner();
+      statusEl.textContent = r.ok ? "Status: ⏹ Runner stopped." : r.unauthorized ? "Status: ⚠ Denied." : "Status: ⚠ Error stopping runner.";
+      if (r.ok) await refreshRunnerStatus();
+    } catch { statusEl.textContent = "Status: ⚠ Network error."; }
+    finally { stopBtn.disabled = false; }
+  });
+
+  refreshBtn.addEventListener("click", refreshRunnerStatus);
+  void refreshRunnerStatus();
+}
+
+function wireStandingsControls(): void {
+  const refreshBtn = document.getElementById("refresh-standings-btn") as HTMLButtonElement | null;
+  if (!refreshBtn) return;
+
+  async function loadStandings(): Promise<void> {
+    const session = getSession();
+    if (!session) return;
+    const statusEl = document.getElementById("standings-status") as HTMLElement | null;
+    refreshBtn!.disabled = true;
+    try {
+      const standings = await session.client.getLadderStandings();
+      renderStandingsTable(standings);
+    } catch {
+      if (statusEl) {
+        statusEl.textContent = "⚠ Failed to load standings — server returned an error.";
+        statusEl.hidden = false;
+      }
+    } finally {
+      refreshBtn!.disabled = false;
+    }
+  }
+
+  refreshBtn.addEventListener("click", loadStandings);
+  void loadStandings();
+}
+
+function wireLadderResetControls(): void {
+  const resetBtn = document.getElementById("reset-ladder-btn") as HTMLButtonElement | null;
+  const statusEl = document.getElementById("ladder-reset-status") as HTMLElement | null;
+  if (!resetBtn || !statusEl) return;
+
+  function showResetStatus(msg: string): void {
+    statusEl!.textContent = msg;
+    statusEl!.hidden = false;
+  }
+
+  resetBtn.addEventListener("click", async () => {
+    const session = getSession();
+    if (!session) return;
+
+    const confirmed = window.confirm(
+      "Reset ALL TrueSkill ratings?\n\nThis cannot be undone. Recorded matches are not deleted.",
+    );
+    if (!confirmed) return;
+
+    resetBtn.disabled = true;
+    try {
+      const r = await session.client.resetLadder();
+      if (r.unauthorized) {
+        showResetStatus("⚠ Denied — session may have expired.");
+      } else if (!r.ok) {
+        showResetStatus("⚠ Reset failed — server returned an error.");
+      } else {
+        showResetStatus("✓ Ratings reset. Refresh standings to see the change.");
+        // Reload standings to reflect the reset
+        const standingsRefreshBtn = document.getElementById("refresh-standings-btn") as HTMLButtonElement | null;
+        standingsRefreshBtn?.click();
+      }
+    } catch {
+      showResetStatus("⚠ Network error during reset.");
+    } finally {
+      resetBtn.disabled = false;
+    }
+  });
+}
+
+// ── Replays panel (issue 12) ──────────────────────────────────────────────────
+
+/**
+ * Inject the replays panel into #admin-panels.
+ *
+ * Sections:
+ *   1. Recordings list — GET /recordings with Replay + Download per row.
+ *      Replay: POST /recordings/{id}/replay → feeds the observer hub;
+ *              link to /index.html (Viewer) shown after success.
+ *      Download: GET /admin/recordings/{id}/download → triggers browser save.
+ */
+function renderReplaysPanel(): void {
+  const container = document.getElementById("admin-panels");
+  if (!container) return;
+
+  const panel = document.createElement("section");
+  panel.className = "panel";
+  panel.id = "replays-panel";
+  panel.innerHTML = `
+    <h2>Replay Management</h2>
+
+    <div class="subpanel" id="recordings-subpanel">
+      <h3>Recorded Matches</h3>
+      <div class="recordings-controls">
+        <button id="refresh-recordings-btn" class="btn-secondary">↺ Refresh List</button>
+      </div>
+      <p class="hint">
+        <strong>Replay</strong> streams a recording to the observer hub — open the
+        <a href="/index.html" target="_blank" rel="noopener">Viewer (/index.html)</a>
+        on the projector screen to watch it.
+        <strong>Download</strong> saves the match metadata as JSON.
+      </p>
+      <p id="recordings-status" class="status-line" hidden></p>
+      <div class="table-wrap">
+        <table id="recordings-table" hidden>
+          <thead>
+            <tr>
+              <th>Match ID</th>
+              <th>Seed</th>
+              <th>Ticks</th>
+              <th>Winner</th>
+              <th>Scores</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody id="recordings-body"></tbody>
+        </table>
+      </div>
+    </div>
+  `;
+
+  container.appendChild(panel);
+  wireRecordingsControls();
+}
+
+function renderRecordingsTable(recordings: RecordingListItem[]): void {
+  const table = document.getElementById("recordings-table");
+  const statusEl = document.getElementById("recordings-status");
+  const tbody = document.getElementById("recordings-body");
+  if (!table || !statusEl || !tbody) return;
+
+  tbody.innerHTML = "";
+
+  if (recordings.length === 0) {
+    statusEl.textContent = "No recordings yet — play some matches to create recordings.";
+    statusEl.hidden = false;
+    table.hidden = true;
+    return;
+  }
+
+  statusEl.textContent = `${recordings.length} recording(s) — updated ${new Date().toLocaleTimeString()}`;
+  statusEl.hidden = false;
+
+  for (const rec of recordings) {
+    const scoresText = Object.entries(rec.scores)
+      .map(([team, score]) => `${escHtml(team)}: ${score}`)
+      .join(", ");
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td class="col-match-id" title="${escHtml(rec.matchId)}">${escHtml(rec.matchId.slice(0, 8))}…</td>
+      <td class="col-seed">${rec.seed}</td>
+      <td class="col-ticks">${rec.tickCount}</td>
+      <td class="col-winner">${rec.winner ? escHtml(rec.winner) : "<em>draw</em>"}</td>
+      <td class="col-scores">${scoresText || "—"}</td>
+      <td class="col-actions">
+        <button class="btn-replay" data-id="${escHtml(rec.matchId)}">▶ Replay</button>
+        <button class="btn-download" data-id="${escHtml(rec.matchId)}">⬇ Download</button>
+      </td>
+    `;
+    tbody.appendChild(tr);
+  }
+
+  table.hidden = false;
+
+  tbody.addEventListener("click", (e) => handleRecordingAction(e));
+}
+
+async function handleRecordingAction(e: Event): Promise<void> {
+  const target = e.target as HTMLElement;
+  const replayBtn = target.closest(".btn-replay") as HTMLButtonElement | null;
+  const downloadBtn = target.closest(".btn-download") as HTMLButtonElement | null;
+
+  if (replayBtn) {
+    const id = replayBtn.dataset.id;
+    if (!id) return;
+    const session = getSession();
+    if (!session) return;
+
+    replayBtn.disabled = true;
+    replayBtn.textContent = "Replaying…";
+
+    try {
+      const r = await session.client.replayRecording(id);
+      if (r.ok) {
+        replayBtn.textContent = "✓ Sent";
+        // Show a convenience note — the observer hub is now streaming the replay
+        const statusEl = document.getElementById("recordings-status");
+        if (statusEl) {
+          statusEl.textContent =
+            `✓ Replay of ${id.slice(0, 8)}… sent to observer hub — open the ` +
+            `Viewer at /index.html to watch.`;
+          statusEl.hidden = false;
+        }
+      } else {
+        replayBtn.textContent = "▶ Replay";
+        alert(`Failed to replay recording "${id}" — server returned an error.`);
+      }
+    } catch {
+      replayBtn.textContent = "▶ Replay";
+      alert(`Network error while replaying recording "${id}".`);
+    } finally {
+      replayBtn.disabled = false;
+    }
+    return;
+  }
+
+  if (downloadBtn) {
+    const id = downloadBtn.dataset.id;
+    if (!id) return;
+    const session = getSession();
+    if (!session) return;
+
+    downloadBtn.disabled = true;
+    downloadBtn.textContent = "Downloading…";
+
+    try {
+      const r = await session.client.downloadRecording(id);
+      if (r.ok && r.data) {
+        // Trigger a browser file download of the JSON metadata
+        const json = JSON.stringify(r.data, null, 2);
+        const blob = new Blob([json], { type: "application/json" });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = `replay-${id}.json`;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+        downloadBtn.textContent = "✓ Downloaded";
+      } else if (r.unauthorized) {
+        downloadBtn.textContent = "⬇ Download";
+        alert("Download denied — session may have expired. Please sign out and sign in again.");
+      } else if (r.notFound) {
+        downloadBtn.textContent = "⬇ Download";
+        alert(`Recording "${id}" not found on the server.`);
+      } else {
+        downloadBtn.textContent = "⬇ Download";
+        alert(`Failed to download recording "${id}" — server returned an error.`);
+      }
+    } catch {
+      downloadBtn.textContent = "⬇ Download";
+      alert(`Network error while downloading recording "${id}".`);
+    } finally {
+      downloadBtn.disabled = false;
+    }
+  }
+}
+
+function wireRecordingsControls(): void {
+  const refreshBtn = document.getElementById("refresh-recordings-btn") as HTMLButtonElement | null;
+  if (!refreshBtn) return;
+
+  async function loadRecordings(): Promise<void> {
+    const session = getSession();
+    if (!session) return;
+    const statusEl = document.getElementById("recordings-status") as HTMLElement | null;
+    refreshBtn!.disabled = true;
+    try {
+      const recordings = await session.client.listRecordings();
+      renderRecordingsTable(recordings);
+    } catch {
+      if (statusEl) {
+        statusEl.textContent = "⚠ Failed to load recordings — server returned an error.";
+        statusEl.hidden = false;
+      }
+    } finally {
+      refreshBtn!.disabled = false;
+    }
+  }
+
+  refreshBtn.addEventListener("click", loadRecordings);
+  void loadRecordings();
 }
 
 // ── Bootstrap ─────────────────────────────────────────────────────────────────

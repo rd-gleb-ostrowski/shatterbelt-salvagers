@@ -6,6 +6,11 @@
  * Exports:
  *   BotHealthSnapshot          — mirrors server `health.rs` camelCase shape
  *   AuthResult                 — result of verifyAuth()
+ *   LadderStanding             — one entry from GET /ladder/standings
+ *   LadderRunnerResult         — result of getLadderRunner()
+ *   RecordingListItem          — one entry from GET /recordings
+ *   DownloadDTO                — payload from GET /admin/recordings/{id}/download
+ *   DownloadRecordingResult    — result of downloadRecording()
  *   HttpResponse               — minimal interface for the injected fetch function
  *   FetchFn                    — injectable fetch-like type (enables unit tests)
  *   AdminClient                — typed client interface
@@ -142,6 +147,88 @@ export interface ExhibitionResult {
  * Mirrors `KickResult` — 200/401/other mapping. Never throws.
  */
 export type ExhibitionActionResult = KickResult;
+
+// ── Issue 12: Ladder & Replay types ──────────────────────────────────────────
+
+/**
+ * One competitor's TrueSkill standing, as returned by `GET /ladder/standings`.
+ * Ordered by `conservativeSkill` descending on the server.
+ */
+export interface LadderStanding {
+  /** Team / competitor name. */
+  competitor: string;
+  /** TrueSkill µ (mean). */
+  mu: number;
+  /** TrueSkill σ (standard deviation). */
+  sigma: number;
+  /** Conservative skill estimate: µ − 3σ. */
+  conservativeSkill: number;
+  /** Total ladder matches played. */
+  matches: number;
+}
+
+/**
+ * Result of `getLadderRunner()`.
+ * Exactly one discriminant is `true`; `running` is set on success.
+ */
+export interface LadderRunnerResult {
+  /** `true` when the server returned 200. */
+  ok: boolean;
+  /** Whether the background headless ladder runner is active. */
+  running: boolean;
+  /** `true` when the server responded with 401. */
+  unauthorized: boolean;
+}
+
+/**
+ * Result of a simple ladder control action (reset / start runner / stop runner).
+ * Mirrors `KickResult` — 200/401/other mapping. Never throws.
+ */
+export type LadderActionResult = KickResult;
+
+/**
+ * One recorded match entry, as returned by `GET /recordings`.
+ * Field names mirror the server's `RecordingListItem` camelCase serialisation.
+ */
+export interface RecordingListItem {
+  /** Unique match identifier. */
+  matchId: string;
+  /** RNG seed used for the match. */
+  seed: number;
+  /** Total tick count of the recorded match. */
+  tickCount: number;
+  /** Winning competitor name, or `null` if the match was a draw. */
+  winner: string | null;
+  /** Final score per competitor (team → score). */
+  scores: Record<string, number>;
+}
+
+/**
+ * Metadata DTO returned by `GET /admin/recordings/{id}/download`.
+ * Mirrors the server's JSON response shape.
+ */
+export interface DownloadDTO {
+  matchId: string;
+  seed: number;
+  tickCount: number;
+  winner: string | null;
+  scores: Record<string, number>;
+}
+
+/**
+ * Result of `downloadRecording()`.
+ * Exactly one discriminant is `true`; `data` is populated on success.
+ */
+export interface DownloadRecordingResult {
+  /** `true` when the server returned 200 and data was parsed. */
+  ok: boolean;
+  /** The parsed DTO on success; `null` otherwise. */
+  data: DownloadDTO | null;
+  /** `true` when the server responded with 401. */
+  unauthorized: boolean;
+  /** `true` when the server responded with 404 (recording not found). */
+  notFound: boolean;
+}
 
 /**
  * Minimal fetch-like interface accepted by `createAdminClient`.
@@ -355,6 +442,89 @@ export interface AdminClient {
    * Never throws for HTTP-level failures.
    */
   stopExhibition(): Promise<ExhibitionActionResult>;
+
+  // ── Issue 12: Ladder control & replay management ─────────────────────────
+
+  /**
+   * Fetch `GET /ladder/standings` (public endpoint).
+   *
+   * Throws if the response is not 200. Returns the parsed `LadderStanding[]`
+   * ordered by conservativeSkill descending on the server.
+   */
+  getLadderStandings(): Promise<LadderStanding[]>;
+
+  /**
+   * Reset all TrueSkill ratings via `POST /ladder/reset` (facilitator-gated).
+   *
+   * No request body is sent.
+   * Returns `{ ok: true, unauthorized: false }` on 200.
+   * Returns `{ ok: false, unauthorized: true }` on 401.
+   * Returns `{ ok: false, unauthorized: false }` on other errors.
+   * Never throws for HTTP-level failures.
+   */
+  resetLadder(): Promise<LadderActionResult>;
+
+  /**
+   * Get ladder runner status via `GET /admin/ladder/runner` (facilitator-gated).
+   *
+   * Returns `{ ok: true, running, unauthorized: false }` on 200.
+   * Returns `{ ok: false, running: false, unauthorized: true }` on 401.
+   * Returns `{ ok: false, running: false, unauthorized: false }` on other errors.
+   * Never throws for HTTP-level failures.
+   */
+  getLadderRunner(): Promise<LadderRunnerResult>;
+
+  /**
+   * Start the background headless ladder runner via `POST /admin/ladder/runner/start`.
+   *
+   * Idempotent — safe to call when already running.
+   * No request body is sent.
+   * Returns `{ ok: true, unauthorized: false }` on 200.
+   * Returns `{ ok: false, unauthorized: true }` on 401.
+   * Returns `{ ok: false, unauthorized: false }` on other errors.
+   * Never throws for HTTP-level failures.
+   */
+  startLadderRunner(): Promise<LadderActionResult>;
+
+  /**
+   * Stop the background headless ladder runner via `POST /admin/ladder/runner/stop`.
+   *
+   * No request body is sent.
+   * Returns `{ ok: true, unauthorized: false }` on 200.
+   * Returns `{ ok: false, unauthorized: true }` on 401.
+   * Returns `{ ok: false, unauthorized: false }` on other errors.
+   * Never throws for HTTP-level failures.
+   */
+  stopLadderRunner(): Promise<LadderActionResult>;
+
+  /**
+   * List all recorded matches via `GET /recordings` (public endpoint).
+   *
+   * Throws if the response is not 200. Returns the parsed `RecordingListItem[]`.
+   */
+  listRecordings(): Promise<RecordingListItem[]>;
+
+  /**
+   * Replay a recording through the observer hub via `POST /recordings/{id}/replay`.
+   *
+   * The id is URL-encoded. The Viewer at `/observe` will show the replay.
+   * Returns `{ ok: true, unauthorized: false }` on 200.
+   * Returns `{ ok: false, unauthorized: false }` on other errors.
+   * Never throws for HTTP-level failures.
+   */
+  replayRecording(id: string): Promise<LadderActionResult>;
+
+  /**
+   * Download recording metadata via `GET /admin/recordings/{id}/download`.
+   *
+   * The id is URL-encoded.
+   * Returns `{ ok: true, data: DownloadDTO, unauthorized: false, notFound: false }` on 200.
+   * Returns `{ ok: false, data: null, unauthorized: true,  notFound: false }` on 401.
+   * Returns `{ ok: false, data: null, unauthorized: false, notFound: true  }` on 404.
+   * Returns `{ ok: false, data: null, unauthorized: false, notFound: false }` on other errors.
+   * Never throws for HTTP-level failures.
+   */
+  downloadRecording(id: string): Promise<DownloadRecordingResult>;
 }
 
 // ── Factory ───────────────────────────────────────────────────────────────────
@@ -557,6 +727,75 @@ export function createAdminClient(
     async stopExhibition(): Promise<ExhibitionActionResult> {
       const res = await post("/admin/exhibition/stop");
       return mapAction(res.status);
+    },
+
+    // ── Issue 12: Ladder control & replay management ────────────────────────
+
+    async getLadderStandings(): Promise<LadderStanding[]> {
+      const res = await get("/ladder/standings");
+      if (res.status !== 200) {
+        throw new Error(`GET /ladder/standings returned ${res.status}`);
+      }
+      const data = await res.json();
+      return data as LadderStanding[];
+    },
+
+    async resetLadder(): Promise<LadderActionResult> {
+      const res = await post("/ladder/reset");
+      return mapAction(res.status);
+    },
+
+    async getLadderRunner(): Promise<LadderRunnerResult> {
+      const res = await get("/admin/ladder/runner");
+      if (res.status === 200) {
+        const data = (await res.json()) as { running: boolean };
+        return { ok: true, running: data.running, unauthorized: false };
+      }
+      if (res.status === 401) {
+        return { ok: false, running: false, unauthorized: true };
+      }
+      return { ok: false, running: false, unauthorized: false };
+    },
+
+    async startLadderRunner(): Promise<LadderActionResult> {
+      const res = await post("/admin/ladder/runner/start");
+      return mapAction(res.status);
+    },
+
+    async stopLadderRunner(): Promise<LadderActionResult> {
+      const res = await post("/admin/ladder/runner/stop");
+      return mapAction(res.status);
+    },
+
+    async listRecordings(): Promise<RecordingListItem[]> {
+      const res = await get("/recordings");
+      if (res.status !== 200) {
+        throw new Error(`GET /recordings returned ${res.status}`);
+      }
+      const data = await res.json();
+      return data as RecordingListItem[];
+    },
+
+    async replayRecording(id: string): Promise<LadderActionResult> {
+      const path = `/recordings/${encodeURIComponent(id)}/replay`;
+      const res = await post(path);
+      return mapAction(res.status);
+    },
+
+    async downloadRecording(id: string): Promise<DownloadRecordingResult> {
+      const path = `/admin/recordings/${encodeURIComponent(id)}/download`;
+      const res = await get(path);
+      if (res.status === 200) {
+        const data = (await res.json()) as DownloadDTO;
+        return { ok: true, data, unauthorized: false, notFound: false };
+      }
+      if (res.status === 401) {
+        return { ok: false, data: null, unauthorized: true, notFound: false };
+      }
+      if (res.status === 404) {
+        return { ok: false, data: null, unauthorized: false, notFound: true };
+      }
+      return { ok: false, data: null, unauthorized: false, notFound: false };
     },
   };
 }

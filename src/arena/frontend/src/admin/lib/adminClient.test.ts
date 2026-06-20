@@ -18,6 +18,8 @@ import {
   createAdminClient,
   type BotHealthSnapshot,
   type FetchFn,
+  type LadderStanding,
+  type RecordingListItem,
 } from "./adminClient.ts";
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -1268,6 +1270,514 @@ describe("createAdminClient", () => {
       const client = createAdminClient(BASE, PASSWORD, fetchFn);
       await client.setMatchTps("match/1", 30);
       expect(captured[0].url).toBe(`${BASE}/admin/matches/match%2F1/tps`);
+    });
+  });
+
+  // ── Issue 12: Ladder & Replay slices ─────────────────────────────────────
+
+  const SAMPLE_STANDINGS: LadderStanding[] = [
+    { competitor: "alpha", mu: 30, sigma: 2.5, conservativeSkill: 22.5, matches: 10 },
+    { competitor: "beta",  mu: 25, sigma: 3.0, conservativeSkill: 16.0, matches: 5  },
+  ];
+
+  const SAMPLE_RECORDINGS: RecordingListItem[] = [
+    { matchId: "rec-1", seed: 42,  tickCount: 1000, winner: "alpha", scores: { alpha: 3, beta: 1 } },
+    { matchId: "rec-2", seed: 99,  tickCount: 800,  winner: null,    scores: { alpha: 2, beta: 2 } },
+  ];
+
+  // Slice 32 — getLadderStandings GETs /ladder/standings and parses typed array
+  describe("getLadderStandings request building and response parsing", () => {
+    it("sends a GET request to /ladder/standings", async () => {
+      const { fetchFn, captured } = makeFakeFetch(200, SAMPLE_STANDINGS);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await client.getLadderStandings();
+      expect(captured[0].init?.method).toBe("GET");
+      expect(captured[0].url).toBe(`${BASE}/ladder/standings`);
+    });
+
+    it("attaches Authorization: Facilitator <password> header", async () => {
+      const { fetchFn, captured } = makeFakeFetch(200, SAMPLE_STANDINGS);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await client.getLadderStandings();
+      const headers = captured[0].init?.headers as Record<string, string>;
+      expect(headers["Authorization"]).toBe(`Facilitator ${PASSWORD}`);
+    });
+
+    it("returns a typed LadderStanding[] on 200", async () => {
+      const { fetchFn } = makeFakeFetch(200, SAMPLE_STANDINGS);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      const standings = await client.getLadderStandings();
+      expect(standings).toHaveLength(2);
+      expect(standings[0].competitor).toBe("alpha");
+      expect(standings[0].mu).toBe(30);
+      expect(standings[0].sigma).toBe(2.5);
+      expect(standings[0].conservativeSkill).toBe(22.5);
+      expect(standings[0].matches).toBe(10);
+    });
+
+    it("returns an empty array when server returns []", async () => {
+      const { fetchFn } = makeFakeFetch(200, []);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      const standings = await client.getLadderStandings();
+      expect(standings).toEqual([]);
+    });
+
+    it("throws on non-200 response", async () => {
+      const { fetchFn } = makeFakeFetch(500, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await expect(client.getLadderStandings()).rejects.toThrow("500");
+    });
+
+    it("throws on 401 response", async () => {
+      const { fetchFn } = makeFakeFetch(401, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await expect(client.getLadderStandings()).rejects.toThrow();
+    });
+  });
+
+  // Slice 33 — resetLadder POSTs /ladder/reset with auth, maps 200/401/other
+  describe("resetLadder request building and response mapping", () => {
+    it("sends a POST request to /ladder/reset", async () => {
+      const { fetchFn, captured } = makeFakeFetch(200, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await client.resetLadder();
+      expect(captured[0].init?.method).toBe("POST");
+      expect(captured[0].url).toBe(`${BASE}/ladder/reset`);
+    });
+
+    it("attaches Authorization: Facilitator <password> header", async () => {
+      const { fetchFn, captured } = makeFakeFetch(200, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await client.resetLadder();
+      const headers = captured[0].init?.headers as Record<string, string>;
+      expect(headers["Authorization"]).toBe(`Facilitator ${PASSWORD}`);
+    });
+
+    it("sends no body", async () => {
+      const { fetchFn, captured } = makeFakeFetch(200, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await client.resetLadder();
+      expect(captured[0].init?.body).toBeUndefined();
+    });
+
+    it("returns { ok: true, unauthorized: false } on 200", async () => {
+      const { fetchFn } = makeFakeFetch(200, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      const result = await client.resetLadder();
+      expect(result.ok).toBe(true);
+      expect(result.unauthorized).toBe(false);
+    });
+
+    it("returns { ok: false, unauthorized: true } on 401", async () => {
+      const { fetchFn } = makeFakeFetch(401, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      const result = await client.resetLadder();
+      expect(result.ok).toBe(false);
+      expect(result.unauthorized).toBe(true);
+    });
+
+    it("returns { ok: false, unauthorized: false } on 500", async () => {
+      const { fetchFn } = makeFakeFetch(500, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      const result = await client.resetLadder();
+      expect(result.ok).toBe(false);
+      expect(result.unauthorized).toBe(false);
+    });
+
+    it("does not throw on any HTTP status", async () => {
+      const { fetchFn } = makeFakeFetch(500, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await expect(client.resetLadder()).resolves.not.toThrow();
+    });
+  });
+
+  // Slice 34 — getLadderRunner GETs /admin/ladder/runner, parses { running }, maps 401
+  describe("getLadderRunner request building and response mapping", () => {
+    it("sends a GET request to /admin/ladder/runner", async () => {
+      const { fetchFn, captured } = makeFakeFetch(200, { running: true });
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await client.getLadderRunner();
+      expect(captured[0].init?.method).toBe("GET");
+      expect(captured[0].url).toBe(`${BASE}/admin/ladder/runner`);
+    });
+
+    it("attaches Authorization: Facilitator <password> header", async () => {
+      const { fetchFn, captured } = makeFakeFetch(200, { running: false });
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await client.getLadderRunner();
+      const headers = captured[0].init?.headers as Record<string, string>;
+      expect(headers["Authorization"]).toBe(`Facilitator ${PASSWORD}`);
+    });
+
+    it("returns { ok: true, running: true, unauthorized: false } when runner is active", async () => {
+      const { fetchFn } = makeFakeFetch(200, { running: true });
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      const result = await client.getLadderRunner();
+      expect(result.ok).toBe(true);
+      expect(result.running).toBe(true);
+      expect(result.unauthorized).toBe(false);
+    });
+
+    it("returns { ok: true, running: false, unauthorized: false } when runner is stopped", async () => {
+      const { fetchFn } = makeFakeFetch(200, { running: false });
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      const result = await client.getLadderRunner();
+      expect(result.ok).toBe(true);
+      expect(result.running).toBe(false);
+      expect(result.unauthorized).toBe(false);
+    });
+
+    it("returns { ok: false, running: false, unauthorized: true } on 401", async () => {
+      const { fetchFn } = makeFakeFetch(401, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      const result = await client.getLadderRunner();
+      expect(result.ok).toBe(false);
+      expect(result.running).toBe(false);
+      expect(result.unauthorized).toBe(true);
+    });
+
+    it("returns { ok: false, running: false, unauthorized: false } on 500", async () => {
+      const { fetchFn } = makeFakeFetch(500, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      const result = await client.getLadderRunner();
+      expect(result.ok).toBe(false);
+      expect(result.running).toBe(false);
+      expect(result.unauthorized).toBe(false);
+    });
+
+    it("does not throw on any HTTP status", async () => {
+      const { fetchFn } = makeFakeFetch(401, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await expect(client.getLadderRunner()).resolves.not.toThrow();
+    });
+  });
+
+  // Slice 35 — startLadderRunner POSTs /admin/ladder/runner/start with auth
+  describe("startLadderRunner request building and response mapping", () => {
+    it("sends a POST request to /admin/ladder/runner/start", async () => {
+      const { fetchFn, captured } = makeFakeFetch(200, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await client.startLadderRunner();
+      expect(captured[0].init?.method).toBe("POST");
+      expect(captured[0].url).toBe(`${BASE}/admin/ladder/runner/start`);
+    });
+
+    it("attaches Authorization: Facilitator <password> header", async () => {
+      const { fetchFn, captured } = makeFakeFetch(200, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await client.startLadderRunner();
+      const headers = captured[0].init?.headers as Record<string, string>;
+      expect(headers["Authorization"]).toBe(`Facilitator ${PASSWORD}`);
+    });
+
+    it("sends no body", async () => {
+      const { fetchFn, captured } = makeFakeFetch(200, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await client.startLadderRunner();
+      expect(captured[0].init?.body).toBeUndefined();
+    });
+
+    it("returns { ok: true, unauthorized: false } on 200", async () => {
+      const { fetchFn } = makeFakeFetch(200, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      const result = await client.startLadderRunner();
+      expect(result.ok).toBe(true);
+      expect(result.unauthorized).toBe(false);
+    });
+
+    it("returns { ok: false, unauthorized: true } on 401", async () => {
+      const { fetchFn } = makeFakeFetch(401, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      const result = await client.startLadderRunner();
+      expect(result.ok).toBe(false);
+      expect(result.unauthorized).toBe(true);
+    });
+
+    it("returns { ok: false, unauthorized: false } on 500", async () => {
+      const { fetchFn } = makeFakeFetch(500, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      const result = await client.startLadderRunner();
+      expect(result.ok).toBe(false);
+      expect(result.unauthorized).toBe(false);
+    });
+
+    it("does not throw on any HTTP status", async () => {
+      const { fetchFn } = makeFakeFetch(500, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await expect(client.startLadderRunner()).resolves.not.toThrow();
+    });
+  });
+
+  // Slice 36 — stopLadderRunner POSTs /admin/ladder/runner/stop with auth
+  describe("stopLadderRunner request building and response mapping", () => {
+    it("sends a POST request to /admin/ladder/runner/stop", async () => {
+      const { fetchFn, captured } = makeFakeFetch(200, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await client.stopLadderRunner();
+      expect(captured[0].init?.method).toBe("POST");
+      expect(captured[0].url).toBe(`${BASE}/admin/ladder/runner/stop`);
+    });
+
+    it("attaches Authorization: Facilitator <password> header", async () => {
+      const { fetchFn, captured } = makeFakeFetch(200, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await client.stopLadderRunner();
+      const headers = captured[0].init?.headers as Record<string, string>;
+      expect(headers["Authorization"]).toBe(`Facilitator ${PASSWORD}`);
+    });
+
+    it("sends no body", async () => {
+      const { fetchFn, captured } = makeFakeFetch(200, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await client.stopLadderRunner();
+      expect(captured[0].init?.body).toBeUndefined();
+    });
+
+    it("returns { ok: true, unauthorized: false } on 200", async () => {
+      const { fetchFn } = makeFakeFetch(200, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      const result = await client.stopLadderRunner();
+      expect(result.ok).toBe(true);
+      expect(result.unauthorized).toBe(false);
+    });
+
+    it("returns { ok: false, unauthorized: true } on 401", async () => {
+      const { fetchFn } = makeFakeFetch(401, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      const result = await client.stopLadderRunner();
+      expect(result.ok).toBe(false);
+      expect(result.unauthorized).toBe(true);
+    });
+
+    it("returns { ok: false, unauthorized: false } on 500", async () => {
+      const { fetchFn } = makeFakeFetch(500, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      const result = await client.stopLadderRunner();
+      expect(result.ok).toBe(false);
+      expect(result.unauthorized).toBe(false);
+    });
+
+    it("does not throw on any HTTP status", async () => {
+      const { fetchFn } = makeFakeFetch(500, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await expect(client.stopLadderRunner()).resolves.not.toThrow();
+    });
+  });
+
+  // Slice 37 — listRecordings GETs /recordings and parses camelCase list
+  describe("listRecordings request building and response parsing", () => {
+    it("sends a GET request to /recordings", async () => {
+      const { fetchFn, captured } = makeFakeFetch(200, SAMPLE_RECORDINGS);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await client.listRecordings();
+      expect(captured[0].init?.method).toBe("GET");
+      expect(captured[0].url).toBe(`${BASE}/recordings`);
+    });
+
+    it("attaches Authorization: Facilitator <password> header", async () => {
+      const { fetchFn, captured } = makeFakeFetch(200, SAMPLE_RECORDINGS);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await client.listRecordings();
+      const headers = captured[0].init?.headers as Record<string, string>;
+      expect(headers["Authorization"]).toBe(`Facilitator ${PASSWORD}`);
+    });
+
+    it("returns a typed RecordingListItem[] on 200", async () => {
+      const { fetchFn } = makeFakeFetch(200, SAMPLE_RECORDINGS);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      const recordings = await client.listRecordings();
+      expect(recordings).toHaveLength(2);
+      expect(recordings[0].matchId).toBe("rec-1");
+      expect(recordings[0].seed).toBe(42);
+      expect(recordings[0].tickCount).toBe(1000);
+      expect(recordings[0].winner).toBe("alpha");
+      expect(recordings[0].scores).toEqual({ alpha: 3, beta: 1 });
+    });
+
+    it("preserves null winner for drawn matches", async () => {
+      const { fetchFn } = makeFakeFetch(200, SAMPLE_RECORDINGS);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      const recordings = await client.listRecordings();
+      expect(recordings[1].winner).toBeNull();
+    });
+
+    it("returns an empty array when server returns []", async () => {
+      const { fetchFn } = makeFakeFetch(200, []);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      const recordings = await client.listRecordings();
+      expect(recordings).toEqual([]);
+    });
+
+    it("throws on non-200 response", async () => {
+      const { fetchFn } = makeFakeFetch(500, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await expect(client.listRecordings()).rejects.toThrow("500");
+    });
+
+    it("throws on 404 response", async () => {
+      const { fetchFn } = makeFakeFetch(404, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await expect(client.listRecordings()).rejects.toThrow();
+    });
+  });
+
+  // Slice 38 — replayRecording POSTs /recordings/{id}/replay (URL-encoded)
+  describe("replayRecording request building and response mapping", () => {
+    it("sends a POST request to /recordings/{id}/replay", async () => {
+      const { fetchFn, captured } = makeFakeFetch(200, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await client.replayRecording("rec-1");
+      expect(captured[0].init?.method).toBe("POST");
+      expect(captured[0].url).toBe(`${BASE}/recordings/rec-1/replay`);
+    });
+
+    it("URL-encodes recording id containing a slash", async () => {
+      const { fetchFn, captured } = makeFakeFetch(200, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await client.replayRecording("rec/1");
+      expect(captured[0].url).toBe(`${BASE}/recordings/rec%2F1/replay`);
+    });
+
+    it("URL-encodes recording id containing a space", async () => {
+      const { fetchFn, captured } = makeFakeFetch(200, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await client.replayRecording("rec 1");
+      expect(captured[0].url).toBe(`${BASE}/recordings/rec%201/replay`);
+    });
+
+    it("sends no body", async () => {
+      const { fetchFn, captured } = makeFakeFetch(200, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await client.replayRecording("rec-1");
+      expect(captured[0].init?.body).toBeUndefined();
+    });
+
+    it("returns { ok: true, unauthorized: false } on 200", async () => {
+      const { fetchFn } = makeFakeFetch(200, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      const result = await client.replayRecording("rec-1");
+      expect(result.ok).toBe(true);
+      expect(result.unauthorized).toBe(false);
+    });
+
+    it("returns { ok: false, unauthorized: false } on 500", async () => {
+      const { fetchFn } = makeFakeFetch(500, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      const result = await client.replayRecording("rec-1");
+      expect(result.ok).toBe(false);
+      expect(result.unauthorized).toBe(false);
+    });
+
+    it("does not throw on any HTTP status", async () => {
+      const { fetchFn } = makeFakeFetch(500, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await expect(client.replayRecording("rec-1")).resolves.not.toThrow();
+    });
+  });
+
+  // Slice 39 — downloadRecording GETs /admin/recordings/{id}/download with auth
+  describe("downloadRecording request building and response mapping", () => {
+    const SAMPLE_DTO = {
+      matchId: "rec-1",
+      seed: 42,
+      tickCount: 1000,
+      winner: "alpha",
+      scores: { alpha: 3, beta: 1 },
+    };
+
+    it("sends a GET request to /admin/recordings/{id}/download", async () => {
+      const { fetchFn, captured } = makeFakeFetch(200, SAMPLE_DTO);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await client.downloadRecording("rec-1");
+      expect(captured[0].init?.method).toBe("GET");
+      expect(captured[0].url).toBe(`${BASE}/admin/recordings/rec-1/download`);
+    });
+
+    it("attaches Authorization: Facilitator <password> header", async () => {
+      const { fetchFn, captured } = makeFakeFetch(200, SAMPLE_DTO);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await client.downloadRecording("rec-1");
+      const headers = captured[0].init?.headers as Record<string, string>;
+      expect(headers["Authorization"]).toBe(`Facilitator ${PASSWORD}`);
+    });
+
+    it("URL-encodes recording id containing a slash", async () => {
+      const { fetchFn, captured } = makeFakeFetch(200, SAMPLE_DTO);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await client.downloadRecording("rec/1");
+      expect(captured[0].url).toBe(`${BASE}/admin/recordings/rec%2F1/download`);
+    });
+
+    it("returns { ok: true, data: DownloadDTO, ... } on 200", async () => {
+      const { fetchFn } = makeFakeFetch(200, SAMPLE_DTO);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      const result = await client.downloadRecording("rec-1");
+      expect(result.ok).toBe(true);
+      expect(result.unauthorized).toBe(false);
+      expect(result.notFound).toBe(false);
+      expect(result.data).not.toBeNull();
+      expect(result.data?.matchId).toBe("rec-1");
+      expect(result.data?.seed).toBe(42);
+      expect(result.data?.tickCount).toBe(1000);
+      expect(result.data?.winner).toBe("alpha");
+      expect(result.data?.scores).toEqual({ alpha: 3, beta: 1 });
+    });
+
+    it("preserves null winner in downloaded DTO", async () => {
+      const dtoWithNull = { ...SAMPLE_DTO, winner: null };
+      const { fetchFn } = makeFakeFetch(200, dtoWithNull);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      const result = await client.downloadRecording("rec-2");
+      expect(result.ok).toBe(true);
+      expect(result.data?.winner).toBeNull();
+    });
+
+    it("returns { ok: false, unauthorized: true, notFound: false } on 401", async () => {
+      const { fetchFn } = makeFakeFetch(401, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      const result = await client.downloadRecording("rec-1");
+      expect(result.ok).toBe(false);
+      expect(result.unauthorized).toBe(true);
+      expect(result.notFound).toBe(false);
+      expect(result.data).toBeNull();
+    });
+
+    it("returns { ok: false, notFound: true, unauthorized: false } on 404", async () => {
+      const { fetchFn } = makeFakeFetch(404, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      const result = await client.downloadRecording("no-such-rec");
+      expect(result.ok).toBe(false);
+      expect(result.notFound).toBe(true);
+      expect(result.unauthorized).toBe(false);
+      expect(result.data).toBeNull();
+    });
+
+    it("returns { ok: false, unauthorized: false, notFound: false } on 500", async () => {
+      const { fetchFn } = makeFakeFetch(500, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      const result = await client.downloadRecording("rec-1");
+      expect(result.ok).toBe(false);
+      expect(result.unauthorized).toBe(false);
+      expect(result.notFound).toBe(false);
+      expect(result.data).toBeNull();
+    });
+
+    it("does not throw on 401", async () => {
+      const { fetchFn } = makeFakeFetch(401, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await expect(client.downloadRecording("rec-1")).resolves.not.toThrow();
+    });
+
+    it("does not throw on 404", async () => {
+      const { fetchFn } = makeFakeFetch(404, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await expect(client.downloadRecording("rec-1")).resolves.not.toThrow();
+    });
+
+    it("does not throw on 500", async () => {
+      const { fetchFn } = makeFakeFetch(500, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await expect(client.downloadRecording("rec-1")).resolves.not.toThrow();
     });
   });
 });
