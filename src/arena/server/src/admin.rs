@@ -943,3 +943,273 @@ pub async fn delete_admin_default_bot(
     state.default_bot_store.clear();
     StatusCode::OK
 }
+
+// ── LadderRunner ─────────────────────────────────────────────────────────────
+
+/// Managed handle for the background headless ladder runner (issue 12/admin).
+///
+/// Mirrors [`ExhibitionSupervisor`]: holds the ability to start a
+/// [`HeadlessRunner::spawn_loop`] that feeds results into the [`Ladder`] via
+/// [`crate::ladder::consume_headless_results`], and to stop it via the
+/// `watch::Sender<bool>` from `spawn_loop`.
+///
+/// ## Roster / params
+///
+/// The runner uses a fixed default roster of `["team-a", "team-b"]` (the same
+/// default used by exhibition matches and `POST /admin/matches`).  Uploaded
+/// WASM bots for those teams (in `wasm_store`) are used automatically via the
+/// [`crate::resolver::ConnectionResolver`]; unoccupied slots fall back to the
+/// Default Bot.  The AppState `match_params` and stores (wasm, disabled,
+/// default_bot, dq, health) are respected.
+///
+/// ## Running state
+///
+/// `is_running()` returns `true` between a successful `start()` and a
+/// subsequent `stop()`.  The flag is set synchronously in `start()` / `stop()`
+/// so HTTP handlers can read it immediately without waiting for background
+/// tasks.
+pub struct LadderRunner {
+    running: Arc<AtomicBool>,
+    stop_tx: Arc<tokio::sync::Mutex<Option<watch::Sender<bool>>>>,
+}
+
+impl LadderRunner {
+    /// Create a new, stopped `LadderRunner` wrapped in `Arc`.
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            running: Arc::new(AtomicBool::new(false)),
+            stop_tx: Arc::new(tokio::sync::Mutex::new(None)),
+        })
+    }
+
+    /// Returns `true` if the background loop is currently running.
+    pub fn is_running(&self) -> bool {
+        self.running.load(Ordering::SeqCst)
+    }
+
+    /// Start the headless ladder runner loop (idempotent — no-op if already running).
+    ///
+    /// Spawns:
+    /// 1. A [`HeadlessRunner::spawn_loop`] background task that runs
+    ///    headless matches continuously until stopped.
+    /// 2. A consumer task ([`crate::ladder::consume_headless_results`]) that
+    ///    feeds each finished result into `state.ladder`.
+    ///
+    /// The `watch::Sender<bool>` from `spawn_loop` is retained so `stop()`
+    /// can signal a graceful halt.
+    pub fn start(&self, state: &AppState) {
+        // Idempotent: skip if already running.
+        if self.running.load(Ordering::SeqCst) {
+            return;
+        }
+
+        // Fixed two-team roster (mirrors normalized_teams(None)).
+        let teams = vec!["team-a".to_owned(), "team-b".to_owned()];
+        let specs = default_specs(&state.match_params, teams.len());
+
+        let runner = HeadlessRunner::new_with_health(
+            Arc::clone(&state.wasm_store),
+            Arc::clone(&state.recording_store),
+            state.match_params.clone(),
+            specs,
+            teams.clone(),
+            10_000_000,
+            state.match_seed,
+            Arc::clone(&state.dq_store),
+            Arc::clone(&state.health_store),
+        )
+        .with_management(
+            Arc::clone(&state.disabled_store),
+            Arc::clone(&state.default_bot_store),
+        );
+
+        let (stop_tx, result_rx, _join) = runner.spawn_loop();
+
+        // Store the stop sender so stop() can signal a halt.
+        if let Ok(mut slot) = self.stop_tx.try_lock() {
+            *slot = Some(stop_tx);
+        }
+
+        // Mark running BEFORE spawning so the HTTP status endpoint sees it
+        // immediately after start() returns.
+        self.running.store(true, Ordering::SeqCst);
+
+        // Spawn the consumer task: feed results into the ladder.
+        let ladder = Arc::clone(&state.ladder);
+        let running_flag = Arc::clone(&self.running);
+        tokio::spawn(async move {
+            crate::ladder::consume_headless_results(result_rx, ladder, &teams).await;
+            // When the channel closes (loop stopped), clear the running flag.
+            running_flag.store(false, Ordering::SeqCst);
+        });
+    }
+
+    /// Stop the background loop (graceful: current in-flight match finishes).
+    ///
+    /// Sets `is_running()` to `false` synchronously so the HTTP status
+    /// endpoint reflects the change immediately.
+    pub async fn stop(&self) {
+        // Clear the running flag immediately (observable via the status endpoint).
+        self.running.store(false, Ordering::SeqCst);
+        if let Some(tx) = self.stop_tx.lock().await.as_ref() {
+            let _ = tx.send(true);
+        }
+    }
+}
+
+// ── Ladder runner status DTO ──────────────────────────────────────────────────
+
+#[derive(Serialize)]
+struct LadderRunnerStatus {
+    running: bool,
+}
+
+// ── Recording download DTO ────────────────────────────────────────────────────
+
+/// Download DTO for `GET /admin/recordings/{id}/download`.
+///
+/// Engine types ([`arena_engine::Params`], [`arena_engine::ShipSpec`],
+/// [`arena_engine::IntentFrame`]) do not implement `Serialize`, so this DTO
+/// contains the fields that are serialisable:
+///
+/// - `match_id`, `seed` — from [`crate::recording::Recording`].
+/// - `tick_count`, `winner`, `scores` — from [`crate::recording::RecordingMeta`].
+///
+/// `params`, `specs`, and `intent_log` are excluded.  A future issue that adds
+/// `Serialize` to engine types can replace this DTO with the full
+/// `Recording` struct without changing the endpoint contract.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordingDownloadDto {
+    pub match_id: String,
+    pub seed: u64,
+    pub tick_count: u32,
+    pub winner: Option<String>,
+    pub scores: Vec<(String, f32)>,
+}
+
+// ── Ladder runner handlers ────────────────────────────────────────────────────
+
+/// `GET /admin/ladder/runner` — report whether the headless ladder loop is running.
+///
+/// # Auth
+///
+/// ```text
+/// Authorization: Facilitator <facilitator_password>
+/// ```
+///
+/// # Response
+///
+/// ```json
+/// { "running": true }
+/// ```
+///
+/// | Status | Meaning |
+/// |--------|---------|
+/// | **200 OK** | Status returned. |
+/// | **401 Unauthorized** | Missing, malformed, or wrong facilitator password. |
+pub async fn get_admin_ladder_runner(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(status) = check_facilitator_auth(&headers, &state.facilitator_password) {
+        return status.into_response();
+    }
+    Json(LadderRunnerStatus { running: state.ladder_runner.is_running() }).into_response()
+}
+
+/// `POST /admin/ladder/runner/start` — start the headless ladder loop (idempotent).
+///
+/// Spawns a background headless match loop that feeds results into the TrueSkill
+/// ladder.  If the loop is already running this is a no-op (200 OK).
+///
+/// # Auth
+///
+/// ```text
+/// Authorization: Facilitator <facilitator_password>
+/// ```
+///
+/// | Status | Meaning |
+/// |--------|---------|
+/// | **200 OK** | Loop started (or was already running). |
+/// | **401 Unauthorized** | Missing, malformed, or wrong facilitator password. |
+pub async fn post_admin_ladder_runner_start(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(status) = check_facilitator_auth(&headers, &state.facilitator_password) {
+        return status;
+    }
+    state.ladder_runner.start(&state);
+    StatusCode::OK
+}
+
+/// `POST /admin/ladder/runner/stop` — stop the headless ladder loop.
+///
+/// Signals the background loop to halt after the current in-flight match
+/// completes.  Safe to call when the loop is not running (no-op).
+///
+/// # Auth
+///
+/// ```text
+/// Authorization: Facilitator <facilitator_password>
+/// ```
+///
+/// | Status | Meaning |
+/// |--------|---------|
+/// | **200 OK** | Stop signal sent (or loop was already stopped). |
+/// | **401 Unauthorized** | Missing, malformed, or wrong facilitator password. |
+pub async fn post_admin_ladder_runner_stop(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(status) = check_facilitator_auth(&headers, &state.facilitator_password) {
+        return status;
+    }
+    state.ladder_runner.stop().await;
+    StatusCode::OK
+}
+
+// ── Recording download handler ────────────────────────────────────────────────
+
+/// `GET /admin/recordings/{id}/download` — download a recording as JSON.
+///
+/// Returns a [`RecordingDownloadDto`] with seed + metadata.  Engine types
+/// (`Params`, `ShipSpec`, `IntentFrame`) are excluded because they do not
+/// implement `Serialize`; the DTO shape is documented and stable.
+///
+/// # Auth
+///
+/// ```text
+/// Authorization: Facilitator <facilitator_password>
+/// ```
+///
+/// | Status | Meaning |
+/// |--------|---------|
+/// | **200 OK** | Recording returned as JSON. |
+/// | **401 Unauthorized** | Missing, malformed, or wrong facilitator password. |
+/// | **404 Not Found** | No recording with the given `id`. |
+pub async fn get_admin_recording_download(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(status) = check_facilitator_auth(&headers, &state.facilitator_password) {
+        return status.into_response();
+    }
+    match state.recording_store.get(&id) {
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "recording not found"})),
+        )
+            .into_response(),
+        Some(rec) => Json(RecordingDownloadDto {
+            match_id: rec.match_id,
+            seed: rec.seed,
+            tick_count: rec.meta.tick_count,
+            winner: rec.meta.winner,
+            scores: rec.meta.scores,
+        })
+        .into_response(),
+    }
+}

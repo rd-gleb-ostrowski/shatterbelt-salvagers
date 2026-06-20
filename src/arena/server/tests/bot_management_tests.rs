@@ -101,6 +101,7 @@ fn test_app() -> (
         ladder: arena_server::ladder::Ladder::new(),
         disabled_store: Arc::clone(&disabled_store),
         default_bot_store: Arc::clone(&default_bot_store),
+        ladder_runner: arena_server::admin::LadderRunner::new(),
     });
     (app, wasm_store, disabled_store, default_bot_store)
 }

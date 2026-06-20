@@ -37,7 +37,7 @@ use serde::{Deserialize, Serialize};
 
 use arena_engine::Params;
 
-use crate::admin::{self, ExhibitionSupervisor, MatchRegistry};
+use crate::admin::{self, ExhibitionSupervisor, LadderRunner, MatchRegistry};
 use crate::auth::TokenRegistry;
 use crate::health::{BotHealthStore, DqStore};
 use crate::ladder::Ladder;
@@ -161,6 +161,15 @@ pub struct AppState {
     /// When set, resolver Priority-3 instantiates a WASM driver from this
     /// artifact instead of the built-in heuristic.
     pub default_bot_store: Arc<DefaultBotStore>,
+
+    /// Background headless ladder runner handle (issue 12/admin).
+    ///
+    /// Holds the ability to start/stop the [`crate::headless::HeadlessRunner`]
+    /// loop that feeds results into `ladder` via
+    /// [`crate::ladder::consume_headless_results`].
+    /// Constructed stopped; admin endpoints (`POST /admin/ladder/runner/start`,
+    /// `POST /admin/ladder/runner/stop`, `GET /admin/ladder/runner`) control it.
+    pub ladder_runner: Arc<LadderRunner>,
 }
 
 // ── Router configuration ──────────────────────────────────────────────────────
@@ -206,6 +215,8 @@ pub struct RouterConfig {
     pub disabled_store: Arc<DisabledStore>,
     /// Custom Default Bot artifact.  Defaults to a fresh (empty) [`DefaultBotStore`] in [`build_router`].
     pub default_bot_store: Arc<DefaultBotStore>,
+    /// Background headless ladder runner handle.  Defaults to a new (stopped) [`LadderRunner`] in [`build_router`].
+    pub ladder_runner: Arc<LadderRunner>,
 }
 
 // ── Wire types ────────────────────────────────────────────────────────────────
@@ -523,6 +534,7 @@ pub fn build_router(event_password: String, registry: Arc<TokenRegistry>) -> Rou
         ladder: Ladder::new(),
         disabled_store: DisabledStore::new(),
         default_bot_store: DefaultBotStore::new(),
+        ladder_runner: LadderRunner::new(),
     })
 }
 
@@ -549,6 +561,7 @@ pub fn build_router_config(config: RouterConfig) -> Router {
         ladder: config.ladder,
         disabled_store: config.disabled_store,
         default_bot_store: config.default_bot_store,
+        ladder_runner: config.ladder_runner,
     };
     Router::new()
         .route("/register", post(post_register))
@@ -598,6 +611,12 @@ pub fn build_router_config(config: RouterConfig) -> Router {
         // ── Issue 10: TrueSkill ladder ────────────────────────────────────
         .route("/ladder/standings", get(get_ladder_standings))
         .route("/ladder/reset", post(post_ladder_reset))
+        // ── Issue 12/admin: headless ladder runner ────────────────────────
+        .route("/admin/ladder/runner", get(admin::get_admin_ladder_runner))
+        .route("/admin/ladder/runner/start", post(admin::post_admin_ladder_runner_start))
+        .route("/admin/ladder/runner/stop", post(admin::post_admin_ladder_runner_stop))
+        // ── Issue 12/admin: recording download ────────────────────────────
+        .route("/admin/recordings/{id}/download", get(admin::get_admin_recording_download))
         .with_state(state)
 }
 
