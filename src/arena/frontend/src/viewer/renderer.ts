@@ -8,24 +8,23 @@
  * Design:
  * - All entity graphics are drawn to a single Graphics object per tick
  *   (cleared + redrawn) for simplicity in this first slice.
- * - The world->screen transform (fitDriftTransform) is the seam issue 02
- *   replaces with a camera system.
+ * - The world->screen transform is produced by the Camera model (camera.ts),
+ *   which replaced the direct fitDriftTransform call from issue 01.
  *
  * Seams for future issues:
- *   02  — replace fitDriftTransform call with camera.getTransform()
  *   03  — add ship team colours, hull/shield bars, name labels, thrust flames
  *   04  — add Sigil effects (singularity well, mine indicator, arc-lance beam, explosions)
- *   05  — add HUD overlay (scoreboard, tick timer)
+ *   05  — add HUD overlay (scoreboard, tick timer); read camera.followTarget for highlight
  *   06  — read frame events for Web Audio triggers (sound module)
  */
 
 import { Application, Graphics, Container } from "pixi.js";
 import type { GodViewFrame } from "../lib/frameParser.ts";
 import {
-  fitDriftTransform,
   worldToScreen,
   type CameraTransform,
 } from "../lib/worldTransform.ts";
+import { Camera } from "../lib/camera.ts";
 
 // ── Palette ───────────────────────────────────────────────────────────────────
 
@@ -55,6 +54,9 @@ export class DriftRenderer {
   private driftGraphics: Graphics;
   private entityGraphics: Graphics;
   private glowGraphics: Graphics;
+
+  /** Camera instance — main.ts wires input handlers against this object. */
+  readonly camera: Camera = new Camera();
 
   private constructor(
     app: Application,
@@ -114,13 +116,21 @@ export class DriftRenderer {
   }
 
   /**
-   * Render one god-view frame.
-   * Seam: issue 02 will pass a CameraTransform from the camera system instead
-   * of computing fitDriftTransform here.
+   * Render one god-view frame using the current camera state.
+   *
+   * Resolves the followed ship's world position from the frame (when in follow
+   * mode) and delegates transform computation to `this.camera.getTransform`.
    */
   renderFrame(frame: GodViewFrame): void {
     const canvas = { width: this.canvasWidth, height: this.canvasHeight };
-    const transform = fitDriftTransform(frame.arena, canvas);
+
+    // Resolve ship position for follow mode
+    const followTarget = this.camera.followTarget;
+    const shipPos = followTarget !== null
+      ? frame.ships.find(s => s.id === followTarget)?.pos
+      : undefined;
+
+    const transform = this.camera.getTransform(frame.arena, canvas, shipPos);
     this.drawDrift(frame, transform);
     this.drawGlows(frame, transform);
     this.drawEntities(frame, transform);
