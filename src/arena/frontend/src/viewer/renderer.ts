@@ -18,13 +18,14 @@
  *   06  — read frame events for Web Audio triggers (sound module)
  */
 
-import { Application, Graphics, Container } from "pixi.js";
+import { Application, Graphics, Container, Text } from "pixi.js";
 import type { GodViewFrame } from "../lib/frameParser.ts";
 import {
   worldToScreen,
   type CameraTransform,
 } from "../lib/worldTransform.ts";
 import { Camera } from "../lib/camera.ts";
+import { teamColour, barFillRatio, isThrusting } from "../lib/shipPresentation.ts";
 
 // ── Palette ───────────────────────────────────────────────────────────────────
 
@@ -33,10 +34,16 @@ const PALETTE = {
   driftBorder: 0x2a2050,
   asteroid: 0x5a5070,
   asteroidStroke: 0x8070a0,
-  ship: 0x8aeeff,
   shipDead: 0x334455,
-  shipInvuln: 0xd0a0ff,
   shipHeading: 0xffffff,
+  shipInvulnRing: 0xd0a0ff,
+  shipInvulnFill: 0xd0a0ff,
+  thrustNormal: 0xff6600,
+  thrustAfterburner: 0xffaa00,
+  hullBarBg: 0x220000,
+  hullBarFill: 0x44ff44,
+  shieldBarBg: 0x000022,
+  shieldBarFill: 0x4488ff,
   anchor: 0xffcc44,
   anchorGlow: 0xffaa00,
   relic: 0x44ffaa,
@@ -54,6 +61,8 @@ export class DriftRenderer {
   private driftGraphics: Graphics;
   private entityGraphics: Graphics;
   private glowGraphics: Graphics;
+  /** Container for per-ship name labels; cleared and rebuilt every frame. */
+  private labelContainer: Container;
 
   /** Camera instance — main.ts wires input handlers against this object. */
   readonly camera: Camera = new Camera();
@@ -63,11 +72,13 @@ export class DriftRenderer {
     driftGraphics: Graphics,
     entityGraphics: Graphics,
     glowGraphics: Graphics,
+    labelContainer: Container,
   ) {
     this.app = app;
     this.driftGraphics = driftGraphics;
     this.entityGraphics = entityGraphics;
     this.glowGraphics = glowGraphics;
+    this.labelContainer = labelContainer;
   }
 
   /**
@@ -88,15 +99,17 @@ export class DriftRenderer {
 
     container.appendChild(app.canvas);
 
-    // Layer order: drift bg, glows (additive), entities on top
+    // Layer order: drift bg → glows (additive) → entities → labels on top
     const worldLayer = new Container();
     const driftGraphics = new Graphics();
     const glowGraphics = new Graphics();
     const entityGraphics = new Graphics();
+    const labelContainer = new Container();
 
     worldLayer.addChild(driftGraphics);
     worldLayer.addChild(glowGraphics);
     worldLayer.addChild(entityGraphics);
+    worldLayer.addChild(labelContainer);
     app.stage.addChild(worldLayer);
 
     return new DriftRenderer(
@@ -104,6 +117,7 @@ export class DriftRenderer {
       driftGraphics,
       entityGraphics,
       glowGraphics,
+      labelContainer,
     );
   }
 
@@ -278,17 +292,18 @@ export class DriftRenderer {
   }
 
   private drawShips(frame: GodViewFrame, t: CameraTransform): void {
+    // Clear name labels from the previous frame
+    const removed = this.labelContainer.removeChildren();
+    for (const child of removed) child.destroy();
+
     for (const ship of frame.ships) {
       const sp = worldToScreen(ship.pos, t);
-      const color = ship.invuln
-        ? PALETTE.shipInvuln
-        : ship.alive
-          ? PALETTE.ship
-          : PALETTE.shipDead;
-
-      // Ship body: equilateral triangle pointing in heading direction
+      const colour = ship.alive ? teamColour(ship.id) : PALETTE.shipDead;
+      const alpha = ship.alive ? 0.9 : 0.4;
       const size = 7;
       const heading = ship.heading;
+
+      // Triangle vertices — tip points in heading direction
       const tip = {
         x: sp.x + Math.cos(heading) * size * 1.6,
         y: sp.y + Math.sin(heading) * size * 1.6,
@@ -302,12 +317,101 @@ export class DriftRenderer {
         y: sp.y + Math.sin(heading - (2.3 * Math.PI) / 3) * size,
       };
 
+      // ── Thrust flame — drawn behind the ship (opposite to heading) ────────
+      // Rule: afterburnerTicksLeft > 0 (afterburner Sigil) → bright orange
+      //       forward speed > threshold               → normal orange flame
+      if (ship.alive && isThrusting(ship)) {
+        const flameDir = heading + Math.PI;
+        const flameLen = ship.afterburnerTicksLeft > 0 ? 18 : 12;
+        const flameW = ship.afterburnerTicksLeft > 0 ? 5 : 3.5;
+        const flameColour = ship.afterburnerTicksLeft > 0
+          ? PALETTE.thrustAfterburner
+          : PALETTE.thrustNormal;
+        const flameAlpha = ship.afterburnerTicksLeft > 0 ? 0.95 : 0.7;
+
+        const flameTip = {
+          x: sp.x + Math.cos(flameDir) * flameLen,
+          y: sp.y + Math.sin(flameDir) * flameLen,
+        };
+        // Flame base — two points straddling the rear of the ship body
+        const flBaseAngle = heading + (2.5 * Math.PI) / 3;
+        const flameLeft = {
+          x: sp.x + Math.cos(flBaseAngle) * flameW,
+          y: sp.y + Math.sin(flBaseAngle) * flameW,
+        };
+        const flameRight = {
+          x: sp.x + Math.cos(heading - (2.5 * Math.PI) / 3) * flameW,
+          y: sp.y + Math.sin(heading - (2.5 * Math.PI) / 3) * flameW,
+        };
+        this.entityGraphics
+          .poly([flameTip.x, flameTip.y, flameLeft.x, flameLeft.y, flameRight.x, flameRight.y])
+          .fill({ color: flameColour, alpha: flameAlpha });
+      }
+
+      // ── Invuln shimmer — pulsing ring when spawn protection is active ──────
+      // Disappears automatically when the invuln flag clears (issue 03 AC).
+      if (ship.alive && ship.invuln) {
+        const shimmerAlpha = 0.3 + Math.sin(frame.tick * 0.3) * 0.25;
+        this.entityGraphics
+          .circle(sp.x, sp.y, size * 2.4)
+          .stroke({ width: 2.5, color: PALETTE.shipInvulnRing, alpha: Math.max(0.05, shimmerAlpha) });
+        this.entityGraphics
+          .circle(sp.x, sp.y, size * 1.6)
+          .fill({ color: PALETTE.shipInvulnFill, alpha: 0.1 });
+      }
+
+      // ── Ship body — team-coloured triangle oriented by heading ─────────────
       this.entityGraphics
         .poly([tip.x, tip.y, left.x, left.y, right.x, right.y])
-        .fill({ color, alpha: ship.alive ? 0.9 : 0.4 })
+        .fill({ color: colour, alpha })
         .stroke({ width: 1, color: PALETTE.shipHeading, alpha: 0.6 });
 
-      // Relic carry indicator: small dot above ship
+      if (ship.alive) {
+        // ── Hull bar (green) ────────────────────────────────────────────────
+        const barW = 20;
+        const barH = 3;
+        const barX = sp.x - barW / 2;
+        const hullBarY = sp.y + size * 2;
+
+        this.entityGraphics
+          .rect(barX, hullBarY, barW, barH)
+          .fill({ color: PALETTE.hullBarBg, alpha: 0.7 });
+        const hf = barFillRatio(ship.hull.cur, ship.hull.max);
+        if (hf > 0) {
+          this.entityGraphics
+            .rect(barX, hullBarY, barW * hf, barH)
+            .fill({ color: PALETTE.hullBarFill, alpha: 0.85 });
+        }
+
+        // ── Shield bar (blue) — one pixel below hull bar ────────────────────
+        const shieldBarY = hullBarY + barH + 1;
+        this.entityGraphics
+          .rect(barX, shieldBarY, barW, barH)
+          .fill({ color: PALETTE.shieldBarBg, alpha: 0.7 });
+        const sf = barFillRatio(ship.shield.cur, ship.shield.max);
+        if (sf > 0) {
+          this.entityGraphics
+            .rect(barX, shieldBarY, barW * sf, barH)
+            .fill({ color: PALETTE.shieldBarFill, alpha: 0.85 });
+        }
+
+        // ── Name label — team colour, centered above ship ───────────────────
+        const colourStr = `#${colour.toString(16).padStart(6, "0")}`;
+        const label = new Text({
+          text: ship.id,
+          style: {
+            fontFamily: "monospace",
+            fontSize: 10,
+            fill: colourStr,
+          },
+        });
+        label.anchor.set(0.5, 1);
+        label.x = sp.x;
+        label.y = sp.y - size * 2.5;
+        this.labelContainer.addChild(label);
+      }
+
+      // ── Relic carry indicator — small dot above ship ───────────────────────
       if (ship.relicsCarried > 0) {
         this.entityGraphics
           .circle(sp.x, sp.y - 12, 3)
