@@ -5,14 +5,158 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Shatterbelt Salvagers — Admin</title>
     <style>
-      body { background: #0a0818; color: #ccc; font-family: monospace; padding: 2rem; }
-      h1 { color: #9b8fef; margin-bottom: 1rem; }
-      p  { color: #666; }
+      /* ── Reset & base ─────────────────────────────────────── */
+      *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+      body {
+        background: #0a0818;
+        color: #ccc;
+        font-family: "Courier New", Courier, monospace;
+        font-size: 14px;
+        min-height: 100vh;
+        padding: 0;
+      }
+
+      /* ── Header ───────────────────────────────────────────── */
+      header {
+        background: #110d2a;
+        border-bottom: 1px solid #2a2050;
+        padding: 0.75rem 1.5rem;
+        display: flex;
+        align-items: center;
+        gap: 1rem;
+      }
+      header h1 { color: #9b8fef; font-size: 1.1rem; letter-spacing: 0.05em; }
+
+      /* ── App container ────────────────────────────────────── */
+      #app { padding: 1.5rem; }
+
+      /* ── Nav bar (dashboard) ──────────────────────────────── */
+      .admin-nav {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        background: #110d2a;
+        border: 1px solid #2a2050;
+        border-radius: 4px;
+        padding: 0.5rem 1rem;
+        margin-bottom: 1.5rem;
+      }
+      .nav-title { color: #9b8fef; font-weight: bold; font-size: 1rem; }
+
+      /* ── Sign-in card ─────────────────────────────────────── */
+      .signin-card {
+        max-width: 380px;
+        margin: 4rem auto;
+        background: #110d2a;
+        border: 1px solid #2a2050;
+        border-radius: 6px;
+        padding: 2rem;
+      }
+      .signin-card h2 { color: #9b8fef; margin-bottom: 1.25rem; font-size: 1rem; }
+
+      #signin-form {
+        display: flex;
+        flex-direction: column;
+        gap: 0.75rem;
+      }
+      #signin-form label { color: #888; font-size: 0.85rem; }
+
+      /* ── Inputs & buttons ─────────────────────────────────── */
+      input[type="password"],
+      input[type="text"] {
+        width: 100%;
+        background: #0a0818;
+        border: 1px solid #3a3060;
+        border-radius: 3px;
+        color: #eee;
+        font-family: inherit;
+        font-size: 0.95rem;
+        padding: 0.45rem 0.6rem;
+        outline: none;
+      }
+      input:focus { border-color: #9b8fef; }
+
+      button {
+        background: #2a1f6a;
+        border: 1px solid #4a3a9a;
+        border-radius: 3px;
+        color: #ccc;
+        cursor: pointer;
+        font-family: inherit;
+        font-size: 0.85rem;
+        padding: 0.4rem 0.9rem;
+        transition: background 0.15s;
+      }
+      button:hover:not(:disabled) { background: #3a2f8a; }
+      button:disabled { opacity: 0.5; cursor: not-allowed; }
+      .btn-secondary { background: #1a1535; border-color: #2a2050; }
+      .btn-secondary:hover:not(:disabled) { background: #221c45; }
+
+      /* ── Error message ────────────────────────────────────── */
+      .error { color: #f66; margin-top: 0.75rem; font-size: 0.85rem; }
+
+      /* ── Panel sections ───────────────────────────────────── */
+      .panel {
+        background: #110d2a;
+        border: 1px solid #2a2050;
+        border-radius: 4px;
+        padding: 1rem 1.25rem;
+        margin-bottom: 1.25rem;
+      }
+      .panel h2 { color: #9b8fef; font-size: 0.95rem; margin-bottom: 0.75rem; }
+
+      /* ── Status line ──────────────────────────────────────── */
+      .status-line { color: #666; font-size: 0.82rem; margin-bottom: 0.75rem; }
+
+      /* ── Bots table ───────────────────────────────────────── */
+      .table-wrap { overflow-x: auto; }
+
+      table {
+        border-collapse: collapse;
+        width: 100%;
+        font-size: 0.82rem;
+      }
+      thead tr { border-bottom: 1px solid #2a2050; }
+      th {
+        color: #7a6fcf;
+        font-weight: normal;
+        padding: 0.35rem 0.6rem;
+        text-align: left;
+        white-space: nowrap;
+      }
+      td { padding: 0.3rem 0.6rem; border-bottom: 1px solid #18133a; }
+
+      tr.row-offline td { color: #555; }
+
+      .connected { color: #5f9; }
+      .offline    { color: #966; }
+
+      .col-skipped,
+      .col-crashes { text-align: right; }
+
+      .log-pre {
+        background: #08060f;
+        border: 1px solid #1e1838;
+        border-radius: 2px;
+        color: #777;
+        font-family: inherit;
+        font-size: 0.75rem;
+        max-height: 80px;
+        max-width: 280px;
+        overflow: auto;
+        padding: 0.25rem 0.4rem;
+        white-space: pre-wrap;
+        word-break: break-all;
+      }
+      .no-logs { color: #444; font-style: italic; }
     </style>
   </head>
   <body>
-    <h1>⬡ Arena Admin</h1>
-    <p>Admin console — issue 08. Not yet implemented.</p>
+    <header>
+      <h1>⬡ Arena Admin</h1>
+    </header>
+    <div id="app"></div>
     <script type="module" src="/src/admin/main.ts"></script>
   </body>
 </html>
