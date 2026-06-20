@@ -22,6 +22,7 @@
 //!   field to [`AppState`] and gate Admin-only routes on it.  `GET /recordings`
 //!   and `POST /recordings/{id}/replay` are already available as seams.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -34,6 +35,7 @@ use axum::{
 };
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
+use tower_http::services::{ServeDir, ServeFile};
 
 use arena_engine::Params;
 
@@ -620,3 +622,75 @@ pub fn build_router_config(config: RouterConfig) -> Router {
         .with_state(state)
 }
 
+// ── Top-level app builder (binary + integration tests) ────────────────────────
+
+/// Convenience redirect handler: `GET /admin` → `/admin.html`.
+async fn redirect_to_admin_html() -> impl IntoResponse {
+    axum::response::Redirect::permanent("/admin.html")
+}
+
+/// Build the complete axum [`Router`] — API routes + optional static asset
+/// serving — for use by both the binary (`main.rs`) and integration tests.
+///
+/// ## Parameters
+///
+/// - `event_password` — pre-shared password for `POST /register`.
+/// - `facilitator_password` — pre-shared password for admin endpoints.
+/// - `static_dir` — when `Some` and the directory exists, serve the frontend
+///   `dist/` directory here.  Any unmatched path falls back to `index.html`
+///   (SPA catch-all).  When the directory is absent or `None`, API routes are
+///   still served normally; a warning is printed when a path was given but
+///   the directory does not exist.
+///
+/// ## Route precedence
+///
+/// All API routes registered by [`build_router_config`] are explicit routes
+/// and win over the static-file fallback service in axum's routing — an
+/// unmatched path only reaches [`ServeDir`] after every explicit route fails.
+pub fn build_app(
+    event_password: String,
+    facilitator_password: String,
+    static_dir: Option<PathBuf>,
+) -> Router {
+    let api_router = build_router_config(RouterConfig {
+        event_password,
+        facilitator_password,
+        registry: TokenRegistry::new(),
+        wasm_store: WasmBotStore::new(),
+        ws_registry: WsConnectionRegistry::new(),
+        tick_deadline: Duration::from_millis(33),
+        match_seed: 42,
+        match_params: Params::default(),
+        observer_hub: ObserverHub::new(),
+        recording_store: RecordingStore::new(),
+        health_store: BotHealthStore::new(),
+        dq_store: DqStore::new(),
+        ladder: Ladder::new(),
+        disabled_store: DisabledStore::new(),
+        default_bot_store: DefaultBotStore::new(),
+        ladder_runner: LadderRunner::new(),
+    });
+
+    match static_dir {
+        Some(dir) if dir.exists() => {
+            let index_html = dir.join("index.html");
+            api_router
+                // Convenience: /admin redirects to /admin.html (Admin UI).
+                .route("/admin", get(redirect_to_admin_html))
+                // Static assets + SPA fallback.  Explicit API routes above take
+                // precedence; only unmatched paths reach ServeDir.
+                .fallback_service(
+                    ServeDir::new(&dir).fallback(ServeFile::new(index_html)),
+                )
+        }
+        Some(dir) => {
+            eprintln!(
+                "[arena-server] WARNING: ARENA_STATIC_DIR {:?} does not exist — \
+                 serving API only (no frontend assets)",
+                dir
+            );
+            api_router
+        }
+        None => api_router,
+    }
+}
