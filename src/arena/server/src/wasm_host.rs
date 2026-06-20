@@ -198,6 +198,17 @@ impl WasmBotDriver {
             .set_fuel(fuel_per_tick.saturating_mul(100))
             .map_err(|e| anyhow!("fuel unavailable (engine not configured with consume_fuel): {e}"))?;
 
+        // WASI "reactor" modules (e.g. TinyGo) export `_initialize`, which runs
+        // package/runtime initialization (heap, GC, global vars). The host must
+        // call it once after instantiation, before any other export, or those
+        // exports trap on uninitialized state. Modules without it (Rust cdylib,
+        // AssemblyScript) simply skip this step.
+        if let Ok(initialize_fn) = instance.get_typed_func::<(), ()>(&mut store, "_initialize") {
+            initialize_fn
+                .call(&mut store, ())
+                .map_err(|e| anyhow!("_initialize trapped: {e}"))?;
+        }
+
         let obs_bytes = tick0_obs_json.as_bytes();
         let obs_len = i32::try_from(obs_bytes.len())
             .map_err(|e| anyhow!("tick-0 JSON too large for i32: {e}"))?;

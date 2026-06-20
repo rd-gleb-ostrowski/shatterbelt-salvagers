@@ -94,6 +94,28 @@ const START_SECTION_WAT: &str = r#"
 )
 "#;
 
+/// A WASI "reactor" bot: runtime/global setup runs in `_initialize`, which the
+/// host must call after instantiation. Here `_initialize` flips a `$ready` flag;
+/// `alloc` traps (`unreachable`) until it has been set — the shape TinyGo emits.
+const REACTOR_WAT: &str = r#"
+(module
+  (memory (export "memory") 1)
+  (global $ready (mut i32) (i32.const 0))
+  (data (i32.const 256) "{\"thrust\":1.0}")
+  (func (export "_initialize") (global.set $ready (i32.const 1)))
+  (func (export "alloc") (param $len i32) (result i32)
+    (if (i32.eqz (global.get $ready)) (then unreachable))
+    i32.const 512)
+  (func (export "init") (param $ptr i32) (param $len i32))
+  (func (export "tick") (param $ptr i32) (param $len i32) (result i64)
+    i64.const 256
+    i64.const 32
+    i64.shl
+    i64.const 14
+    i64.or)
+)
+"#;
+
 /// A bot that calls `log` during `init` with the string `"init_called"` (11 bytes)
 /// and during `tick` with `"tick_called"` (11 bytes), so both can be observed.
 const LOG_BOT_WAT: &str = r#"
@@ -229,6 +251,34 @@ fn module_with_start_section_instantiates_and_acts() {
     let intent = driver
         .decide(0, &obs)
         .expect("start-section bot must return Some");
+    assert_eq!(intent.thrust, Some(1.0), "thrust must be 1.0");
+}
+
+// ── Test: a WASI reactor module gets `_initialize` called ────────────────────
+//
+// TinyGo (and other WASI reactors) run runtime/global setup in `_initialize`,
+// which the host must call after instantiation before any other export. Here
+// `alloc` traps until `_initialize` has run, so a successful warm-up proves the
+// host calls it.
+//
+// Observable: `WasmBotDriver::new` succeeds and the bot then acts.
+
+#[test]
+fn reactor_module_gets_initialize_called() {
+    let wasm = wat_to_wasm(REACTOR_WAT);
+    let params = test_params(10);
+    let obs_json = tick0_obs_json("ship-0", &params);
+
+    let mut driver = WasmBotDriver::new(&wasm, &obs_json, 1_000_000)
+        .expect("WasmBotDriver::new must call _initialize so alloc does not trap");
+
+    let specs = two_ships(&params);
+    let engine = arena_engine::Engine::new(42, params, specs);
+    let obs = engine.observation(&"ship-0".to_owned()).unwrap();
+
+    let intent = driver
+        .decide(0, &obs)
+        .expect("reactor bot must return Some");
     assert_eq!(intent.thrust, Some(1.0), "thrust must be 1.0");
 }
 
