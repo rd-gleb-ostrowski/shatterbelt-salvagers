@@ -59,7 +59,7 @@ async function main(): Promise<void> {
 
   const ws = new WebSocket(WS);
 
-  // Resolve when the match ends so the process can exit.
+  // Resolve when server disconnects
   await new Promise<void>((resolve, reject) => {
     let sessionId = "";
     ws.onerror = () => reject(new Error("websocket error"));
@@ -84,8 +84,10 @@ async function main(): Promise<void> {
           break;
         case "matchEnd":
           console.log(`[bot] matchEnd: ${JSON.stringify(msg.results)}`);
-          ws.close();
-          resolve();
+          break;
+        case "matchStart":
+          console.log(`[bot] matchStart`);
+          // New match, reset internal, match-specific state.
           break;
         // matchStart and anything else need no reply.
       }
