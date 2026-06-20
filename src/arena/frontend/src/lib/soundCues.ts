@@ -1,24 +1,18 @@
 /**
- * soundCues — pure, framework-free frame-delta → SoundCue[] mapping.
+ * soundCues — pure, framework-free event-driven → SoundCue[] mapping.
  *
- * REALITY NOTE: The server's god-view stream (GodViewFrameJson in observer.rs)
- * does NOT contain an `events` array — the same gap noted in issues 01 and 04.
- * All sound cues are therefore DERIVED from frame-to-frame state deltas. This
- * is a pure, fully unit-testable function: given two consecutive frames it
- * emits the sound cues that should play this tick.
+ * The god-view frame's authoritative `events` array is the SOLE source of
+ * truth for one-shot sound cues. Thrust is derived from the authoritative
+ * ship STATE (per-ship `isThrusting` — this is live position data, not a
+ * delta). Match lifecycle cues are derived from authoritative frame METADATA
+ * (tick / maxTicks).
  *
- * Seam for issue 07 (replay): replay drives `deriveSoundCues` from recorded
- * frames on every step — the same function, no changes required.
- *
- * Seam for a future server events channel: if the server ever adds an `events`
- * array to the god-view frame, this module can be replaced or augmented
- * without touching the audio layer.
+ * NO state-delta reconstruction anywhere: this function takes ONE frame only.
  *
  * Pure function — no side effects, no global state; fully unit-testable.
  */
 
 import type { GodViewFrame } from "./frameParser.ts";
-import { detectExplosions } from "./explosionDetector.ts";
 import { isThrusting } from "./shipPresentation.ts";
 import type { Vec2 } from "./frameParser.ts";
 
@@ -27,14 +21,15 @@ import type { Vec2 } from "./frameParser.ts";
 /**
  * The kinds of sound events the Viewer can trigger.
  *
- * - explosion       — a ship was destroyed this tick
- * - cannon          — a rune-cannon bolt was just fired
- * - sigilDischarge  — a ship discharged its Sigil (spent the ability)
- * - relicPickup     — a ship collected a Relic
- * - relicBank       — a ship banked Relics at its Anchor (scoring)
+ * - explosion       — a ship was destroyed (from `died`) or mine detonated
+ * - cannon          — a rune-cannon bolt was just fired (`cannonFired`)
+ * - sigilDischarge  — a ship discharged its Sigil (`sigilDischarged`)
+ * - relicPickup     — a ship collected a Relic (`relicTaken`)
+ * - relicBank       — a ship banked Relics at its Anchor (`relicBanked`)
+ * - lanceZap        — Arc Lance beam hit (`lanceTookHull`)
  * - thrust          — a ship is currently thrusting (drives continuous hum)
- * - matchStart      — the match just started (tick 0 first seen)
- * - matchEnd        — the match just ended (tick reached maxTicks)
+ * - matchStart      — tick === 0 (authoritative frame metadata)
+ * - matchEnd        — tick >= maxTicks (authoritative frame metadata)
  */
 export type SoundCueKind =
   | "explosion"
@@ -42,6 +37,7 @@ export type SoundCueKind =
   | "sigilDischarge"
   | "relicPickup"
   | "relicBank"
+  | "lanceZap"
   | "thrust"
   | "matchStart"
   | "matchEnd";
@@ -64,133 +60,96 @@ export interface SoundCue {
 // ── deriveSoundCues ───────────────────────────────────────────────────────────
 
 /**
- * Derive the set of sound cues that should play when the viewer advances from
- * `prevFrame` to `currFrame`.
+ * Derive the set of sound cues that should play for the given god-view frame.
  *
- * Pass `null` for `prevFrame` on the very first frame received.
+ * Mapping rules:
  *
- * Delta rules documented inline:
+ * MATCH LIFECYCLE (authoritative frame metadata — not delta):
+ *   matchStart  — `frame.tick === 0`
+ *   matchEnd    — `frame.tick >= frame.maxTicks`
  *
- * EXPLOSION
- *   Reuses `detectExplosions(prev.ships, curr.ships)` — one cue per ship that
- *   transitioned alive→dead or alive→absent.
+ * EVENT-DRIVEN CUES (from `frame.events`):
+ *   cannonFired       → cannon cue; pos from subject ship in frame.ships
+ *   died              → explosion cue; pos from subject ship in frame.ships
+ *   mineDetonated     → explosion cue; pos from event payload
+ *   sigilDischarged   → sigilDischarge cue; sigil = ev.which
+ *   relicTaken        → relicPickup cue
+ *   relicBanked       → relicBank cue
+ *   lanceTookHull     → lanceZap cue; pos from subject (hit) ship
  *
- * CANNON FIRE
- *   A ship's `cannonCooldown` went from exactly 0 in `prev` to > 0 in `curr`
- *   while the ship is still alive in `curr`. The cooldown starts at 0 when the
- *   rune-cannon is ready; firing sets it to the reload duration and it counts
- *   down. The 0→positive transition is the only reliable "just fired" signal.
+ * CONTINUOUS STATE (authoritative ship state — not a delta):
+ *   thrust — `isThrusting(ship)` per alive ship each frame (drives hum loop)
  *
- * SIGIL DISCHARGE
- *   A ship's `sigil` was non-null in `prev` and is null in `curr`, AND the ship
- *   is still alive in `curr`. A ship that died while holding a Sigil drops it
- *   silently (no discharge cue).
- *
- * RELIC PICKUP
- *   A ship's `relicsCarried` increased between frames.
- *
- * RELIC BANK
- *   A ship's `relicsCarried` decreased (or reached 0) AND the ship's score in
- *   `scores` increased in the same tick. The dual condition distinguishes a
- *   deliberate bank at the Anchor from relics dropped on death.
- *
- * THRUST
- *   Reuses `isThrusting(ship)` from shipPresentation for each alive ship in
- *   `currFrame`. Emitting a cue every tick lets the audio layer manage a
- *   continuous hum loop (start on first cue, silence when absent).
- *
- * MATCH START
- *   `curr.tick === 0` AND (`prevFrame` is null OR `prev.tick !== 0`). Fires
- *   exactly once at the beginning of each match even if tick-0 frames repeat.
- *
- * MATCH END
- *   `curr.tick >= curr.maxTicks` AND (`prevFrame` is null OR
- *   `prev.tick < curr.maxTicks`). Fires exactly once when the match crosses the
- *   final tick, preventing repeat stingers if extra frames arrive at maxTicks.
- *
- * @param prevFrame  Previous god-view frame, or `null` for the first frame.
- * @param currFrame  Current god-view frame.
- * @returns          Array of `SoundCue`s (empty if nothing notable happened).
+ * @param frame  Current god-view frame (single frame — no previous frame needed).
+ * @returns      Array of `SoundCue`s (empty if nothing notable this tick).
  *
  * Pure function — deterministic, no I/O, no mutation of inputs.
  */
-export function deriveSoundCues(
-  prevFrame: GodViewFrame | null,
-  currFrame: GodViewFrame,
-): SoundCue[] {
+export function deriveSoundCues(frame: GodViewFrame): SoundCue[] {
   const cues: SoundCue[] = [];
 
-  // ── Match lifecycle stingers ──────────────────────────────────────────────
+  // ── Match lifecycle (authoritative frame metadata) ─────────────────────────
 
-  // MATCH START: first time we observe tick 0 in this match
-  if (
-    currFrame.tick === 0 &&
-    (prevFrame === null || prevFrame.tick !== 0)
-  ) {
+  if (frame.tick === 0) {
     cues.push({ kind: "matchStart" });
   }
-
-  // MATCH END: tick just crossed maxTicks
-  if (
-    currFrame.tick >= currFrame.maxTicks &&
-    (prevFrame === null || prevFrame.tick < currFrame.maxTicks)
-  ) {
+  if (frame.tick >= frame.maxTicks) {
     cues.push({ kind: "matchEnd" });
   }
 
-  // ── Per-ship deltas (require prevFrame) ──────────────────────────────────
+  // ── Event-driven one-shot cues ─────────────────────────────────────────────
 
-  if (prevFrame !== null) {
-    // Build lookup maps for efficient O(1) access
-    const prevShipById = new Map(prevFrame.ships.map((s) => [s.id, s]));
-    const prevScores = prevFrame.scores;
-    const currScores = currFrame.scores;
+  const shipById = new Map(frame.ships.map((s) => [s.id, s]));
 
-    // EXPLOSIONS: reuse detectExplosions for the alive→dead/absent delta
-    const explosions = detectExplosions(prevFrame.ships, currFrame.ships);
-    for (const e of explosions) {
-      cues.push({ kind: "explosion", shipId: e.shipId, pos: e.pos });
-    }
-
-    for (const curr of currFrame.ships) {
-      const prev = prevShipById.get(curr.id);
-      if (prev === undefined) continue; // new ship — no prev state to diff
-
-      // CANNON FIRE: cannonCooldown was 0 (ready), now > 0 (just fired).
-      // Only on ships alive in curr so we don't double-up with explosion.
-      if (curr.alive && prev.cannonCooldown === 0 && curr.cannonCooldown > 0) {
-        cues.push({ kind: "cannon", shipId: curr.id, pos: curr.pos });
+  for (const ev of frame.events) {
+    switch (ev.event) {
+      case "cannonFired": {
+        const ship = shipById.get(ev.ship);
+        cues.push({ kind: "cannon", shipId: ev.ship, pos: ship?.pos });
+        break;
       }
-
-      // SIGIL DISCHARGE: sigil present in prev, absent in curr, ship alive.
-      if (curr.alive && prev.sigil !== null && curr.sigil === null) {
+      case "died": {
+        const ship = shipById.get(ev.ship);
+        cues.push({ kind: "explosion", shipId: ev.ship, pos: ship?.pos });
+        break;
+      }
+      case "mineDetonated": {
+        cues.push({ kind: "explosion", pos: ev.pos });
+        break;
+      }
+      case "sigilDischarged": {
+        const ship = shipById.get(ev.ship);
         cues.push({
           kind: "sigilDischarge",
-          shipId: curr.id,
-          pos: curr.pos,
-          sigil: prev.sigil,
+          shipId: ev.ship,
+          pos: ship?.pos,
+          sigil: ev.which,
         });
+        break;
       }
-
-      // RELIC PICKUP: relicsCarried increased
-      if (curr.relicsCarried > prev.relicsCarried) {
-        cues.push({ kind: "relicPickup", shipId: curr.id, pos: curr.pos });
+      case "relicTaken": {
+        const ship = shipById.get(ev.ship);
+        cues.push({ kind: "relicPickup", shipId: ev.ship, pos: ship?.pos });
+        break;
       }
-
-      // RELIC BANK: relicsCarried decreased AND score increased.
-      // Distinguishes deliberate banking from relics dropped on death.
-      if (
-        curr.relicsCarried < prev.relicsCarried &&
-        (currScores[curr.id] ?? 0) > (prevScores[curr.id] ?? 0)
-      ) {
-        cues.push({ kind: "relicBank", shipId: curr.id, pos: curr.pos });
+      case "relicBanked": {
+        const ship = shipById.get(ev.ship);
+        cues.push({ kind: "relicBank", shipId: ev.ship, pos: ship?.pos });
+        break;
       }
+      case "lanceTookHull": {
+        const ship = shipById.get(ev.ship);
+        cues.push({ kind: "lanceZap", shipId: ev.ship, pos: ship?.pos });
+        break;
+      }
+      default:
+        break;
     }
   }
 
-  // ── THRUST: per-alive-ship in currFrame (works with or without prevFrame) ─
+  // ── THRUST: per-alive-ship authoritative state (drives continuous hum) ──────
 
-  for (const ship of currFrame.ships) {
+  for (const ship of frame.ships) {
     if (ship.alive && isThrusting(ship)) {
       cues.push({ kind: "thrust", shipId: ship.id, pos: ship.pos });
     }

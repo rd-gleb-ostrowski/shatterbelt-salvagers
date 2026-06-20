@@ -32,7 +32,7 @@
  * NOT UNIT-TESTED (per PRD): this module creates Web Audio nodes which are
  * browser-only. Rely on manual/audible verification in a live match.
  *
- * Seam for issue 07 (replay): replay calls `engine.playCues(deriveSoundCues(prev, curr))`
+ * Seam for issue 07 (replay): replay calls `engine.playCues(deriveSoundCues(frame))`
  * on each step at whatever playback speed — the same interface as the live path.
  */
 
@@ -95,7 +95,7 @@ export class SoundEngine {
 
   /**
    * Process a batch of cues for this tick. Call once per rendered frame with
-   * the output of `deriveSoundCues(prevFrame, currFrame)`.
+   * the output of `deriveSoundCues(frame)`.
    *
    * Silently no-ops if the AudioContext has not been unlocked yet.
    */
@@ -121,6 +121,9 @@ export class SoundEngine {
           break;
         case "relicBank":
           this.playRelicBank(cue.pos?.x);
+          break;
+        case "lanceZap":
+          this.playLanceZap(cue.pos?.x);
           break;
         case "thrust":
           if (cue.shipId) thrustingNow.add(cue.shipId);
@@ -300,8 +303,7 @@ export class SoundEngine {
   }
 
   /** Ascending arpeggio chime on Relic bank (score). */
-  private playRelicBank(worldX?: number): void {
-    const ctx = this.ctx!;
+  private playRelicBank(worldX?: number): void {    const ctx = this.ctx!;
     const panner = makePanner(ctx, this.pan(worldX));
 
     // Three-note ascending arpeggio
@@ -319,6 +321,25 @@ export class SoundEngine {
       osc.start(t);
       osc.stop(t + 0.2);
     });
+  }
+
+  /** Sharp electrical sizzle for Arc Lance beam hit. */
+  private playLanceZap(worldX?: number): void {
+    const ctx = this.ctx!;
+    const t = ctx.currentTime;
+    const panner = makePanner(ctx, this.pan(worldX));
+
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.type = "sawtooth";
+    osc.frequency.setValueAtTime(2200, t);
+    osc.frequency.exponentialRampToValueAtTime(600, t + 0.06);
+    gain.gain.setValueAtTime(0.3, t);
+    gain.gain.exponentialRampToValueAtTime(0.001, t + 0.08);
+    osc.connect(gain);
+    connect(gain, panner, ctx);
+    osc.start(t);
+    osc.stop(t + 0.1);
   }
 
   /**

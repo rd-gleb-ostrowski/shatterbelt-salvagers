@@ -249,8 +249,7 @@ async function init(): Promise<void> {
   const client = new ObserverClient({
     url: wsUrl,
     onFrame(frame) {
-      // Derive and play sound cues BEFORE advancing lastFrame
-      const cues = deriveSoundCues(lastFrame, frame);
+      const cues = deriveSoundCues(frame);
       sound.playCues(cues);
 
       lastFrame = frame;
@@ -311,14 +310,12 @@ function wireReplayPanel(
   // ── State ─────────────────────────────────────────────────────────────────
   let inReplayMode = false;
   let isScrubbing = false;
-  let prevReplayFrame: GodViewFrame | null = null;
 
   // ── ReplayPlayer ──────────────────────────────────────────────────────────
   const player = new ReplayPlayer({
     onFrame(frame) {
-      const cues = deriveSoundCues(prevReplayFrame, frame);
+      const cues = deriveSoundCues(frame);
       sound.playCues(cues);
-      prevReplayFrame = frame;
       renderer.renderFrame(frame);
       hud.update(frame);
     },
@@ -386,7 +383,6 @@ function wireReplayPanel(
     timeline.disabled = true;
     timeline.value = "0";
     tickLabel.textContent = "tick —/—";
-    prevReplayFrame = null;
 
     // Switch to replay mode: pause the live stream
     if (!inReplayMode) {
@@ -435,7 +431,6 @@ function wireReplayPanel(
   // ── Return to live ────────────────────────────────────────────────────────
   liveBtn.addEventListener("click", () => {
     player.stop();
-    prevReplayFrame = null;
     playPauseBtn.disabled = true;
     playPauseBtn.textContent = "Play";
     timeline.disabled = true;

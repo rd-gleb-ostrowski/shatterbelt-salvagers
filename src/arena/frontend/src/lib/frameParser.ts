@@ -9,6 +9,35 @@
  * the live WS client and the replay loader both call `parseGodViewFrame`.
  */
 
+// ── God-view event types (new authoritative event stream) ─────────────────────
+
+/**
+ * Discriminated union of all god-view frame events.
+ * Each entry carries `ship` (the SUBJECT ship id) + `event` (camelCase tag)
+ * + any payload fields defined in the server protocol.
+ */
+export type GodEvent =
+  | { ship: string; event: "tookShield"; amount: number; by: string }
+  | { ship: string; event: "tookHull"; amount: number; by: string }
+  | { ship: string; event: "shieldDown" }
+  | { ship: string; event: "lanceTookHull"; amount: number; by: string }
+  | { ship: string; event: "collisionTookShield"; amount: number }
+  | { ship: string; event: "collisionTookHull"; amount: number }
+  | { ship: string; event: "relicDropped"; relicId: string; pos: Vec2 }
+  | { ship: string; event: "relicTaken" }
+  | { ship: string; event: "relicBanked"; value: number }
+  | { ship: string; event: "cannonFired" }
+  | { ship: string; event: "sigilGranted"; which: string }
+  | { ship: string; event: "sigilDischarged"; which: string }
+  | { ship: string; event: "afterburnerExpired" }
+  | { ship: string; event: "bulwarkExpired" }
+  | { ship: string; event: "singularityDeployed"; id: string; pos: Vec2 }
+  | { ship: string; event: "mineDeployed"; id: string; pos: Vec2 }
+  | { ship: string; event: "mineDetonated"; mineId: string; pos: Vec2 }
+  | { ship: string; event: "killedShip"; victim: string }
+  | { ship: string; event: "died"; by: string | null }
+  | { ship: string; event: "respawned" };
+
 // ── Domain value types (mirror the server's camelCase JSON) ──────────────────
 
 export interface Vec2 {
@@ -101,6 +130,8 @@ export interface GodViewFrame {
   singularities: SingularityView[];
   mines: MineView[];
   scores: Record<string, number>;
+  /** Authoritative event log for this tick. Empty array if no events occurred. */
+  events: GodEvent[];
 }
 
 // ── Parser helpers ────────────────────────────────────────────────────────────
@@ -250,6 +281,70 @@ function parseScores(raw: unknown): Record<string, number> | null {
   return result;
 }
 
+/**
+ * Parse a single god-view event entry.
+ * Returns `null` for unknown or malformed entries — callers skip nulls rather
+ * than rejecting the whole frame.
+ */
+function parseGodEvent(v: unknown): GodEvent | null {
+  if (!isObject(v)) return null;
+  if (typeof v.ship !== "string") return null;
+  if (typeof v.event !== "string") return null;
+  const ship = v.ship;
+
+  switch (v.event) {
+    case "tookShield":
+    case "tookHull":
+      if (typeof v.amount !== "number" || typeof v.by !== "string") return null;
+      return { ship, event: v.event, amount: v.amount, by: v.by };
+    case "lanceTookHull":
+      if (typeof v.amount !== "number" || typeof v.by !== "string") return null;
+      return { ship, event: "lanceTookHull", amount: v.amount, by: v.by };
+    case "shieldDown":
+    case "relicTaken":
+    case "cannonFired":
+    case "afterburnerExpired":
+    case "bulwarkExpired":
+    case "respawned":
+      return { ship, event: v.event };
+    case "collisionTookShield":
+    case "collisionTookHull":
+      if (typeof v.amount !== "number") return null;
+      return { ship, event: v.event, amount: v.amount };
+    case "relicDropped": {
+      const pos = parseVec2(v.pos);
+      if (typeof v.relicId !== "string" || !pos) return null;
+      return { ship, event: "relicDropped", relicId: v.relicId, pos };
+    }
+    case "relicBanked":
+      if (typeof v.value !== "number") return null;
+      return { ship, event: "relicBanked", value: v.value };
+    case "sigilGranted":
+    case "sigilDischarged":
+      if (typeof v.which !== "string") return null;
+      return { ship, event: v.event, which: v.which };
+    case "singularityDeployed":
+    case "mineDeployed": {
+      const pos = parseVec2(v.pos);
+      if (typeof v.id !== "string" || !pos) return null;
+      return { ship, event: v.event, id: v.id, pos };
+    }
+    case "mineDetonated": {
+      const pos = parseVec2(v.pos);
+      if (typeof v.mineId !== "string" || !pos) return null;
+      return { ship, event: "mineDetonated", mineId: v.mineId, pos };
+    }
+    case "killedShip":
+      if (typeof v.victim !== "string") return null;
+      return { ship, event: "killedShip", victim: v.victim };
+    case "died":
+      if (v.by !== null && typeof v.by !== "string") return null;
+      return { ship, event: "died", by: v.by as string | null };
+    default:
+      return null; // Unknown tag — skip gracefully
+  }
+}
+
 // ── Public API ────────────────────────────────────────────────────────────────
 
 /**
@@ -296,6 +391,15 @@ export function parseGodViewFrame(raw: unknown): GodViewFrame | null {
   const scores = parseScores(raw.scores);
   if (!scores) return null;
 
+  // Events: missing → empty array; malformed entries → skipped (lenient)
+  const events: GodEvent[] = [];
+  if (Array.isArray(raw.events)) {
+    for (const item of raw.events) {
+      const ev = parseGodEvent(item);
+      if (ev !== null) events.push(ev);
+    }
+  }
+
   return {
     type: "godView",
     tick: raw.tick,
@@ -310,5 +414,6 @@ export function parseGodViewFrame(raw: unknown): GodViewFrame | null {
     singularities,
     mines,
     scores,
+    events,
   };
 }

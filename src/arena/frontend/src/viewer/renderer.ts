@@ -3,7 +3,8 @@
  *
  * Renders: Drift bounds, asteroids, ships (with heading indicator),
  * relics (glowing), Anchors (team home beacons), rune-cannon projectiles,
- * singularity gravity wells, deployed Aether Mines, and transient explosions.
+ * singularity gravity wells, deployed Aether Mines, transient explosions,
+ * and Arc Lance beams.
  *
  * Design:
  * - All entity graphics are drawn to a single Graphics object per tick
@@ -13,40 +14,27 @@
  * - Layer order (bottom → top):
  *     driftGraphics  — arena border
  *     glowGraphics   — additive glow halos (relics, anchors, singularities,
- *                      explosion blooms)
+ *                      explosion blooms, arc lance glow)
  *     entityGraphics — solid game entities
- *     effectsGraphics — transient effects (explosions) rendered above entities
+ *     effectsGraphics — transient effects (explosions, arc lance beams) above entities
  *     labelContainer — ship name labels always on top
  *
- * KNOWN LIMITATION — Arc Lance beams (issue 04 seam):
- *   Arc Lance is emitted by the engine as an event (a one-shot discharge),
- *   not as a persistent entity.  The god-view frame contains only STATE arrays
- *   (singularities, mines, projectiles); it does NOT include an `events` field.
- *   Therefore Arc Lance beams CANNOT be drawn from god-view state in v1.
- *   The `effectsGraphics` layer is the correct place to render them if/when
- *   the server adds Arc Lance to the god-view event stream.
- *   See also: PROTOCOL.md / observer.rs — the same gap noted in issues 01 + 06.
- *
- * Seams for future issues:
- *   05  — add HUD overlay (scoreboard, tick timer); read camera.followTarget
- *   06  — sound module reuses `detectExplosions` return value from renderFrame
- *         to trigger explosion/sigil SFX without duplicating delta detection
- *   07  — replay loader feeds the same `renderFrame` callback from recorded
- *         frames; the effectsModel and explosionDetector advance naturally
+ * Effects are now spawned directly from `frame.events` (authoritative god-view
+ * event stream). Arc Lance beams are rendered from `lanceTookHull` events —
+ * the issue-04 "Arc Lance unrenderable" limitation is resolved.
  */
 
 import { Application, Graphics, Container, Text } from "pixi.js";
-import type { GodViewFrame, GodShipView } from "../lib/frameParser.ts";
+import type { GodViewFrame } from "../lib/frameParser.ts";
 import {
   worldToScreen,
   type CameraTransform,
 } from "../lib/worldTransform.ts";
 import { Camera } from "../lib/camera.ts";
 import { teamColour, barFillRatio, isThrusting } from "../lib/shipPresentation.ts";
-import { detectExplosions } from "../lib/explosionDetector.ts";
 import {
   EMPTY_EFFECTS,
-  addExplosions,
+  spawnEffectsFromEvents,
   advanceEffects,
   type EffectsState,
 } from "../lib/effectsModel.ts";
@@ -79,6 +67,8 @@ const PALETTE = {
   explosionCore: 0xffffff,
   explosionMid: 0xff8800,
   explosionOuter: 0xff2200,
+  arcLanceBeam: 0x88eeff,
+  arcLanceGlow: 0x44ccff,
 } as const;
 
 // ── DriftRenderer ─────────────────────────────────────────────────────────────
@@ -90,8 +80,8 @@ export class DriftRenderer {
   private glowGraphics: Graphics;
   /**
    * Transient effects layer — rendered above entityGraphics, below labels.
-   * Used for explosions; the correct place for Arc Lance beams when the
-   * server exposes them in the god-view stream.
+   * Renders explosions (from `died` / `mineDetonated` events) and Arc Lance
+   * beams (from `lanceTookHull` events).
    */
   private effectsGraphics: Graphics;
   /** Container for per-ship name labels; cleared and rebuilt every frame. */
@@ -100,9 +90,7 @@ export class DriftRenderer {
   /** Camera instance — main.ts wires input handlers against this object. */
   readonly camera: Camera = new Camera();
 
-  /** Ships from the most-recently-rendered frame, used for explosion delta. */
-  private prevShips: readonly GodShipView[] = [];
-  /** Active transient effects (explosions). */
+  /** Active transient effects (explosions, arc lance beams). */
   private effectsState: EffectsState = EMPTY_EFFECTS;
 
   private constructor(
@@ -178,8 +166,8 @@ export class DriftRenderer {
    * Resolves the followed ship's world position from the frame (when in follow
    * mode) and delegates transform computation to `this.camera.getTransform`.
    *
-   * Also: detects ship destructions via frame delta, advances the effects
-   * model, and returns the new explosion events (seam for issue 06 sound).
+   * Spawns transient effects directly from `frame.events` (event-driven;
+   * no frame-delta reconstruction), advances the effects model, then draws.
    */
   renderFrame(frame: GodViewFrame): void {
     const canvas = { width: this.canvasWidth, height: this.canvasHeight };
@@ -192,12 +180,10 @@ export class DriftRenderer {
 
     const transform = this.camera.getTransform(frame.arena, canvas, shipPos);
 
-    // ── Explosion detection (pure delta) ─────────────────────────────────────
-    const newExplosions = detectExplosions(this.prevShips, frame.ships);
+    // ── Event-driven effect spawning (pure, no delta) ─────────────────────
     this.effectsState = advanceEffects(
-      addExplosions(this.effectsState, newExplosions),
+      spawnEffectsFromEvents(this.effectsState, frame.events, frame.ships),
     );
-    this.prevShips = frame.ships;
 
     this.drawDrift(frame, transform);
     this.drawGlows(frame, transform);
@@ -261,16 +247,24 @@ export class DriftRenderer {
 
     // Explosion bloom halos — drawn in the glow layer for additive feel
     for (const fx of this.effectsState.effects) {
-      if (fx.kind !== "explosion") continue;
-      const sp = worldToScreen(fx.pos, t);
-      // Fade out as the effect ages: alpha proportional to remaining life
-      const life = fx.ticksLeft / 20; // normalised 0→1
-      this.glowGraphics
-        .circle(sp.x, sp.y, 40 * life + 4)
-        .fill({ color: PALETTE.explosionOuter, alpha: 0.18 * life });
-      this.glowGraphics
-        .circle(sp.x, sp.y, 22 * life + 2)
-        .fill({ color: PALETTE.explosionMid, alpha: 0.28 * life });
+      if (fx.kind === "explosion") {
+        const sp = worldToScreen(fx.pos, t);
+        // Fade out as the effect ages: alpha proportional to remaining life
+        const life = fx.ticksLeft / 20; // normalised 0→1
+        this.glowGraphics
+          .circle(sp.x, sp.y, 40 * life + 4)
+          .fill({ color: PALETTE.explosionOuter, alpha: 0.18 * life });
+        this.glowGraphics
+          .circle(sp.x, sp.y, 22 * life + 2)
+          .fill({ color: PALETTE.explosionMid, alpha: 0.28 * life });
+      } else if (fx.kind === "arcLance") {
+        // Arc Lance glow — soft halo along the beam midpoint
+        const life = fx.ticksLeft / 5;
+        const sp = worldToScreen(fx.pos, t);
+        this.glowGraphics
+          .circle(sp.x, sp.y, 18 * life)
+          .fill({ color: PALETTE.arcLanceGlow, alpha: 0.22 * life });
+      }
     }
   }
 
@@ -489,41 +483,63 @@ export class DriftRenderer {
     }
   }
 
-  // ── Layer: Transient effects (explosions) ─────────────────────────────────
+  // ── Layer: Transient effects (explosions + arc lance beams) ──────────────
 
   /**
    * Draw all active transient effects onto the effectsGraphics layer.
    *
-   * Currently renders explosions as a bright core + decaying ring.
-   *
-   * Arc Lance beams would be drawn here when the server adds them to the
-   * god-view stream — see the KNOWN LIMITATION comment at the top of this file.
+   * Explosions: bright core + decaying ring (from `died` / `mineDetonated` events).
+   * Arc Lance beams: bright line from attacker to target (from `lanceTookHull`
+   * events) — resolves the issue-04 "Arc Lance unrenderable" limitation.
    */
   private drawEffects(t: CameraTransform): void {
     this.effectsGraphics.clear();
 
     for (const fx of this.effectsState.effects) {
-      if (fx.kind !== "explosion") continue;
-      const sp = worldToScreen(fx.pos, t);
-      // Normalised life fraction (1 = fresh, approaching 0 = fading)
-      const life = fx.ticksLeft / 20;
+      if (fx.kind === "explosion") {
+        const sp = worldToScreen(fx.pos, t);
+        // Normalised life fraction (1 = fresh, approaching 0 = fading)
+        const life = fx.ticksLeft / 20;
 
-      // Outer ring — expands and fades
-      const outerR = 6 + (1 - life) * 18;
-      this.effectsGraphics
-        .circle(sp.x, sp.y, outerR)
-        .stroke({ width: 2, color: PALETTE.explosionOuter, alpha: 0.7 * life });
-
-      // Mid burst — shrinks as it fades
-      this.effectsGraphics
-        .circle(sp.x, sp.y, 10 * life + 2)
-        .fill({ color: PALETTE.explosionMid, alpha: 0.6 * life });
-
-      // Bright core — only visible in first half of lifetime
-      if (life > 0.5) {
+        // Outer ring — expands and fades
+        const outerR = 6 + (1 - life) * 18;
         this.effectsGraphics
-          .circle(sp.x, sp.y, 5 * life)
-          .fill({ color: PALETTE.explosionCore, alpha: (life - 0.5) * 2 });
+          .circle(sp.x, sp.y, outerR)
+          .stroke({ width: 2, color: PALETTE.explosionOuter, alpha: 0.7 * life });
+
+        // Mid burst — shrinks as it fades
+        this.effectsGraphics
+          .circle(sp.x, sp.y, 10 * life + 2)
+          .fill({ color: PALETTE.explosionMid, alpha: 0.6 * life });
+
+        // Bright core — only visible in first half of lifetime
+        if (life > 0.5) {
+          this.effectsGraphics
+            .circle(sp.x, sp.y, 5 * life)
+            .fill({ color: PALETTE.explosionCore, alpha: (life - 0.5) * 2 });
+        }
+      } else if (fx.kind === "arcLance") {
+        // Arc Lance beam — line from attacker to target
+        const life = fx.ticksLeft / 5; // normalised 0→1
+        const fromSp = worldToScreen(fx.from, t);
+        const toSp = worldToScreen(fx.to, t);
+
+        // Outer glow line
+        this.effectsGraphics
+          .moveTo(fromSp.x, fromSp.y)
+          .lineTo(toSp.x, toSp.y)
+          .stroke({ width: 4 * life + 1, color: PALETTE.arcLanceGlow, alpha: 0.4 * life });
+
+        // Bright core beam
+        this.effectsGraphics
+          .moveTo(fromSp.x, fromSp.y)
+          .lineTo(toSp.x, toSp.y)
+          .stroke({ width: 2, color: PALETTE.arcLanceBeam, alpha: 0.9 * life });
+
+        // Impact flash at target
+        this.effectsGraphics
+          .circle(toSp.x, toSp.y, 5 * life)
+          .fill({ color: PALETTE.arcLanceBeam, alpha: 0.8 * life });
       }
     }
   }

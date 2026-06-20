@@ -65,6 +65,7 @@ function makeFrame(
     singularities: [],
     mines: [],
     scores,
+    events: [],
   };
 }
 

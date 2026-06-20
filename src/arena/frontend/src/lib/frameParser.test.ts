@@ -18,6 +18,7 @@ const MINIMAL_FRAME = {
   singularities: [],
   mines: [],
   scores: {},
+  events: [],
 };
 
 /** A full frame with one of every entity type. */
@@ -83,6 +84,10 @@ const FULL_FRAME = {
     { id: "mine-0", pos: { x: 200, y: 700 }, own: false },
   ],
   scores: { "ship-alpha": 3, "ship-beta": 1 },
+  events: [
+    { ship: "ship-alpha", event: "cannonFired" },
+    { ship: "ship-beta", event: "died", by: "ship-alpha" },
+  ],
 };
 
 // ── parseGodViewFrame: rejection cases ───────────────────────────────────────
@@ -141,6 +146,7 @@ describe("parseGodViewFrame — accepts valid frames", () => {
     expect(frame!.arena).toEqual({ width: 2000, height: 1500 });
     expect(frame!.ships).toHaveLength(0);
     expect(frame!.scores).toEqual({});
+    expect(frame!.events).toEqual([]);
   });
 
   it("parses a full frame with all entity types", () => {
@@ -195,5 +201,136 @@ describe("parseGodViewFrame — accepts valid frames", () => {
     expect(reparse).not.toBeNull();
     expect(reparse!.tick).toBe(frame.tick);
     expect(reparse!.ships).toHaveLength(2);
+    expect(reparse!.events).toHaveLength(2);
+  });
+});
+
+// ── parseGodViewFrame: events array ─────────────────────────────────────────
+
+describe("parseGodViewFrame — events array", () => {
+  it("parses a frame with no events field as events: []", () => {
+    const { events: _omit, ...rest } = MINIMAL_FRAME;
+    const frame = parseGodViewFrame(rest);
+    expect(frame).not.toBeNull();
+    expect(frame!.events).toEqual([]);
+  });
+
+  it("parses a frame with an empty events array as events: []", () => {
+    const frame = parseGodViewFrame({ ...MINIMAL_FRAME, events: [] });
+    expect(frame).not.toBeNull();
+    expect(frame!.events).toHaveLength(0);
+  });
+
+  it("parses a cannonFired event (no payload beyond ship + event)", () => {
+    const frame = parseGodViewFrame({
+      ...MINIMAL_FRAME,
+      events: [{ ship: "alpha", event: "cannonFired" }],
+    });
+    expect(frame!.events).toHaveLength(1);
+    expect(frame!.events[0]).toEqual({ ship: "alpha", event: "cannonFired" });
+  });
+
+  it("parses a died event with by: null", () => {
+    const frame = parseGodViewFrame({
+      ...MINIMAL_FRAME,
+      events: [{ ship: "alpha", event: "died", by: null }],
+    });
+    expect(frame!.events[0]).toEqual({ ship: "alpha", event: "died", by: null });
+  });
+
+  it("parses a died event with by: string (attacker id)", () => {
+    const frame = parseGodViewFrame({
+      ...MINIMAL_FRAME,
+      events: [{ ship: "alpha", event: "died", by: "beta" }],
+    });
+    expect(frame!.events[0]).toEqual({ ship: "alpha", event: "died", by: "beta" });
+  });
+
+  it("parses lanceTookHull with amount and by", () => {
+    const frame = parseGodViewFrame({
+      ...MINIMAL_FRAME,
+      events: [{ ship: "alpha", event: "lanceTookHull", amount: 40, by: "beta" }],
+    });
+    expect(frame!.events[0]).toEqual({
+      ship: "alpha",
+      event: "lanceTookHull",
+      amount: 40,
+      by: "beta",
+    });
+  });
+
+  it("parses mineDetonated with mineId and pos", () => {
+    const frame = parseGodViewFrame({
+      ...MINIMAL_FRAME,
+      events: [{ ship: "alpha", event: "mineDetonated", mineId: "m-1", pos: { x: 300, y: 400 } }],
+    });
+    expect(frame!.events[0]).toEqual({
+      ship: "alpha",
+      event: "mineDetonated",
+      mineId: "m-1",
+      pos: { x: 300, y: 400 },
+    });
+  });
+
+  it("parses sigilDischarged with which field", () => {
+    const frame = parseGodViewFrame({
+      ...MINIMAL_FRAME,
+      events: [{ ship: "alpha", event: "sigilDischarged", which: "ArcLance" }],
+    });
+    expect(frame!.events[0]).toEqual({
+      ship: "alpha",
+      event: "sigilDischarged",
+      which: "ArcLance",
+    });
+  });
+
+  it("parses relicBanked with value", () => {
+    const frame = parseGodViewFrame({
+      ...MINIMAL_FRAME,
+      events: [{ ship: "alpha", event: "relicBanked", value: 3 }],
+    });
+    expect(frame!.events[0]).toEqual({ ship: "alpha", event: "relicBanked", value: 3 });
+  });
+
+  it("skips malformed event entries but still parses rest of frame", () => {
+    const frame = parseGodViewFrame({
+      ...MINIMAL_FRAME,
+      events: [
+        { ship: "alpha", event: "cannonFired" },         // valid
+        { ship: 42, event: "cannonFired" },              // malformed: ship not string
+        { ship: "beta", event: "unknown-tag" },          // unknown tag — skipped
+        { ship: "beta", event: "died", by: null },       // valid
+      ],
+    });
+    expect(frame).not.toBeNull();
+    expect(frame!.events).toHaveLength(2);
+    expect(frame!.events[0]!.event).toBe("cannonFired");
+    expect(frame!.events[1]!.event).toBe("died");
+  });
+
+  it("parses relicDropped with relicId and pos", () => {
+    const frame = parseGodViewFrame({
+      ...MINIMAL_FRAME,
+      events: [{
+        ship: "alpha",
+        event: "relicDropped",
+        relicId: "r-1",
+        pos: { x: 100, y: 200 },
+      }],
+    });
+    expect(frame!.events[0]).toEqual({
+      ship: "alpha",
+      event: "relicDropped",
+      relicId: "r-1",
+      pos: { x: 100, y: 200 },
+    });
+  });
+
+  it("parses a full frame with two events from FULL_FRAME fixture", () => {
+    const frame = parseGodViewFrame(FULL_FRAME);
+    expect(frame).not.toBeNull();
+    expect(frame!.events).toHaveLength(2);
+    expect(frame!.events[0]).toEqual({ ship: "ship-alpha", event: "cannonFired" });
+    expect(frame!.events[1]).toEqual({ ship: "ship-beta", event: "died", by: "ship-alpha" });
   });
 });

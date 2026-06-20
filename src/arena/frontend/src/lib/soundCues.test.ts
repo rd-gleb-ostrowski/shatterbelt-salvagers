@@ -1,20 +1,27 @@
 /**
- * Unit tests for soundCues — pure frame-delta → SoundCue[] mapping.
+ * Unit tests for soundCues — pure event-driven frame → SoundCue[] mapping.
  *
- * Eight tracer slices (TDD, red-green order):
- *   1. newly-destroyed ship → explosion cue
- *   2. cannonCooldown 0→>0  → cannon cue; unchanged cooldown → no cue
- *   3. sigil Some→None on living ship → sigil-discharge cue; death case excluded
- *   4. relicsCarried increase → relicPickup cue
- *   5. relicsCarried drop + score increase → relicBank cue
- *   6. tick === 0 (first/new match) → matchStart cue
- *   7. tick crossing maxTicks → matchEnd cue (only once)
- *   8. quiet frame (no deltas) → empty cue list
+ * All slices test the REWRITTEN `deriveSoundCues(frame)` — single frame,
+ * no delta reconstruction. Events come from `frame.events` (authoritative
+ * god-view event stream). Thrust comes from authoritative ship state.
+ *
+ * Slices:
+ *   1. `cannonFired` event → cannon cue
+ *   2. `died` event → explosion cue at ship pos
+ *   3. `mineDetonated` event → explosion cue at event pos
+ *   4. `sigilDischarged` event → sigilDischarge cue with `sigil = which`
+ *   5. `relicTaken` event → relicPickup cue
+ *   6. `relicBanked` event → relicBank cue
+ *   7. `lanceTookHull` event → lanceZap cue
+ *   8. matchStart — tick === 0
+ *   9. matchEnd — tick >= maxTicks
+ *  10. quiet frame (no events, mid-match, stationary ships) → only thrust cues
+ *  11. thrust from authoritative ship state
  */
 
 import { describe, it, expect } from "vitest";
 import { deriveSoundCues } from "./soundCues.ts";
-import type { GodViewFrame, GodShipView } from "./frameParser.ts";
+import type { GodViewFrame, GodShipView, GodEvent } from "./frameParser.ts";
 
 // ── Minimal fixtures ──────────────────────────────────────────────────────────
 
@@ -45,6 +52,7 @@ function makeShip(
 function makeFrame(
   tick: number,
   ships: GodShipView[] = [],
+  events: GodEvent[] = [],
   overrides: Partial<GodViewFrame> = {},
 ): GodViewFrame {
   return {
@@ -61,353 +69,267 @@ function makeFrame(
     singularities: [],
     mines: [],
     scores: {},
+    events,
     ...overrides,
   };
 }
 
-// ── slice 1: explosion cues ───────────────────────────────────────────────────
+// ── Tests ─────────────────────────────────────────────────────────────────────
 
 describe("deriveSoundCues", () => {
-  describe("slice 1 — newly-destroyed ship → explosion cue", () => {
-    it("emits one explosion cue when a ship transitions alive → dead", () => {
-      const prev = makeFrame(1, [makeShip("alpha", { alive: true })]);
-      const curr = makeFrame(2, [makeShip("alpha", { alive: false })]);
 
-      const cues = deriveSoundCues(prev, curr);
+  // ── slice 1: cannonFired → cannon cue ────────────────────────────────────
 
-      const explosions = cues.filter((c) => c.kind === "explosion");
-      expect(explosions).toHaveLength(1);
-      expect(explosions[0]!.shipId).toBe("alpha");
+  describe("slice 1 — cannonFired event → cannon cue", () => {
+    it("emits a cannon cue for a cannonFired event", () => {
+      const ship = makeShip("alpha", { pos: { x: 300, y: 400 } });
+      const frame = makeFrame(5, [ship], [{ ship: "alpha", event: "cannonFired" }]);
+
+      const cues = deriveSoundCues(frame);
+      const cannon = cues.filter((c) => c.kind === "cannon");
+      expect(cannon).toHaveLength(1);
+      expect(cannon[0]!.shipId).toBe("alpha");
+      expect(cannon[0]!.pos).toEqual({ x: 300, y: 400 });
     });
 
-    it("emits explosion cues for multiple simultaneous deaths", () => {
-      const prev = makeFrame(1, [
-        makeShip("alpha", { alive: true }),
-        makeShip("beta", { alive: true }),
-      ]);
-      const curr = makeFrame(2, [
-        makeShip("alpha", { alive: false }),
-        makeShip("beta", { alive: false }),
-      ]);
+    it("emits one cannon cue per cannonFired event", () => {
+      const ships = [makeShip("alpha"), makeShip("beta")];
+      const events: GodEvent[] = [
+        { ship: "alpha", event: "cannonFired" },
+        { ship: "beta", event: "cannonFired" },
+      ];
+      const frame = makeFrame(5, ships, events);
 
-      const cues = deriveSoundCues(prev, curr);
-      const explosionIds = cues
-        .filter((c) => c.kind === "explosion")
-        .map((c) => c.shipId)
-        .sort();
-
-      expect(explosionIds).toEqual(["alpha", "beta"]);
+      const cannon = deriveSoundCues(frame).filter((c) => c.kind === "cannon");
+      expect(cannon).toHaveLength(2);
+      expect(cannon.map((c) => c.shipId).sort()).toEqual(["alpha", "beta"]);
     });
 
-    it("does not emit an explosion for a ship that stays alive", () => {
-      const prev = makeFrame(1, [makeShip("alpha", { alive: true })]);
-      const curr = makeFrame(2, [makeShip("alpha", { alive: true })]);
-
-      const cues = deriveSoundCues(prev, curr);
-      expect(cues.filter((c) => c.kind === "explosion")).toHaveLength(0);
-    });
-
-    it("emits explosion cue with position from the death frame", () => {
-      const prev = makeFrame(1, [makeShip("alpha", { alive: true, pos: { x: 50, y: 60 } })]);
-      const curr = makeFrame(2, [makeShip("alpha", { alive: false, pos: { x: 55, y: 62 } })]);
-
-      const cues = deriveSoundCues(prev, curr);
-      const exp = cues.find((c) => c.kind === "explosion");
-      expect(exp?.pos).toEqual({ x: 55, y: 62 });
+    it("emits no cannon cue when events array is empty", () => {
+      const frame = makeFrame(5, [makeShip("alpha")], []);
+      expect(deriveSoundCues(frame).filter((c) => c.kind === "cannon")).toHaveLength(0);
     });
   });
 
-  // ── slice 2: cannon-fire cues ───────────────────────────────────────────────
+  // ── slice 2: died event → explosion cue ──────────────────────────────────
 
-  describe("slice 2 — cannonCooldown 0→>0 → cannon cue", () => {
-    it("emits a cannon cue when a ship's cannonCooldown goes from 0 to positive", () => {
-      const prev = makeFrame(1, [makeShip("alpha", { cannonCooldown: 0 })]);
-      const curr = makeFrame(2, [makeShip("alpha", { cannonCooldown: 10 })]);
+  describe("slice 2 — died event → explosion cue at ship pos", () => {
+    it("emits an explosion cue for a died event with ship pos lookup", () => {
+      const ship = makeShip("alpha", { pos: { x: 55, y: 62 } });
+      const frame = makeFrame(5, [ship], [{ ship: "alpha", event: "died", by: null }]);
 
-      const cues = deriveSoundCues(prev, curr);
-      const cannons = cues.filter((c) => c.kind === "cannon");
-      expect(cannons).toHaveLength(1);
-      expect(cannons[0]!.shipId).toBe("alpha");
+      const cues = deriveSoundCues(frame);
+      const exp = cues.filter((c) => c.kind === "explosion");
+      expect(exp).toHaveLength(1);
+      expect(exp[0]!.shipId).toBe("alpha");
+      expect(exp[0]!.pos).toEqual({ x: 55, y: 62 });
     });
 
-    it("does not emit a cannon cue when cannonCooldown is already counting down", () => {
-      // mid-cooldown: 8 → 7 (no new shot)
-      const prev = makeFrame(1, [makeShip("alpha", { cannonCooldown: 8 })]);
-      const curr = makeFrame(2, [makeShip("alpha", { cannonCooldown: 7 })]);
+    it("emits explosion cues for multiple simultaneous died events", () => {
+      const ships = [makeShip("alpha"), makeShip("beta")];
+      const events: GodEvent[] = [
+        { ship: "alpha", event: "died", by: null },
+        { ship: "beta", event: "died", by: "alpha" },
+      ];
+      const frame = makeFrame(5, ships, events);
 
-      const cues = deriveSoundCues(prev, curr);
-      expect(cues.filter((c) => c.kind === "cannon")).toHaveLength(0);
+      const exp = deriveSoundCues(frame).filter((c) => c.kind === "explosion");
+      expect(exp).toHaveLength(2);
+      expect(exp.map((c) => c.shipId).sort()).toEqual(["alpha", "beta"]);
     });
 
-    it("does not emit a cannon cue when cannonCooldown stays at 0", () => {
-      const prev = makeFrame(1, [makeShip("alpha", { cannonCooldown: 0 })]);
-      const curr = makeFrame(2, [makeShip("alpha", { cannonCooldown: 0 })]);
-
-      const cues = deriveSoundCues(prev, curr);
-      expect(cues.filter((c) => c.kind === "cannon")).toHaveLength(0);
-    });
-
-    it("does not emit a cannon cue for a ship that just died (dead in curr)", () => {
-      // Ship fired and died in the same tick — no cannon sound
-      const prev = makeFrame(1, [makeShip("alpha", { alive: true, cannonCooldown: 0 })]);
-      const curr = makeFrame(2, [makeShip("alpha", { alive: false, cannonCooldown: 10 })]);
-
-      const cues = deriveSoundCues(prev, curr);
-      expect(cues.filter((c) => c.kind === "cannon")).toHaveLength(0);
+    it("emits explosion even if ship is absent from ships list (pos undefined)", () => {
+      const frame = makeFrame(5, [], [{ ship: "ghost", event: "died", by: null }]);
+      const exp = deriveSoundCues(frame).filter((c) => c.kind === "explosion");
+      expect(exp).toHaveLength(1);
+      expect(exp[0]!.shipId).toBe("ghost");
     });
   });
 
-  // ── slice 3: sigil-discharge cues ──────────────────────────────────────────
+  // ── slice 3: mineDetonated event → explosion cue ─────────────────────────
 
-  describe("slice 3 — sigil Some→None on living ship → sigil-discharge cue", () => {
-    it("emits a sigilDischarge cue when a living ship's sigil disappears", () => {
-      const prev = makeFrame(1, [makeShip("alpha", { sigil: "Afterburner" })]);
-      const curr = makeFrame(2, [makeShip("alpha", { sigil: null })]);
+  describe("slice 3 — mineDetonated event → explosion cue at event pos", () => {
+    it("emits an explosion cue at the mine's pos from the event payload", () => {
+      const frame = makeFrame(5, [], [{
+        ship: "alpha",
+        event: "mineDetonated",
+        mineId: "mine-1",
+        pos: { x: 700, y: 500 },
+      }]);
 
-      const cues = deriveSoundCues(prev, curr);
-      const discharges = cues.filter((c) => c.kind === "sigilDischarge");
-      expect(discharges).toHaveLength(1);
-      expect(discharges[0]!.shipId).toBe("alpha");
-      expect(discharges[0]!.sigil).toBe("Afterburner");
+      const exp = deriveSoundCues(frame).filter((c) => c.kind === "explosion");
+      expect(exp).toHaveLength(1);
+      expect(exp[0]!.pos).toEqual({ x: 700, y: 500 });
     });
 
-    it("carries the sigil type on the cue", () => {
-      const prev = makeFrame(1, [makeShip("alpha", { sigil: "Singularity" })]);
-      const curr = makeFrame(2, [makeShip("alpha", { sigil: null })]);
+    it("mineDetonated cue has no shipId (ship is the deployer, not positional)", () => {
+      const frame = makeFrame(5, [], [{
+        ship: "alpha",
+        event: "mineDetonated",
+        mineId: "mine-1",
+        pos: { x: 100, y: 100 },
+      }]);
 
-      const cues = deriveSoundCues(prev, curr);
-      expect(cues.find((c) => c.kind === "sigilDischarge")?.sigil).toBe("Singularity");
-    });
-
-    it("does NOT emit a sigilDischarge cue when the ship died holding a sigil", () => {
-      const prev = makeFrame(1, [makeShip("alpha", { alive: true, sigil: "Bulwark" })]);
-      const curr = makeFrame(2, [makeShip("alpha", { alive: false, sigil: null })]);
-
-      const cues = deriveSoundCues(prev, curr);
-      expect(cues.filter((c) => c.kind === "sigilDischarge")).toHaveLength(0);
-    });
-
-    it("does not emit a cue when the sigil stays the same", () => {
-      const prev = makeFrame(1, [makeShip("alpha", { sigil: "ArcLance" })]);
-      const curr = makeFrame(2, [makeShip("alpha", { sigil: "ArcLance" })]);
-
-      const cues = deriveSoundCues(prev, curr);
-      expect(cues.filter((c) => c.kind === "sigilDischarge")).toHaveLength(0);
-    });
-
-    it("does not emit a cue when sigil stays null", () => {
-      const prev = makeFrame(1, [makeShip("alpha", { sigil: null })]);
-      const curr = makeFrame(2, [makeShip("alpha", { sigil: null })]);
-
-      const cues = deriveSoundCues(prev, curr);
-      expect(cues.filter((c) => c.kind === "sigilDischarge")).toHaveLength(0);
+      const exp = deriveSoundCues(frame).filter((c) => c.kind === "explosion");
+      expect(exp[0]!.shipId).toBeUndefined();
     });
   });
 
-  // ── slice 4: relicPickup cues ───────────────────────────────────────────────
+  // ── slice 4: sigilDischarged event → sigilDischarge cue ──────────────────
 
-  describe("slice 4 — relicsCarried increase → relicPickup cue", () => {
-    it("emits a relicPickup cue when a ship's relicsCarried increases", () => {
-      const prev = makeFrame(1, [makeShip("alpha", { relicsCarried: 0 })]);
-      const curr = makeFrame(2, [makeShip("alpha", { relicsCarried: 1 })]);
+  describe("slice 4 — sigilDischarged event → sigilDischarge cue", () => {
+    it("emits a sigilDischarge cue with the which field as sigil", () => {
+      const ship = makeShip("alpha");
+      const frame = makeFrame(5, [ship], [{
+        ship: "alpha",
+        event: "sigilDischarged",
+        which: "Afterburner",
+      }]);
 
-      const cues = deriveSoundCues(prev, curr);
-      const pickups = cues.filter((c) => c.kind === "relicPickup");
-      expect(pickups).toHaveLength(1);
-      expect(pickups[0]!.shipId).toBe("alpha");
+      const cues = deriveSoundCues(frame).filter((c) => c.kind === "sigilDischarge");
+      expect(cues).toHaveLength(1);
+      expect(cues[0]!.sigil).toBe("Afterburner");
+      expect(cues[0]!.shipId).toBe("alpha");
     });
 
-    it("does not emit a relicPickup cue when relicsCarried stays the same", () => {
-      const prev = makeFrame(1, [makeShip("alpha", { relicsCarried: 2 })]);
-      const curr = makeFrame(2, [makeShip("alpha", { relicsCarried: 2 })]);
+    it("carries the sigil type for different Sigil types", () => {
+      const ship = makeShip("alpha");
+      const frame = makeFrame(5, [ship], [{
+        ship: "alpha",
+        event: "sigilDischarged",
+        which: "Singularity",
+      }]);
 
-      const cues = deriveSoundCues(prev, curr);
-      expect(cues.filter((c) => c.kind === "relicPickup")).toHaveLength(0);
-    });
-
-    it("does not emit a relicPickup cue when relicsCarried decreases", () => {
-      const prev = makeFrame(1, [makeShip("alpha", { relicsCarried: 3 })]);
-      const curr = makeFrame(2, [makeShip("alpha", { relicsCarried: 2 })]);
-
-      const cues = deriveSoundCues(prev, curr);
-      expect(cues.filter((c) => c.kind === "relicPickup")).toHaveLength(0);
-    });
-  });
-
-  // ── slice 5: relicBank cues ─────────────────────────────────────────────────
-
-  describe("slice 5 — relicsCarried drop + score increase → relicBank cue", () => {
-    it("emits a relicBank cue when relics drop and score increases", () => {
-      const prev = makeFrame(
-        1,
-        [makeShip("alpha", { relicsCarried: 2 })],
-        { scores: { alpha: 10 } },
-      );
-      const curr = makeFrame(
-        2,
-        [makeShip("alpha", { relicsCarried: 0 })],
-        { scores: { alpha: 12 } },
-      );
-
-      const cues = deriveSoundCues(prev, curr);
-      const banks = cues.filter((c) => c.kind === "relicBank");
-      expect(banks).toHaveLength(1);
-      expect(banks[0]!.shipId).toBe("alpha");
-    });
-
-    it("does NOT emit a relicBank cue when relics drop but score does NOT increase", () => {
-      // Relics dropped due to death — no bank
-      const prev = makeFrame(
-        1,
-        [makeShip("alpha", { alive: true, relicsCarried: 2 })],
-        { scores: { alpha: 10 } },
-      );
-      const curr = makeFrame(
-        2,
-        [makeShip("alpha", { alive: false, relicsCarried: 0 })],
-        { scores: { alpha: 10 } },
-      );
-
-      const cues = deriveSoundCues(prev, curr);
-      expect(cues.filter((c) => c.kind === "relicBank")).toHaveLength(0);
-    });
-
-    it("does NOT emit a relicBank cue when score increases but relics stayed same", () => {
-      const prev = makeFrame(1, [makeShip("alpha", { relicsCarried: 1 })], { scores: { alpha: 5 } });
-      const curr = makeFrame(2, [makeShip("alpha", { relicsCarried: 1 })], { scores: { alpha: 7 } });
-
-      const cues = deriveSoundCues(prev, curr);
-      expect(cues.filter((c) => c.kind === "relicBank")).toHaveLength(0);
+      expect(deriveSoundCues(frame).find((c) => c.kind === "sigilDischarge")?.sigil)
+        .toBe("Singularity");
     });
   });
 
-  // ── slice 6: matchStart cue ─────────────────────────────────────────────────
+  // ── slice 5: relicTaken event → relicPickup cue ───────────────────────────
 
-  describe("slice 6 — tick === 0 → matchStart cue", () => {
-    it("emits a matchStart cue when prevFrame is null and curr.tick === 0", () => {
-      const curr = makeFrame(0);
+  describe("slice 5 — relicTaken event → relicPickup cue", () => {
+    it("emits a relicPickup cue for a relicTaken event", () => {
+      const ship = makeShip("alpha", { pos: { x: 200, y: 300 } });
+      const frame = makeFrame(5, [ship], [{ ship: "alpha", event: "relicTaken" }]);
 
-      const cues = deriveSoundCues(null, curr);
-      expect(cues.filter((c) => c.kind === "matchStart")).toHaveLength(1);
+      const cues = deriveSoundCues(frame).filter((c) => c.kind === "relicPickup");
+      expect(cues).toHaveLength(1);
+      expect(cues[0]!.shipId).toBe("alpha");
+      expect(cues[0]!.pos).toEqual({ x: 200, y: 300 });
     });
+  });
 
-    it("emits a matchStart cue when curr.tick === 0 and prev.tick was non-zero", () => {
-      const prev = makeFrame(99);
-      const curr = makeFrame(0);
+  // ── slice 6: relicBanked event → relicBank cue ────────────────────────────
 
-      const cues = deriveSoundCues(prev, curr);
-      expect(cues.filter((c) => c.kind === "matchStart")).toHaveLength(1);
+  describe("slice 6 — relicBanked event → relicBank cue", () => {
+    it("emits a relicBank cue for a relicBanked event", () => {
+      const ship = makeShip("alpha");
+      const frame = makeFrame(5, [ship], [{
+        ship: "alpha",
+        event: "relicBanked",
+        value: 2,
+      }]);
+
+      const cues = deriveSoundCues(frame).filter((c) => c.kind === "relicBank");
+      expect(cues).toHaveLength(1);
+      expect(cues[0]!.shipId).toBe("alpha");
     });
+  });
 
-    it("does NOT emit a matchStart cue when both prev.tick and curr.tick are 0", () => {
-      const prev = makeFrame(0);
-      const curr = makeFrame(0);
+  // ── slice 7: lanceTookHull event → lanceZap cue ───────────────────────────
 
-      const cues = deriveSoundCues(prev, curr);
-      expect(cues.filter((c) => c.kind === "matchStart")).toHaveLength(0);
+  describe("slice 7 — lanceTookHull event → lanceZap cue", () => {
+    it("emits a lanceZap cue for a lanceTookHull event", () => {
+      const target = makeShip("alpha", { pos: { x: 400, y: 500 } });
+      const attacker = makeShip("beta");
+      const frame = makeFrame(5, [target, attacker], [{
+        ship: "alpha",
+        event: "lanceTookHull",
+        amount: 30,
+        by: "beta",
+      }]);
+
+      const cues = deriveSoundCues(frame).filter((c) => c.kind === "lanceZap");
+      expect(cues).toHaveLength(1);
+      expect(cues[0]!.shipId).toBe("alpha");
+      expect(cues[0]!.pos).toEqual({ x: 400, y: 500 });
+    });
+  });
+
+  // ── slice 8: matchStart cue ───────────────────────────────────────────────
+
+  describe("slice 8 — tick === 0 → matchStart cue", () => {
+    it("emits a matchStart cue when tick === 0", () => {
+      const frame = makeFrame(0);
+      expect(deriveSoundCues(frame).filter((c) => c.kind === "matchStart")).toHaveLength(1);
     });
 
     it("does NOT emit a matchStart cue mid-match", () => {
-      const prev = makeFrame(5);
-      const curr = makeFrame(6);
-
-      const cues = deriveSoundCues(prev, curr);
-      expect(cues.filter((c) => c.kind === "matchStart")).toHaveLength(0);
+      const frame = makeFrame(5);
+      expect(deriveSoundCues(frame).filter((c) => c.kind === "matchStart")).toHaveLength(0);
     });
   });
 
-  // ── slice 7: matchEnd cue ───────────────────────────────────────────────────
+  // ── slice 9: matchEnd cue ─────────────────────────────────────────────────
 
-  describe("slice 7 — tick crossing maxTicks → matchEnd cue (once)", () => {
-    it("emits a matchEnd cue when curr.tick >= maxTicks and prev.tick < maxTicks", () => {
-      const prev = makeFrame(99, [], { maxTicks: 100 });
-      const curr = makeFrame(100, [], { maxTicks: 100 });
-
-      const cues = deriveSoundCues(prev, curr);
-      expect(cues.filter((c) => c.kind === "matchEnd")).toHaveLength(1);
+  describe("slice 9 — tick >= maxTicks → matchEnd cue", () => {
+    it("emits a matchEnd cue when tick === maxTicks", () => {
+      const frame = makeFrame(100, [], [], { maxTicks: 100 });
+      expect(deriveSoundCues(frame).filter((c) => c.kind === "matchEnd")).toHaveLength(1);
     });
 
-    it("does NOT re-emit matchEnd when both frames are at or past maxTicks", () => {
-      const prev = makeFrame(100, [], { maxTicks: 100 });
-      const curr = makeFrame(101, [], { maxTicks: 100 });
-
-      const cues = deriveSoundCues(prev, curr);
-      expect(cues.filter((c) => c.kind === "matchEnd")).toHaveLength(0);
+    it("emits a matchEnd cue when tick > maxTicks", () => {
+      const frame = makeFrame(101, [], [], { maxTicks: 100 });
+      expect(deriveSoundCues(frame).filter((c) => c.kind === "matchEnd")).toHaveLength(1);
     });
 
-    it("emits matchEnd when prevFrame is null and curr.tick >= maxTicks", () => {
-      // First frame received is already at max (edge: replay seeked to end)
-      const curr = makeFrame(100, [], { maxTicks: 100 });
-
-      const cues = deriveSoundCues(null, curr);
-      expect(cues.filter((c) => c.kind === "matchEnd")).toHaveLength(1);
-    });
-
-    it("does NOT emit matchEnd mid-match", () => {
-      const prev = makeFrame(40, [], { maxTicks: 100 });
-      const curr = makeFrame(41, [], { maxTicks: 100 });
-
-      const cues = deriveSoundCues(prev, curr);
-      expect(cues.filter((c) => c.kind === "matchEnd")).toHaveLength(0);
+    it("does NOT emit a matchEnd cue mid-match", () => {
+      const frame = makeFrame(50, [], [], { maxTicks: 100 });
+      expect(deriveSoundCues(frame).filter((c) => c.kind === "matchEnd")).toHaveLength(0);
     });
   });
 
-  // ── slice 8: quiet frame → no cues ─────────────────────────────────────────
+  // ── slice 10: quiet frame → no cues (except thrust if thrusting) ─────────
 
-  describe("slice 8 — quiet frame with no deltas → no cues", () => {
-    it("returns an empty array when nothing changed between frames", () => {
+  describe("slice 10 — quiet frame → only thrust cues from state", () => {
+    it("returns empty cue list for mid-match frame with no events and stationary ships", () => {
       const ship = makeShip("alpha", {
-        alive: true,
-        sigil: null,
-        cannonCooldown: 0,
-        relicsCarried: 0,
+        vel: { x: 0, y: 0 },
+        afterburnerTicksLeft: 0,
       });
-      const prev = makeFrame(5, [ship], { scores: { alpha: 0 } });
-      const curr = makeFrame(6, [ship], { scores: { alpha: 0 } });
-
-      const cues = deriveSoundCues(prev, curr);
-      // Filter out thrust cues (ship is stationary, so none expected here)
-      const nonThrust = cues.filter((c) => c.kind !== "thrust");
+      const frame = makeFrame(5, [ship], []);
+      const nonThrust = deriveSoundCues(frame).filter((c) => c.kind !== "thrust");
       expect(nonThrust).toHaveLength(0);
     });
 
-    it("returns an empty array when both frames are empty mid-match", () => {
-      const prev = makeFrame(5);
-      const curr = makeFrame(6);
-
-      const cues = deriveSoundCues(prev, curr);
-      expect(cues).toHaveLength(0);
+    it("returns completely empty array for mid-match frame with no ships and no events", () => {
+      const frame = makeFrame(5, [], []);
+      expect(deriveSoundCues(frame)).toHaveLength(0);
     });
   });
 
-  // ── thrust cues ────────────────────────────────────────────────────────────
+  // ── slice 11: thrust cues from authoritative ship state ───────────────────
 
-  describe("thrust cues — living thrusting ships emit thrust cues", () => {
+  describe("slice 11 — thrust cues from authoritative ship state", () => {
     it("emits a thrust cue for a ship with afterburnerTicksLeft > 0", () => {
-      const curr = makeFrame(5, [makeShip("alpha", { afterburnerTicksLeft: 3 })]);
-
-      const cues = deriveSoundCues(null, curr);
-      const thrustCues = cues.filter((c) => c.kind === "thrust");
-      expect(thrustCues).toHaveLength(1);
-      expect(thrustCues[0]!.shipId).toBe("alpha");
+      const frame = makeFrame(5, [makeShip("alpha", { afterburnerTicksLeft: 3 })]);
+      const thrust = deriveSoundCues(frame).filter((c) => c.kind === "thrust");
+      expect(thrust).toHaveLength(1);
+      expect(thrust[0]!.shipId).toBe("alpha");
     });
 
     it("does not emit a thrust cue for a dead ship", () => {
-      const curr = makeFrame(5, [
+      const frame = makeFrame(5, [
         makeShip("alpha", { alive: false, afterburnerTicksLeft: 3 }),
       ]);
-
-      const cues = deriveSoundCues(null, curr);
-      expect(cues.filter((c) => c.kind === "thrust")).toHaveLength(0);
+      expect(deriveSoundCues(frame).filter((c) => c.kind === "thrust")).toHaveLength(0);
     });
 
     it("does not emit a thrust cue for a stationary ship", () => {
-      const curr = makeFrame(5, [
+      const frame = makeFrame(5, [
         makeShip("alpha", { vel: { x: 0, y: 0 }, afterburnerTicksLeft: 0 }),
       ]);
-
-      const cues = deriveSoundCues(null, curr);
-      expect(cues.filter((c) => c.kind === "thrust")).toHaveLength(0);
+      expect(deriveSoundCues(frame).filter((c) => c.kind === "thrust")).toHaveLength(0);
     });
   });
 });

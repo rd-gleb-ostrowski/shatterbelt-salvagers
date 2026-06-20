@@ -117,7 +117,8 @@ export class ReplayPlayer {
   private lastRafTime: number | null = null;
   private rafHandle: number | null = null;
   private currentIndex = 0;
-  private prevFrame: GodViewFrame | null = null;
+  /** True after at least one frame has been emitted; guards the scrub-skip logic. */
+  private hasEmittedFirstFrame = false;
 
   constructor(opts: ReplayPlayerOptions) {
     this.opts = {
@@ -162,7 +163,7 @@ export class ReplayPlayer {
     this.buffer = [];
     this.playbackMs = 0;
     this.currentIndex = 0;
-    this.prevFrame = null;
+    this.hasEmittedFirstFrame = false;
     this.buffering = true;
 
     this.opts.onStatus(`Buffering replay ${matchId}…`);
@@ -267,7 +268,7 @@ export class ReplayPlayer {
     this.playing = false;
     this.playbackMs = 0;
     this.currentIndex = 0;
-    this.prevFrame = null;
+    this.hasEmittedFirstFrame = false;
     if (this.rafHandle !== null) {
       cancelAnimationFrame(this.rafHandle);
       this.rafHandle = null;
@@ -361,7 +362,7 @@ export class ReplayPlayer {
   /** Jump to a specific buffer index, emit the frame, update progress. */
   private jumpToIndex(idx: number): void {
     const clamped = Math.min(idx, this.buffer.length - 1);
-    if (clamped === this.currentIndex && this.prevFrame !== null) {
+    if (clamped === this.currentIndex && this.hasEmittedFirstFrame) {
       // Same frame — still need to call progress for scrub UI responsiveness
       this.opts.onProgress(clamped, this.buffer.length);
       return;
@@ -374,7 +375,7 @@ export class ReplayPlayer {
     if (!frame) return;
 
     this.opts.onFrame(frame);
-    this.prevFrame = frame;
+    this.hasEmittedFirstFrame = true;
     this.opts.onProgress(clamped, this.buffer.length);
   }
 }
