@@ -135,8 +135,9 @@ async fn send_json(ws: &mut WsStream, v: Value) {
         .expect("send");
 }
 
-/// Full WS bot handshake: welcome → join → assigned → matchStart.
-async fn bot_handshake(ws: &mut WsStream, token: &str) {
+/// Full WS bot handshake: welcome → join → assigned.
+/// Returns the assigned shipId (= team name in the persistent model).
+async fn bot_handshake(ws: &mut WsStream, token: &str) -> String {
     // welcome
     let welcome = next_text(ws).await;
     let session_id = welcome["sessionId"].as_str().unwrap().to_owned();
@@ -152,9 +153,25 @@ async fn bot_handshake(ws: &mut WsStream, token: &str) {
     )
     .await;
     // assigned
-    let _ = next_text(ws).await;
-    // matchStart
-    let _ = next_text(ws).await;
+    let assigned = next_text(ws).await;
+    assigned["shipId"].as_str().unwrap_or("").to_owned()
+}
+
+/// Start a live match via the admin API.
+async fn start_match(addr: std::net::SocketAddr, teams: &[&str]) {
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("http://{addr}/admin/matches"))
+        .header("Authorization", "Facilitator test-facilitator")
+        .json(&serde_json::json!({
+            "mode": "live",
+            "maxTicks": TEST_MAX_TICKS,
+            "teams": teams
+        }))
+        .send()
+        .await
+        .expect("start match request");
+    assert_eq!(resp.status(), 200, "admin/matches must return 200");
 }
 
 // ── Test 1: hub delivers one frame per tick ───────────────────────────────────
@@ -329,9 +346,15 @@ async fn viewer_ws_receives_god_view_frames() {
     // Connect Viewer BEFORE the bot so it subscribes before frames start.
     let mut viewer = ws_connect(addr, "/observe").await;
 
-    // Connect bot and play through the match.
+    // Connect bot and complete handshake (bot stays idle until match starts).
     let mut bot = ws_connect(addr, "/ws").await;
     bot_handshake(&mut bot, &token).await;
+
+    // Brief pause so server completes registration.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    // Start a live match that includes this team.
+    start_match(addr, &["viewer-test-bot", "team-b"]).await;
 
     // Drain the bot's ticks (to drive the match forward) while viewer collects frames.
     // Play through all TEST_MAX_TICKS ticks by receiving bot observations.
@@ -400,6 +423,8 @@ async fn bot_does_not_receive_god_frames() {
 
     let mut bot = ws_connect(addr, "/ws").await;
     bot_handshake(&mut bot, &token).await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    start_match(addr, &["privacy-bot", "team-b"]).await;
 
     // Collect all messages the bot receives until matchEnd.
     let deadline = Duration::from_millis((TEST_MAX_TICKS as u64 + 5) * TEST_DEADLINE_MS * 6);
@@ -450,6 +475,8 @@ async fn viewer_sending_bytes_is_ignored() {
     // Connect bot.
     let mut bot = ws_connect(addr, "/ws").await;
     bot_handshake(&mut bot, &token).await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    start_match(addr, &["ignored-sender-bot", "team-b"]).await;
 
     // Viewer spams the server with arbitrary data.
     let spam_task = tokio::spawn(async move {
@@ -633,6 +660,8 @@ async fn viewer_god_view_frames_always_include_events_array() {
     let mut viewer = ws_connect(addr, "/observe").await;
     let mut bot = ws_connect(addr, "/ws").await;
     bot_handshake(&mut bot, &token).await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    start_match(addr, &["events-e2e-bot", "team-b"]).await;
 
     // Drain bot + collect viewer frames concurrently.
     let bot_task = tokio::spawn(async move {

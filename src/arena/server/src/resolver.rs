@@ -9,23 +9,31 @@
 //!
 //! For each team slot, in order:
 //!
-//! 1. **WS Bot** — a live [`WsBotDriver`](crate::ws::WsBotDriver) in the
-//!    [`WsConnectionRegistry`] for this team.
+//! 1. **WS Bot** — a live [`WsBotDriver`](crate::ws::WsBotDriver) minted from
+//!    a [`BotSessionSource`] in the [`WsConnectionRegistry`] for this team.
 //! 2. **WASM Bot** — an artifact in the [`WasmBotStore`] for this team.
 //! 3. **Default Bot** — the built-in
 //!    [`DefaultBotDriver`](crate::bot::DefaultBotDriver) fallback so every
 //!    slot always plays.
+//!
+//! ## Persistent connection model (ADR-0001 v2)
+//!
+//! A WS bot connects once and stays connected across successive matches.
+//! The registry stores an `Arc<dyn BotSessionSource>` per team; each
+//! match calls `BotSessionSource::make_driver` to mint a fresh
+//! per-match driver without consuming the session.
 //!
 //! ## Seams for future issues
 //!
 //! | Future issue | Usage |
 //! |---|---|
 //! | 09 (headless) | Pass an empty [`WsConnectionRegistry`] — WS drivers are never present in headless-fast matches (ADR story 23) |
-//! | 11 (admin start) | Call [`ConnectionResolver::resolve`] to build drivers; hold `Arc<WsConnectionRegistry>` to inject live bots before calling it |
-//! | 12 (bot health) | Read health from registered [`WsBotDriver`]s via the registry before the match |
+//! | 11 (admin start) | Call [`ConnectionResolver::resolve`] to build drivers; `ws_registry.make_driver` mints a fresh driver each time |
+//! | 12 (bot health) | Read health from registered sessions via the registry before the match |
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use arena_engine::Params;
 
@@ -35,29 +43,59 @@ use crate::runner::BotDriver;
 use crate::store::{DefaultBotStore, DisabledStore, WasmBotStore};
 use crate::wasm_host::WasmBotDriver;
 
+// ── BotSessionSource ──────────────────────────────────────────────────────────
+
+/// Trait for a persistent WS bot session that mints per-match drivers.
+///
+/// Implemented by [`crate::ws::WsSession`] (production) and stub types
+/// (tests).  The registry stores `Arc<dyn BotSessionSource>` so the resolver
+/// can mint a fresh [`BotDriver`] for each match without consuming the
+/// session.
+///
+/// ## Thread safety
+///
+/// Implementations must be `Send + Sync`; they are shared via `Arc`.
+pub trait BotSessionSource: Send + Sync {
+    /// Mint a fresh per-match [`BotDriver`] backed by this session.
+    ///
+    /// Called at match-build time once per match.  The same underlying
+    /// WebSocket connection is reused across calls.
+    fn make_driver(
+        &self,
+        deadline: Duration,
+        health: Option<Arc<BotHealthEntry>>,
+    ) -> Box<dyn BotDriver>;
+
+    /// Queue a raw JSON envelope frame to the connected bot (fire-and-forget).
+    ///
+    /// Returns `true` if the frame was queued, `false` if the channel is full
+    /// or the socket has already closed.  Callers may log a warning on `false`
+    /// but must not treat it as fatal.
+    fn try_send_envelope(&self, json: String) -> bool;
+}
+
 // ── WsConnectionRegistry ─────────────────────────────────────────────────────
 
-/// Registry of live WS bot connections, keyed by team identity.
+/// Registry of live WS bot sessions, keyed by team identity.
 ///
-/// Each entry is a [`BotDriver`] already wired to a live WebSocket connection
-/// (typically a [`WsBotDriver`](crate::ws::WsBotDriver)). The WS handler
-/// inserts drivers here after a successful join/assigned handshake; the
-/// [`ConnectionResolver`] takes them out at match-build time.
+/// Each entry is an `Arc<dyn BotSessionSource>` for a bot whose WebSocket
+/// connection is currently open.  The WS handler registers a session here
+/// after a successful join/assigned handshake; the [`ConnectionResolver`]
+/// mints a fresh [`BotDriver`] from the session at each match-build time
+/// without removing it from the registry.
 ///
 /// ## Thread safety
 ///
 /// The registry is `Send + Sync` and should be shared as
 /// `Arc<WsConnectionRegistry>`.
 ///
-/// ## Integration with ws.rs (issue 11)
+/// ## Persistent connection model
 ///
-/// After the WS handshake is complete (successful `assigned`), the WS handler
-/// calls `registry.insert(team, Box::new(ws_driver))`.  Issue 11 (admin starts
-/// a match) then calls `resolver.resolve(…)` which takes the driver from the
-/// registry, transferring ownership to the new [`MatchRunner`].
+/// Unlike the old consume-once `take` API, sessions survive match boundaries.
+/// The WS handler calls `remove` when the bot disconnects.
 #[derive(Default)]
 pub struct WsConnectionRegistry {
-    connections: Mutex<HashMap<String, Box<dyn BotDriver>>>,
+    connections: Mutex<HashMap<String, Arc<dyn BotSessionSource>>>,
 }
 
 impl WsConnectionRegistry {
@@ -66,28 +104,57 @@ impl WsConnectionRegistry {
         Arc::new(Self::default())
     }
 
-    /// Register a live WS driver for `team`.
+    /// Register a persistent session for `team`.
     ///
-    /// Replaces any previously registered driver for the same team (e.g. on
-    /// reconnect). Called by the WS handler after a successful join/assigned
-    /// handshake so the resolver can find it at match-build time.
-    pub fn insert(&self, team: impl Into<String>, driver: Box<dyn BotDriver>) {
-        self.connections.lock().unwrap().insert(team.into(), driver);
+    /// Replaces any previously registered session for the same team (e.g. on
+    /// reconnect).  Called by the WS handler after a successful join/assigned
+    /// handshake.
+    pub fn register(&self, team: impl Into<String>, session: Arc<dyn BotSessionSource>) {
+        self.connections.lock().unwrap().insert(team.into(), session);
     }
 
-    /// Take the live driver for `team`, removing it from the registry.
+    /// Mint a fresh per-match driver for `team` WITHOUT removing the session.
     ///
-    /// Called by the resolver at match-build time. Consuming the registration
-    /// ensures each match starts with exclusive ownership of every driver.
-    pub fn take(&self, team: &str) -> Option<Box<dyn BotDriver>> {
-        self.connections.lock().unwrap().remove(team)
+    /// Returns `None` if no live session is registered for `team`.
+    /// Called by the resolver at match-build time; the session persists so
+    /// the same bot can play subsequent matches.
+    pub fn make_driver(
+        &self,
+        team: &str,
+        deadline: Duration,
+        health: Option<Arc<BotHealthEntry>>,
+    ) -> Option<Box<dyn BotDriver>> {
+        self.connections
+            .lock()
+            .unwrap()
+            .get(team)
+            .map(|s| s.make_driver(deadline, health))
     }
 
-    /// Return `true` if a live driver is registered for `team`.
-    ///
-    /// Inspects without consuming; useful for health checks (issue 12).
+    /// Remove the session for `team` (called on disconnect).
+    pub fn remove(&self, team: &str) {
+        self.connections.lock().unwrap().remove(team);
+    }
+
+    /// Return `true` if a live session is registered for `team`.
     pub fn has(&self, team: &str) -> bool {
         self.connections.lock().unwrap().contains_key(team)
+    }
+
+    /// Return all currently-connected team names.
+    ///
+    /// Used by the live-match orchestrator to build a default roster from
+    /// whichever WS bots are connected at match-start time.
+    pub fn connected_teams(&self) -> Vec<String> {
+        self.connections.lock().unwrap().keys().cloned().collect()
+    }
+
+    /// Return a clone of the session for `team`, if present.
+    ///
+    /// Callers use this to send per-match envelope frames (matchStart /
+    /// matchEnd) without going through the resolver.
+    pub fn get(&self, team: &str) -> Option<Arc<dyn BotSessionSource>> {
+        self.connections.lock().unwrap().get(team).cloned()
     }
 }
 
@@ -162,6 +229,13 @@ pub struct ConnectionResolver {
     /// Wasmtime fuel budget per `tick` call. `10_000_000` is a generous
     /// default; tests may pass a smaller value to trigger exhaustion.
     fuel_per_tick: u64,
+    /// Per-tick deadline passed to WS bot drivers.
+    ///
+    /// Controls how long `WsBotDriver::decide` waits for an action reply.
+    /// Defaults to `100 ms` when constructed via [`ConnectionResolver::new`];
+    /// set explicitly via [`ConnectionResolver::with_deadline`] or pass it
+    /// from `AppState.tick_deadline` in production.
+    deadline: Duration,
     /// Optional DQ store — checked before WS/WASM driver selection.
     /// When `None`, no exclusion is applied (backward-compat with tests).
     dq_store: Option<Arc<DqStore>>,
@@ -185,6 +259,9 @@ impl ConnectionResolver {
     /// - `wasm_store` — shared WASM artifact store (wired into `POST /bots`).
     /// - `fuel_per_tick` — wasmtime instruction budget per
     ///   [`WasmBotDriver`] tick call.
+    ///
+    /// The default per-tick deadline is `100 ms`; set it via
+    /// [`ConnectionResolver::with_deadline`] for production use.
     pub fn new(
         ws_registry: Arc<WsConnectionRegistry>,
         wasm_store: Arc<WasmBotStore>,
@@ -194,11 +271,22 @@ impl ConnectionResolver {
             ws_registry,
             wasm_store,
             fuel_per_tick,
+            deadline: Duration::from_millis(100),
             dq_store: None,
             health_store: None,
             disabled_store: None,
             default_bot_store: None,
         }
+    }
+
+    /// Set the per-tick deadline for WS bot drivers.
+    ///
+    /// Should be set to `AppState::tick_deadline` in production so the
+    /// resolver-created drivers respect the same timing budget as the inline
+    /// WS handler.
+    pub fn with_deadline(mut self, deadline: Duration) -> Self {
+        self.deadline = deadline;
+        self
     }
 
     /// Attach shared DQ and health stores (issue 12).
@@ -239,8 +327,8 @@ impl ConnectionResolver {
     /// If a WASM bot fails to instantiate (e.g. bad upload), the slot
     /// silently falls back to the Default Bot so the match is never aborted.
     ///
-    /// WS drivers are consumed from the registry; those teams' entries are
-    /// absent from the registry after this call returns.
+    /// WS sessions remain in the registry after this call — the same bot
+    /// can play subsequent matches without reconnecting.
     pub fn resolve(&self, slots: &[Slot], params: &Params) -> Vec<Box<dyn BotDriver>> {
         slots.iter().map(|slot| self.resolve_slot(slot, params)).collect()
     }
@@ -269,21 +357,18 @@ impl ConnectionResolver {
             }
         }
 
-        // Priority 1 — WS Bot: a live connection supersedes everything.
-        if let Some(driver) = self.ws_registry.take(&slot.team) {
-            // Inject health into the WS driver if moderation is active.
-            if let Some(h) = self.make_health(&slot.team, "ws") {
-                // Downcast to WsBotDriver if possible; otherwise skip health inject.
-                // Since the registry holds Box<dyn BotDriver>, we use a trait method seam.
-                // Call set_health via Any-like downcasting isn't available here.
-                // Instead, the health entry is still registered — the ExclusionDriver
-                // will mark it connected=false on DQ.  The WS driver updates health
-                // only if it was given the entry before boxing (see ws.rs).
-                drop(h); // health entry already registered in health_store
-            }
+        // Priority 1 — WS Bot: mint a fresh per-match driver from the
+        // persistent session WITHOUT removing it from the registry.
+        let health_entry = self.make_health(&slot.team, "ws");
+        if let Some(driver) = self.ws_registry.make_driver(
+            &slot.team,
+            self.deadline,
+            health_entry.clone(),
+        ) {
             // Wrap in ExclusionDriver for mid-match kick support.
             if let Some(dq) = &self.dq_store {
-                let health = self.health_store.as_ref().and_then(|hs| hs.get(&slot.team));
+                let health = health_entry
+                    .or_else(|| self.health_store.as_ref().and_then(|hs| hs.get(&slot.team)));
                 return Box::new(ExclusionDriver::new(
                     &slot.team,
                     driver,

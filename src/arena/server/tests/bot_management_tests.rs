@@ -23,18 +23,18 @@
 //! 12. `resolver_after_clear_falls_back_to_builtin_default`
 //! 13. `default_bot_endpoints_require_auth`
 
-use std::{sync::Arc, time::Duration};
-
 use arena_engine::{Intent, Observation, Params, ShipClass, ShipSpec, Vec2};
 use arena_server::{
     auth::TokenRegistry,
     observer::ObserverHub,
     recording::RecordingStore,
-    resolver::{ConnectionResolver, Slot, WsConnectionRegistry},
+    resolver::{BotSessionSource, ConnectionResolver, Slot, WsConnectionRegistry},
     routes::{build_router_config, RouterConfig},
     runner::BotDriver,
     store::{DefaultBotStore, DisabledStore, WasmBotStore},
 };
+
+use std::{sync::Arc, time::Duration};
 use axum::body::Body;
 use http::{Method, Request, StatusCode};
 use tower::ServiceExt;
@@ -121,8 +121,9 @@ async fn http_raw(
     app.oneshot(req).await.unwrap().status()
 }
 
-// ── Stub driver for resolver tests ────────────────────────────────────────────
+// ── Stub session for resolver tests ──────────────────────────────────────────
 
+struct StubWsSession;
 struct StubWsDriver;
 
 impl BotDriver for StubWsDriver {
@@ -131,6 +132,19 @@ impl BotDriver for StubWsDriver {
     }
     fn kind(&self) -> &'static str {
         "ws"
+    }
+}
+
+impl BotSessionSource for StubWsSession {
+    fn make_driver(
+        &self,
+        _deadline: Duration,
+        _health: Option<std::sync::Arc<arena_server::health::BotHealthEntry>>,
+    ) -> Box<dyn BotDriver> {
+        Box::new(StubWsDriver)
+    }
+    fn try_send_envelope(&self, _json: String) -> bool {
+        true
     }
 }
 
@@ -468,7 +482,7 @@ async fn disabled_team_with_ws_bot_still_resolves_to_default() {
 
     let ws_registry = WsConnectionRegistry::new();
     // Insert a stub WS driver for team-a — should be bypassed.
-    ws_registry.insert("team-a", Box::new(StubWsDriver));
+    ws_registry.register("team-a", Arc::new(StubWsSession));
 
     let resolver = ConnectionResolver::new(
         Arc::clone(&ws_registry),

@@ -28,12 +28,13 @@
 use arena_engine::{Intent, Observation, Params, ShipClass, ShipSpec, Vec2};
 use arena_server::{
     pacer::NoopPacer,
-    resolver::{ConnectionResolver, Slot, WsConnectionRegistry},
+    resolver::{BotSessionSource, ConnectionResolver, Slot, WsConnectionRegistry},
     runner::{BotDriver, MatchRunner},
     store::WasmBotStore,
     ws::obs_to_tick_json,
 };
 use std::sync::Arc;
+use std::time::Duration;
 
 // ── WAT fixtures (same pattern as wasm_host_tests) ───────────────────────────
 
@@ -61,13 +62,16 @@ fn wat_to_wasm(wat: &str) -> Vec<u8> {
     wat::parse_str(wat).expect("WAT assembly failed")
 }
 
-// ── StubWsDriver ─────────────────────────────────────────────────────────────
+// ── StubWsSession ─────────────────────────────────────────────────────────────
 
-/// A stand-in for a live WsBotDriver: always returns `Some(Intent::default())`.
+/// A stand-in for a live WsSession: `make_driver` returns a driver that always
+/// returns `Some(Intent::default())`.
 ///
-/// Inserted into [`WsConnectionRegistry`] in tests to represent a connected
+/// Registered into [`WsConnectionRegistry`] in tests to represent a connected
 /// WS bot without requiring a real socket.  Reports `kind() == "ws"` so tests
 /// can assert the correct driver was chosen.
+struct StubWsSession;
+
 struct StubWsDriver;
 
 impl BotDriver for StubWsDriver {
@@ -76,6 +80,20 @@ impl BotDriver for StubWsDriver {
     }
     fn kind(&self) -> &'static str {
         "ws"
+    }
+}
+
+impl BotSessionSource for StubWsSession {
+    fn make_driver(
+        &self,
+        _deadline: Duration,
+        _health: Option<Arc<arena_server::health::BotHealthEntry>>,
+    ) -> Box<dyn BotDriver> {
+        Box::new(StubWsDriver)
+    }
+
+    fn try_send_envelope(&self, _json: String) -> bool {
+        true // no-op in tests
     }
 }
 
@@ -207,7 +225,7 @@ fn wasm_bot_when_only_wasm_present() {
 // ── Test 3: WS supersedes WASM when both are present ─────────────────────────
 //
 // RED → GREEN:
-// - registry has a StubWsDriver for "alpha"
+// - registry has a StubWsSession for "alpha"
 // - wasm_store ALSO has a WASM artifact for "alpha"
 // - resolver must pick the WS driver (priority 1 > priority 2)
 // - beta has only WASM; gamma has neither
@@ -220,8 +238,8 @@ fn ws_supersedes_wasm_when_both_present() {
     let ws_registry = WsConnectionRegistry::new();
     let wasm_store = WasmBotStore::new();
 
-    // "alpha" has BOTH a live WS driver AND a WASM artifact.
-    ws_registry.insert("alpha", Box::new(StubWsDriver));
+    // "alpha" has BOTH a live WS session AND a WASM artifact.
+    ws_registry.register("alpha", Arc::new(StubWsSession));
     wasm_store.store("alpha", wat_to_wasm(CONST_ACTION_WAT));
 
     let resolver = ConnectionResolver::new(
@@ -244,16 +262,16 @@ fn ws_supersedes_wasm_when_both_present() {
     assert_eq!(drivers[0].kind(), "ws", "alpha: WS supersedes WASM");
     assert_eq!(drivers[1].kind(), "default", "beta: no WS, no WASM → default");
 
-    // WASM artifact for alpha is still in the store (the resolver only took the WS driver).
+    // WASM artifact for alpha is still in the store.
     assert!(
         wasm_store.get("alpha").is_some(),
         "WASM artifact must remain in store after WS driver was selected"
     );
 
-    // WS driver was consumed from the registry.
+    // In the persistent model, the WS session STAYS in the registry after resolve.
     assert!(
-        !ws_registry.has("alpha"),
-        "WS driver must be taken from registry after resolve"
+        ws_registry.has("alpha"),
+        "WS session must remain in registry after resolve (persistent model)"
     );
 
     // Match still runs.
@@ -279,7 +297,7 @@ fn mixed_field_all_slots_filled_match_completes() {
     let ws_registry = WsConnectionRegistry::new();
     let wasm_store = WasmBotStore::new();
 
-    ws_registry.insert("ws-team", Box::new(StubWsDriver));
+    ws_registry.register("ws-team", Arc::new(StubWsSession));
     wasm_store.store("wasm-team", wat_to_wasm(CONST_ACTION_WAT));
 
     let resolver = ConnectionResolver::new(
@@ -331,7 +349,7 @@ fn resolution_reflects_state_at_build_time() {
     let wasm_store = WasmBotStore::new();
 
     // Scenario A: WS present → WS is chosen.
-    ws_registry.insert("alpha", Box::new(StubWsDriver));
+    ws_registry.register("alpha", Arc::new(StubWsSession));
     wasm_store.store("alpha", wat_to_wasm(CONST_ACTION_WAT));
 
     {
@@ -351,10 +369,15 @@ fn resolution_reflects_state_at_build_time() {
         assert_eq!(drivers[0].kind(), "ws", "scenario A: WS present → ws chosen");
     }
 
-    // The WS driver was consumed. The registry no longer has "alpha".
-    assert!(!ws_registry.has("alpha"), "WS driver consumed by resolve");
+    // In the persistent model, the WS session is NOT consumed by resolve.
+    // The session remains until the bot disconnects (explicit remove).
+    assert!(ws_registry.has("alpha"), "WS session stays in registry after resolve");
 
-    // Scenario B: WS absent, WASM still present → WASM is chosen.
+    // Scenario B: simulate bot disconnect by explicitly removing the session.
+    ws_registry.remove("alpha");
+    assert!(!ws_registry.has("alpha"), "WS session removed after explicit disconnect");
+
+    // Now WASM is chosen (WS gone, WASM still present).
     {
         let resolver = ConnectionResolver::new(
             Arc::clone(&ws_registry),

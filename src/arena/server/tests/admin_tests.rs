@@ -288,7 +288,6 @@ async fn exhibition_supervisor_restarts_match_on_completion() {
     supervisor.start(ExhibitionConfig {
         seed: 1,
         params: params.clone(),
-        specs: two_specs(&params),
         teams: teams(),
         wasm_store: WasmBotStore::new(),
         ws_registry: WsConnectionRegistry::new(),

@@ -29,7 +29,7 @@ use crate::{
     routes::AppState,
     runner::{BotDriver, MatchOutcome, MatchRunner, TickPacer},
     store::WasmBotStore,
-    ws::obs_to_tick_json,
+    ws::{obs_to_tick_json, MatchEndMsg, MatchResultsJson, MatchStartMsg},
 };
 
 pub struct MatchControlHandle {
@@ -248,14 +248,25 @@ pub async fn spawn_live_match(
         &specs,
         &teams,
         wasm_store,
-        ws_registry,
+        Arc::clone(&ws_registry),
         fuel_per_tick,
         DqStore::new(),
         BotHealthStore::new(),
+        Duration::from_millis(100),
         None,
     );
+    // Send matchStart envelope to every connected WS bot in this roster.
+    let match_start_json =
+        serde_json::to_string(&MatchStartMsg { type_: "matchStart" }).unwrap_or_default();
+    for team in &teams {
+        if let Some(session) = ws_registry.get(team) {
+            session.try_send_envelope(match_start_json.clone());
+        }
+    }
+    let ws_reg_for_end = Arc::clone(&ws_registry);
+    let teams_for_end = teams.clone();
     tokio::task::spawn_blocking(move || {
-        run_live_controlled(
+        let result = run_live_controlled(
             seed,
             params,
             specs,
@@ -264,7 +275,23 @@ pub async fn spawn_live_match(
             handle,
             observer_hub,
             recording_store,
-        )
+        );
+        // Send matchEnd envelope to every connected WS bot.
+        let match_end = MatchEndMsg {
+            type_: "matchEnd",
+            results: MatchResultsJson {
+                winner: result.1.winner.clone(),
+                scores: result.1.scores.iter().cloned().collect(),
+                ticks: result.1.ticks,
+            },
+        };
+        let match_end_json = serde_json::to_string(&match_end).unwrap_or_default();
+        for team in &teams_for_end {
+            if let Some(session) = ws_reg_for_end.get(team) {
+                session.try_send_envelope(match_end_json.clone());
+            }
+        }
+        result
     })
 }
 
@@ -295,7 +322,8 @@ impl MatchRegistry {
 pub struct ExhibitionConfig {
     pub seed: u64,
     pub params: Params,
-    pub specs: Vec<ShipSpec>,
+    /// Explicit team override.  Empty = use `live_teams(ws_registry)` at the
+    /// start of each match iteration so late-connecting bots are included.
     pub teams: Vec<String>,
     pub wasm_store: Arc<WasmBotStore>,
     pub ws_registry: Arc<WsConnectionRegistry>,
@@ -381,13 +409,22 @@ async fn exhibition_loop(
             break;
         }
 
+        // Recompute the roster each iteration so bots that connect later
+        // are picked up by the next match.
+        let teams = if config.teams.is_empty() {
+            live_teams(&config.ws_registry)
+        } else {
+            config.teams.clone()
+        };
+        let specs = default_specs(&config.params, teams.len());
+
         let handle = MatchControlHandle::new(config.tps);
         *current_handle.lock().await = Some(handle.clone());
         let join = spawn_live_match(
             config.seed + u64::from(match_count.load(Ordering::SeqCst)),
             config.params.clone(),
-            config.specs.clone(),
-            config.teams.clone(),
+            specs,
+            teams,
             Arc::clone(&config.wasm_store),
             Arc::clone(&config.ws_registry),
             config.fuel_per_tick,
@@ -461,7 +498,8 @@ pub async fn post_admin_start_match(
     if let Some(max_ticks) = body.max_ticks {
         params.max_ticks = max_ticks;
     }
-    let teams = normalized_teams(body.teams);
+    let explicit_teams = body.teams;
+    let teams = normalized_teams(explicit_teams.clone());
     let specs = default_specs(&params, teams.len());
 
     match body.mode.as_str() {
@@ -509,6 +547,15 @@ pub async fn post_admin_start_match(
             let tps = body.tps.unwrap_or(30);
             let handle = MatchControlHandle::new(tps);
             let match_id = Uuid::new_v4().to_string();
+            // For live matches, build the roster from connected WS bots when
+            // no explicit teams list is provided; fall back to placeholders so
+            // the field always has ≥ 2 slots.
+            let live_roster = if explicit_teams.is_some() {
+                normalized_teams(explicit_teams)
+            } else {
+                live_teams(&state.ws_registry)
+            };
+            let specs = default_specs(&params, live_roster.len());
             state
                 .match_registry
                 .register(match_id.clone(), handle.clone());
@@ -518,7 +565,7 @@ pub async fn post_admin_start_match(
                 seed,
                 params,
                 specs,
-                teams,
+                live_roster,
                 handle,
             );
             Json(StartMatchResponse {
@@ -615,13 +662,12 @@ pub async fn post_admin_exhibition_start(
     if let Err(status) = check_facilitator_auth(&headers, &state.facilitator_password) {
         return status;
     }
-    let teams = normalized_teams(None);
-    let specs = default_specs(&state.match_params, teams.len());
+    // `teams` is empty — the exhibition loop recomputes the roster from
+    // connected bots at the start of each match iteration.
     state.exhibition.start(ExhibitionConfig {
         seed: state.match_seed,
         params: state.match_params.clone(),
-        specs,
-        teams,
+        teams: vec![],
         wasm_store: Arc::clone(&state.wasm_store),
         ws_registry: Arc::clone(&state.ws_registry),
         fuel_per_tick: 10_000_000,
@@ -655,6 +701,15 @@ fn spawn_registered_live_match(
     handle: MatchControlHandle,
 ) {
     tokio::spawn(async move {
+        // Send matchStart envelope to every connected WS bot in this roster.
+        let match_start_json =
+            serde_json::to_string(&MatchStartMsg { type_: "matchStart" }).unwrap_or_default();
+        for team in &teams {
+            if let Some(session) = state.ws_registry.get(team) {
+                session.try_send_envelope(match_start_json.clone());
+            }
+        }
+
         let drivers = resolve_drivers(
             seed,
             &params,
@@ -665,6 +720,7 @@ fn spawn_registered_live_match(
             10_000_000,
             Arc::clone(&state.dq_store),
             Arc::clone(&state.health_store),
+            state.tick_deadline,
             Some(&state),
         );
         let pacer: Box<dyn TickPacer + Send> = Box::new(ControlledPacer::new(handle.clone()));
@@ -672,7 +728,6 @@ fn spawn_registered_live_match(
         let id_for_remove = match_id.clone();
 
         // Build ship→team map before specs are moved into spawn_blocking.
-        // Map: specs[i].id → teams[i], matching the headless and consume_headless_results approach.
         let ship_to_team: HashMap<String, String> = specs
             .iter()
             .zip(teams.iter())
@@ -694,7 +749,25 @@ fn spawn_registered_live_match(
         })
         .await;
 
-        // Feed the ladder once the match finishes (state.ladder was not moved above).
+        // Send matchEnd envelope to every connected WS bot in this roster.
+        if let Ok((_, ref outcome)) = result {
+            let match_end = MatchEndMsg {
+                type_: "matchEnd",
+                results: MatchResultsJson {
+                    winner: outcome.winner.clone(),
+                    scores: outcome.scores.iter().cloned().collect(),
+                    ticks: outcome.ticks,
+                },
+            };
+            let match_end_json = serde_json::to_string(&match_end).unwrap_or_default();
+            for team in &teams {
+                if let Some(session) = state.ws_registry.get(team) {
+                    session.try_send_envelope(match_end_json.clone());
+                }
+            }
+        }
+
+        // Feed the ladder once the match finishes.
         if let Ok((_, outcome)) = result {
             state.ladder.update_from_match(&outcome, |ship_id| {
                 ship_to_team
@@ -719,9 +792,11 @@ fn resolve_drivers(
     fuel_per_tick: u64,
     dq_store: Arc<DqStore>,
     health_store: Arc<BotHealthStore>,
+    tick_deadline: Duration,
     state: Option<&AppState>,
 ) -> Vec<Box<dyn BotDriver>> {
     let mut resolver = ConnectionResolver::new(ws_registry, wasm_store, fuel_per_tick)
+        .with_deadline(tick_deadline)
         .with_moderation(dq_store, health_store);
     if let Some(s) = state {
         resolver = resolver.with_management(
@@ -795,6 +870,26 @@ fn normalized_teams(teams: Option<Vec<String>>) -> Vec<String> {
     } else {
         teams
     }
+}
+
+/// Build a live-match roster from currently-connected WS bots.
+///
+/// Starts with `ws_registry.connected_teams()`, then fills up to a minimum
+/// of 2 slots with placeholder team names ("team-a", "team-b") so the match
+/// field is always valid.  Connected bots that share a name with a placeholder
+/// are not duplicated.
+fn live_teams(ws_registry: &WsConnectionRegistry) -> Vec<String> {
+    let mut teams = ws_registry.connected_teams();
+    for placeholder in &["team-a", "team-b"] {
+        if teams.len() >= 2 {
+            break;
+        }
+        let p = (*placeholder).to_owned();
+        if !teams.contains(&p) {
+            teams.push(p);
+        }
+    }
+    teams
 }
 
 fn default_specs(params: &Params, count: usize) -> Vec<ShipSpec> {

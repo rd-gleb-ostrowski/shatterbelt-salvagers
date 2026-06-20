@@ -1,6 +1,6 @@
-//! WebSocket Bot connection & live match drive (issue 03).
+//! WebSocket Bot persistent connection & per-match driver (ADR-0001 v2).
 //!
-//! ## Protocol flow (PROTOCOL.md §5)
+//! ## Protocol flow (PROTOCOL.md §5) — persistent model
 //!
 //! ```text
 //! Bot                                  Arena
@@ -8,11 +8,32 @@
 //!  |◀──── welcome ──────────────────────|
 //!  |──── join ─────────────────────────▶|
 //!  |◀──── assigned ─────────────────────|  (or close on bad token)
-//!  |◀──── matchStart ───────────────────|
+//!  |                                    |  ← bot stays connected, idle
+//!  |◀──── matchStart ───────────────────|  per match (facilitator starts one)
 //!  |◀──── tick ─────────────────────────|  per tick (bot's PRIVATE observation)
 //!  |──── action ───────────────────────▶|  per tick, before deadline
-//!  |◀──── matchEnd ─────────────────────|
+//!  |◀──── matchEnd ─────────────────────|  per match
+//!  |                 ... repeats ...     |  same socket, many matches
+//!  |──── close ────────────────────────▶|  bot closes when done
 //! ```
+//!
+//! ## WsSession — the persistent socket owner
+//!
+//! [`WsSession`] owns the WebSocket for the entire connection lifetime via
+//! a single long-lived bridge task.  It exposes:
+//!
+//! - An **outbound** `tokio::sync::mpsc::Sender<String>` (clonable) — the
+//!   bridge forwards every string frame to the socket.  Used for both per-tick
+//!   observations AND matchStart/matchEnd envelopes.
+//! - An **inbound** `Arc<Mutex<std::sync::mpsc::Receiver<Intent>>>` — the
+//!   bridge reads socket text frames, parses them with [`parse_action`], and
+//!   delivers [`Intent`]s.  Each per-match [`WsBotDriver`] locks this to
+//!   `recv_timeout` within the tick deadline.
+//!
+//! `WsSession` implements [`BotSessionSource`](crate::resolver::BotSessionSource)
+//! so the [`WsConnectionRegistry`](crate::resolver::WsConnectionRegistry) can
+//! store it and the [`ConnectionResolver`](crate::resolver::ConnectionResolver)
+//! can mint a fresh [`WsBotDriver`] per match without consuming the session.
 //!
 //! ## Serde / PROTOCOL mismatches (mapped here; PROTOCOL.md not modified)
 //!
@@ -31,16 +52,9 @@
 //! | `SingularityView.ticks_left` | `"ticksLeft"`           |
 //! | `OtherShipView.relics_carried` | `"relicsCarried"`     |
 //! | `Intent.sigil_target`     | `"sigilTarget"`            |
-//!
-//! ## Seams for future issues
-//!
-//! | Future issue | Seam |
-//! |---|---|
-//! | 06 (connection resolver) | [`WsBotDriver`] implements [`BotDriver`] — plug into resolver |
-//! | 07 (observer god stream) | call `engine.god_view()` after each `engine.step()` in `run_ws_match` |
-//! | 12 (bot health) | Add `skipped_ticks`/`last_seen` to [`WsBotDriver`]; increment on deadline miss |
 
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::extract::State;
@@ -48,13 +62,12 @@ use axum::extract::ws::{CloseFrame, Message, Utf8Bytes, WebSocket, WebSocketUpgr
 use axum::response::Response;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
-use tokio::time::timeout;
 use uuid::Uuid;
 
-use arena_engine::{Engine, Intent, ShipClass, ShipId, ShipSpec, Vec2};
+use arena_engine::{Intent, ShipClass, Vec2};
 
-use crate::bot::DefaultBotDriver;
-use crate::recording::{Recording, RecordingMeta};
+use crate::health::BotHealthEntry;
+use crate::resolver::BotSessionSource;
 use crate::routes::AppState;
 use crate::runner::BotDriver;
 
@@ -289,87 +302,140 @@ pub struct MineViewJson {
 // use EventJson without duplicating the mapping.
 pub use crate::events_json::EventJson;
 
-// ── WsBotDriver — BotDriver seam for issue 06 ────────────────────────────────
+// ── WsSession — persistent socket owner ──────────────────────────────────────
 
-/// A [`BotDriver`] backed by a WebSocket connection.
+/// Persistent WS bot session: owns the WebSocket for the entire connection
+/// lifetime via a single long-lived bridge task.
 ///
-/// Each call to [`BotDriver::decide`] serialises the observation to a `tick`
-/// JSON message, sends it to the connected bot via a channel (which a background
-/// async task forwards over the socket), then blocks for up to `deadline`
-/// waiting for an `action` reply.
+/// ## Channels
+///
+/// - **Outbound** (`outbound_tx`): `tokio::sync::mpsc::Sender<String>` (capacity
+///   16) — the bridge task drains this and writes each string to the socket.
+///   Used for tick observations AND matchStart/matchEnd envelopes.
+/// - **Inbound** (`action_rx`): `Arc<Mutex<std::sync::mpsc::Receiver<Intent>>>`
+///   — the bridge task parses incoming socket text frames with
+///   [`parse_action`] and sends [`Intent`]s into the sync channel.  Each
+///   per-match [`WsBotDriver`] holds a clone of the `Arc` and locks it
+///   during `decide` to drain stale intents and block on
+///   `recv_timeout(deadline)`.
+///
+/// ## Envelope sending
+///
+/// Call [`WsSession::try_send_envelope`] to push a matchStart/matchEnd JSON
+/// frame.  This is non-blocking (`try_send`) — if the channel is momentarily
+/// full the frame is silently dropped (a warning is logged).  The capacity of
+/// 16 provides enough headroom for concurrent envelope and tick frames.
+///
+/// ## Per-match driver
+///
+/// Call [`WsSession::make_driver`] to mint a fresh [`WsBotDriver`] for each
+/// match.  The driver holds a clone of the outbound sender and a clone of the
+/// inbound `Arc<Mutex<Receiver>>`, so it shares the same underlying socket
+/// without requiring exclusive ownership.
+pub struct WsSession {
+    /// Outbound channel shared with the bridge task and per-match drivers.
+    outbound_tx: tokio::sync::mpsc::Sender<String>,
+    /// Inbound parsed-action channel shared across per-match drivers.
+    action_rx: Arc<Mutex<std::sync::mpsc::Receiver<Intent>>>,
+}
+
+impl WsSession {
+    /// Build a `WsSession` from a live WebSocket and return the bridge future.
+    ///
+    /// The returned future must be `tokio::spawn`ed before any match can
+    /// drive this session.  The session is live for as long as the bridge
+    /// future is running (i.e. until the socket closes).
+    pub fn new(socket: WebSocket) -> (Self, impl std::future::Future<Output = ()> + Send) {
+        let (outbound_tx, outbound_rx) = tokio::sync::mpsc::channel::<String>(16);
+        let (action_stx, action_rx) = std::sync::mpsc::sync_channel::<Intent>(8);
+        let action_rx = Arc::new(Mutex::new(action_rx));
+        let bridge = ws_bridge_task(socket, outbound_rx, action_stx);
+        (Self { outbound_tx, action_rx }, bridge)
+    }
+
+    /// Mint a fresh per-match [`WsBotDriver`] backed by this session's channels.
+    ///
+    /// The driver holds:
+    /// - A **clone** of the outbound `Sender` (so it can send tick JSON).
+    /// - A **clone** of the `Arc<Mutex<Receiver>>` (so it can recv intents).
+    /// - The `deadline` for `recv_timeout`.
+    /// - An optional health entry for per-tick health tracking.
+    ///
+    /// Only one match runs per team at a time, so there is no contention on
+    /// the receiver lock.
+    pub fn make_driver(
+        &self,
+        deadline: Duration,
+        health: Option<Arc<BotHealthEntry>>,
+    ) -> Box<dyn BotDriver> {
+        Box::new(WsBotDriver {
+            outbound_tx: self.outbound_tx.clone(),
+            action_rx: Arc::clone(&self.action_rx),
+            deadline,
+            health,
+            skipped_ticks: 0,
+            last_seen: None,
+        })
+    }
+
+    /// Queue a raw JSON envelope frame (matchStart / matchEnd) to the bot.
+    ///
+    /// Uses `try_send` so it never blocks the async caller.  Returns `true`
+    /// if the frame was queued, `false` if the channel was full or closed.
+    pub fn try_send_envelope(&self, json: String) -> bool {
+        self.outbound_tx.try_send(json).is_ok()
+    }
+}
+
+impl BotSessionSource for WsSession {
+    fn make_driver(
+        &self,
+        deadline: Duration,
+        health: Option<Arc<BotHealthEntry>>,
+    ) -> Box<dyn BotDriver> {
+        WsSession::make_driver(self, deadline, health)
+    }
+
+    fn try_send_envelope(&self, json: String) -> bool {
+        WsSession::try_send_envelope(self, json)
+    }
+}
+
+// ── WsBotDriver — per-match BotDriver seam ────────────────────────────────────
+
+/// A [`BotDriver`] backed by a persistent [`WsSession`].
+///
+/// Minted once per match via [`WsSession::make_driver`].  Shares the same
+/// underlying socket (via the session's channels) with any subsequent match
+/// drivers for the same team.
 ///
 /// ## Design for spawn_blocking use
 ///
-/// [`decide`](BotDriver::decide) is synchronous; it uses
-/// `tokio::sync::mpsc::Sender::blocking_send` and
-/// `std::sync::mpsc::Receiver::recv_timeout`, both of which are safe to call
-/// from a `tokio::task::spawn_blocking` context. The match runner (MatchRunner
-/// + NoopPacer) should be run inside `spawn_blocking` when WS bots are present.
+/// [`decide`](BotDriver::decide) is synchronous and uses
+/// `tokio::sync::mpsc::Sender::blocking_send` + `std::sync::mpsc::Receiver::recv_timeout`,
+/// both of which are safe to call from a `tokio::task::spawn_blocking` context.
 ///
-/// For issue 03 the handler drives the match loop inline (async), so this driver
-/// is not exercised directly — it is the seam for issue 06 (connection resolver).
+/// ## Health tracking (issue 12)
 ///
-/// ## Seam for issue 12 (bot health)
-///
-/// Tracks skipped ticks and last-seen timestamp; both exposed via
-/// [`BotHealthEntry`](crate::health::BotHealthEntry) for `GET /admin/bots`.
+/// When a [`BotHealthEntry`] is injected via [`WsSession::make_driver`], each
+/// tick updates `last_seen` (on time) or `skipped_ticks` (on deadline miss or
+/// socket drop).
 pub struct WsBotDriver {
-    /// Sends serialised tick JSON to the socket bridge task.
-    obs_tx: tokio::sync::mpsc::Sender<String>,
-    /// Receives parsed intents from the socket bridge task.
-    action_rx: std::sync::mpsc::Receiver<Intent>,
+    /// Sends serialised tick JSON (and nothing else) to the bridge task.
+    outbound_tx: tokio::sync::mpsc::Sender<String>,
+    /// Shared inbound intent channel.  Locked exclusively during each tick's
+    /// drain + recv_timeout so no two drivers race (only one match at a time
+    /// per team is guaranteed by the orchestrator).
+    action_rx: Arc<Mutex<std::sync::mpsc::Receiver<Intent>>>,
     /// Per-tick deadline for receiving an action.
     deadline: Duration,
     // ── Issue 12 health tracking ──────────────────────────────────────────────
     skipped_ticks: u64,
     last_seen: Option<std::time::Instant>,
-    health: Option<std::sync::Arc<crate::health::BotHealthEntry>>,
+    health: Option<Arc<BotHealthEntry>>,
 }
 
 impl WsBotDriver {
-    /// Construct a `WsBotDriver` and its corresponding async socket bridge.
-    ///
-    /// The returned `Future` must be `tokio::spawn`ed before running the match.
-    /// The driver communicates with the bridge via the returned channels:
-    /// - Driver → bridge: serialised tick JSON (tokio mpsc)
-    /// - Bridge → driver: parsed intents (std sync mpsc)
-    ///
-    /// ## Usage (issue 06 connection resolver)
-    ///
-    /// ```rust,ignore
-    /// let (driver, bridge) = WsBotDriver::new(socket, state.tick_deadline);
-    /// tokio::spawn(bridge);
-    /// let drivers: Vec<Box<dyn BotDriver>> = vec![Box::new(driver), ...];
-    /// tokio::task::spawn_blocking(move || {
-    ///     MatchRunner::new(seed, params, specs, drivers, Box::new(NoopPacer))
-    ///         .run_to_completion()
-    /// }).await
-    /// ```
-    pub fn new(
-        socket: WebSocket,
-        deadline: Duration,
-    ) -> (Self, impl std::future::Future<Output = ()> + Send) {
-        let (obs_tx, obs_rx) = tokio::sync::mpsc::channel::<String>(1);
-        let (action_stx, action_rx) = std::sync::mpsc::sync_channel::<Intent>(8);
-        let bridge = ws_bridge_task(socket, obs_rx, action_stx);
-        (
-            Self {
-                obs_tx,
-                action_rx,
-                deadline,
-                skipped_ticks: 0,
-                last_seen: None,
-                health: None,
-            },
-            bridge,
-        )
-    }
-
-    /// Inject a shared health entry so `decide` can update it each tick.
-    pub fn set_health(&mut self, health: std::sync::Arc<crate::health::BotHealthEntry>) {
-        self.health = Some(health);
-    }
-
     /// Number of ticks where no intent was received before the deadline.
     pub fn skipped_ticks(&self) -> u64 {
         self.skipped_ticks
@@ -386,7 +452,7 @@ impl BotDriver for WsBotDriver {
         "ws"
     }
 
-    /// Serialize `obs` to a `tick` message, forward to the bot, and wait up to
+    /// Serialize `obs` to a `tick` message, send to the bot, and wait up to
     /// `deadline` for an `action` reply.
     ///
     /// - Returns `Some(intent)` if a fresh action arrived before the deadline.
@@ -396,13 +462,17 @@ impl BotDriver for WsBotDriver {
     /// Stale actions from previous deadline misses are drained before sending
     /// the new observation so they are not mistakenly treated as fresh.
     fn decide(&mut self, tick: u32, obs: &arena_engine::Observation) -> Option<Intent> {
-        // Drain any stale actions from previous deadline misses.
-        while self.action_rx.try_recv().is_ok() {}
+        // Lock the shared inbound channel for the duration of this tick.
+        // Only one match runs per team at a time, so no contention occurs.
+        let action_rx = self.action_rx.lock().unwrap();
 
-        // Serialise and send the observation to the socket bridge.
+        // Drain any stale actions from previous deadline misses.
+        while action_rx.try_recv().is_ok() {}
+
+        // Serialise and send the observation to the bridge task.
         let obs_json = obs_to_tick_json(tick, obs);
-        if self.obs_tx.blocking_send(obs_json).is_err() {
-            // Socket has dropped.
+        if self.outbound_tx.blocking_send(obs_json).is_err() {
+            // Socket bridge has dropped (bot disconnected mid-match).
             self.skipped_ticks += 1;
             if let Some(h) = &self.health {
                 h.increment_skipped();
@@ -412,7 +482,7 @@ impl BotDriver for WsBotDriver {
         }
 
         // Wait up to deadline for the bot's action.
-        match self.action_rx.recv_timeout(self.deadline) {
+        match action_rx.recv_timeout(self.deadline) {
             Ok(intent) => {
                 self.last_seen = Some(std::time::Instant::now());
                 if let Some(h) = &self.health {
@@ -435,18 +505,20 @@ impl BotDriver for WsBotDriver {
 /// Async task bridging between the sync [`WsBotDriver`] channels and the WebSocket.
 ///
 /// Runs for the lifetime of the WS connection:
-/// - Reads serialised tick observations from the driver, writes to socket.
-/// - Reads action text messages from the socket, parses, writes to driver.
+/// - Reads outbound messages (tick observations AND envelope frames) from
+///   `outbound_rx`, writes them as text frames to the socket.
+/// - Reads action text messages from the socket, parses with [`parse_action`],
+///   forwards parsed intents to `action_tx`.
 async fn ws_bridge_task(
     socket: WebSocket,
-    mut obs_rx: tokio::sync::mpsc::Receiver<String>,
+    mut outbound_rx: tokio::sync::mpsc::Receiver<String>,
     action_tx: std::sync::mpsc::SyncSender<Intent>,
 ) {
     let (mut sink, mut stream) = socket.split();
 
     let write_fut = async {
-        while let Some(obs_json) = obs_rx.recv().await {
-            if sink.send(Message::Text(obs_json.into())).await.is_err() {
+        while let Some(msg) = outbound_rx.recv().await {
+            if sink.send(Message::Text(msg.into())).await.is_err() {
                 break;
             }
         }
@@ -481,16 +553,23 @@ pub async fn ws_bot_handler(
     ws.on_upgrade(move |socket| handle_ws_bot(socket, state))
 }
 
-/// Drive a single WS bot connection through the full match lifecycle.
+/// Drive a WS bot connection for its full lifetime.
 ///
 /// Steps:
 /// 1. **Handshake** (PROTOCOL.md §5): send `welcome`, receive `join`,
 ///    validate token, send `assigned` (or close on bad token).
-/// 2. **Match** (PROTOCOL.md §5–8): send `matchStart`, then per tick:
-///    send `tick` (bot's private fog-respecting observation),
-///    await `action` up to `state.tick_deadline`,
-///    advance the engine, repeat until match over.
-/// 3. **matchEnd**: send `matchEnd` with results.
+/// 2. **Register**: build a [`WsSession`], spawn its bridge task, register
+///    the session in `state.ws_registry` under the team name, and mark the
+///    health entry as connected.  The bot is now idle — it waits for the
+///    orchestrator to start a match.
+/// 3. **Persist**: await the bridge task for the entire connection lifetime.
+///    The orchestrator sends matchStart/matchEnd envelopes and per-tick
+///    observations through the session's outbound channel; the bot's actions
+///    arrive through the inbound channel.
+/// 4. **Cleanup**: when the bridge exits (socket closed by bot or error),
+///    remove the session from the registry and mark health as disconnected.
+///
+/// NO match is run here.  Match orchestration lives in `admin.rs`.
 async fn handle_ws_bot(mut socket: WebSocket, state: AppState) {
     // ── 1. Handshake ──────────────────────────────────────────────────────────
 
@@ -535,13 +614,12 @@ async fn handle_ws_bot(mut socket: WebSocket, state: AppState) {
         }
     };
 
-    // Assign the WS bot to ship-0 (issue 06 connection resolver will handle
-    // multi-bot slot assignment; for now one WS bot per match, always ship-0).
-    let ws_ship_id: ShipId = "ship-0".to_owned();
-
+    // Inform the bot of its stable team identity.
+    // `assigned.shipId` is the team name; per-match ship ids come from
+    // `self.id` in each tick observation (assigned by the match specs).
     let assigned = AssignedMsg {
         type_: "assigned",
-        ship_id: ws_ship_id.clone(),
+        ship_id: team.clone(),
     };
     if socket
         .send(Message::Text(
@@ -553,149 +631,31 @@ async fn handle_ws_bot(mut socket: WebSocket, state: AppState) {
         return;
     }
 
-    // ── 2. Match setup ────────────────────────────────────────────────────────
+    // ── 2. Build WsSession and spawn bridge ───────────────────────────────────
 
-    // Register health entry for the WS bot's inline match.
+    let (session, bridge_future) = WsSession::new(socket);
+    let session: Arc<dyn BotSessionSource> = Arc::new(session);
+    let bridge_handle = tokio::spawn(bridge_future);
+
+    // ── 3. Register session and mark health connected ─────────────────────────
+
+    state.ws_registry.register(team.clone(), Arc::clone(&session));
     let health_entry = state
         .health_store
         .register(crate::health::BotHealthEntry::new(&team, "ws"));
     health_entry.set_connected(true);
 
-    let params = state.match_params.clone();
-    let seed = state.match_seed;
-    let default_ship_id: ShipId = "ship-1".to_owned();
-
-    // Place ships symmetrically in the arena.
-    let specs = vec![
-        ShipSpec {
-            id: ws_ship_id.clone(),
-            class: ShipClass::Skiff,
-            anchor_pos: Vec2::new(params.arena_w * 0.2, params.arena_h * 0.5),
-        },
-        ShipSpec {
-            id: default_ship_id.clone(),
-            class: ShipClass::Skiff,
-            anchor_pos: Vec2::new(params.arena_w * 0.8, params.arena_h * 0.5),
-        },
-    ];
-
-    let mut engine = Engine::new(seed, params.clone(), specs.clone());
-    let mut default_driver = DefaultBotDriver::new(&params);
-
-    // ── 3. matchStart ─────────────────────────────────────────────────────────
-
-    let match_start = MatchStartMsg { type_: "matchStart" };
-    if socket
-        .send(Message::Text(
-            serde_json::to_string(&match_start).unwrap_or_default().into(),
-        ))
-        .await
-        .is_err()
-    {
-        return;
-    }
-
-    // ── 4. Match loop ─────────────────────────────────────────────────────────
-
-    while !engine.is_match_over() {
-        let tick = engine.tick();
-
-        // Send the bot its private fog-respecting observation.
-        if let Some(ws_obs) = engine.observation(&ws_ship_id) {
-            let tick_json = obs_to_tick_json(tick, &ws_obs);
-            if socket
-                .send(Message::Text(tick_json.into()))
-                .await
-                .is_err()
-            {
-                health_entry.set_connected(false);
-                return; // bot disconnected
-            }
-        }
-
-        // Wait up to deadline for the bot's action (PROTOCOL §2: missed deadline
-        // → previous intent persists in the engine; server does not track it).
-        let ws_intent = timeout(state.tick_deadline, recv_text(&mut socket))
-            .await
-            .ok()
-            .flatten()
-            .and_then(|text| parse_action(&text).ok());
-
-        // Issue 12: track per-tick health for the WS bot.
-        if ws_intent.is_some() {
-            health_entry.touch();
-        } else {
-            health_entry.increment_skipped();
-        }
-
-        // Collect all intents for this tick.
-        let mut intents: Vec<(ShipId, Intent)> = Vec::new();
-        if let Some(intent) = ws_intent {
-            intents.push((ws_ship_id.clone(), intent));
-        }
-        if let Some(obs) = engine.observation(&default_ship_id) {
-            if let Some(intent) = default_driver.decide(tick, &obs) {
-                intents.push((default_ship_id.clone(), intent));
-            }
-        }
-
-        // Issue 07: broadcast the full world state to Viewer clients after each tick.
-        let events = engine.step(intents);
-        state.observer_hub.publish_god_view(&engine.god_view(), &events);
-    }
-
-    // ── 5. matchEnd ───────────────────────────────────────────────────────────
-
-    let ship_ids = [ws_ship_id.clone(), default_ship_id.clone()];
-    let scores: HashMap<String, f32> = ship_ids
-        .iter()
-        .map(|id| (id.clone(), engine.score(id).unwrap_or(0.0)))
-        .collect();
-
-    // ── Issue 08: record the finished match ───────────────────────────────────
+    // ── 4. Await bridge — live for the entire connection lifetime ─────────────
     //
-    // Persist the seed, scaled params, specs, and full applied-intent log so
-    // the match can be replayed exactly via `harness::replay_match`.
-    //
-    // Seam (issue 10 / TrueSkill): `recording.meta.winner` and
-    // `recording.meta.scores` are available here for rating updates.
-    {
-        let match_id = Uuid::new_v4().to_string();
-        let score_vec: Vec<(ShipId, f32)> = ship_ids
-            .iter()
-            .map(|id| (id.clone(), engine.score(id).unwrap_or(0.0)))
-            .collect();
-        let recording = Recording {
-            match_id: match_id.clone(),
-            seed,
-            params: params.clone(),
-            specs: specs.clone(),
-            intent_log: engine.intent_log().to_vec(),
-            meta: RecordingMeta {
-                match_id,
-                seed,
-                tick_count: engine.tick(),
-                winner: engine.winner(),
-                scores: score_vec,
-            },
-        };
-        state.recording_store.record(recording);
-    }
+    // The match orchestrator sends matchStart/matchEnd envelopes through the
+    // session's outbound channel; per-tick observations come from WsBotDriver
+    // via the same channel.  We just wait here until the bridge exits.
+    let _ = bridge_handle.await;
 
-    let match_end = MatchEndMsg {
-        type_: "matchEnd",
-        results: MatchResultsJson {
-            winner: engine.winner(),
-            scores,
-            ticks: engine.tick(),
-        },
-    };
-    socket
-        .send(Message::Text(
-            serde_json::to_string(&match_end).unwrap_or_default().into(),
-        ))
-        .await
-        .ok();
+    // ── 5. Cleanup on disconnect ──────────────────────────────────────────────
+
+    state.ws_registry.remove(&team);
+    health_entry.set_connected(false);
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

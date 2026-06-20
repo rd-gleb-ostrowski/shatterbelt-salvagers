@@ -430,6 +430,32 @@ async fn ws_missed_deadlines_increment_skipped_ticks() {
     .await
     .unwrap();
 
+    // Wait for assigned (bot is now registered but idle).
+    loop {
+        match ws.next().await.unwrap().unwrap() {
+            WsMsg::Text(t) => {
+                let v: Value = serde_json::from_str(&t).unwrap_or_default();
+                if v["type"] == "assigned" {
+                    break;
+                }
+            }
+            _ => continue,
+        }
+    }
+
+    // Brief delay so the server completes registration.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    // Start a live match that includes this team so ticks start flowing.
+    let start_resp = client
+        .post(format!("http://{addr}/admin/matches"))
+        .header("Authorization", "Facilitator test-facilitator")
+        .json(&serde_json::json!({ "mode": "live", "maxTicks": 5, "teams": ["ws-team", "team-b"] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(start_resp.status(), 200, "match start must succeed");
+
     // Drain all messages (matchStart, ticks, matchEnd) without responding.
     // Bound: at most 5 ticks + 3 control messages = 8 messages max.
     let mut msg_count = 0_u32;

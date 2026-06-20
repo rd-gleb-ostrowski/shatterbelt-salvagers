@@ -54,25 +54,46 @@ Auth is intentionally simple — pre-shared passwords, no accounts.
 - **Admin** endpoints (match control, ladder control, kicks) are gated by a separate
   **facilitator password**.
 
-## 5. WS connection handshake
+## 5. WS connection handshake — persistent multi-match model
+
+A WS bot connects **once** and stays connected across **successive matches**.  The Arena streams
+`tick` observations for whatever live match it runs the bot in; the socket remains open until the
+bot closes it.
 
 ```
 Bot                              Arena
  |──── WebSocket connect ────────▶|
  |◀──── welcome ──────────────────|  { type:"welcome", protocolVersion, sessionId, gameType }
  |──── join ─────────────────────▶|  { type:"join", sessionId (echo), token, name, preferredClass? }
- |◀──── assigned ─────────────────|  { type:"assigned", shipId }
- |              ... lobby ...      |
- |◀──── matchStart ───────────────|  (followed immediately by the first tick)
- |◀──── tick (observation) ───────|  per tick
- |──── action (intent) ──────────▶|  per tick, before the deadline
- |◀──── matchEnd ─────────────────|  { type:"matchEnd", results }
+ |◀──── assigned ─────────────────|  { type:"assigned", shipId }  ← shipId = team name (stable identity)
+ |                                |  ← bot is now registered; it idles until the Arena starts a match
+ |      ┌─── match N ─────────────┤
+ |      |◀── matchStart ──────────|  { type:"matchStart" }
+ |      |◀── tick (observation) ──|  per tick; self.id carries the per-match ship id
+ |      |─── action (intent) ────▶|  per tick, before deadline
+ |      |◀── matchEnd ────────────|  { type:"matchEnd", results:{winner,scores,ticks} }
+ |      └─────────────────────────┤
+ |      ┌─── match N+1 ───────────┤  (same socket, repeated for every match)
+ |      |    ...                  |
+ |      └─────────────────────────┤
+ |──── close ────────────────────▶|  bot disconnects when done
 ```
 
-The `sessionId` is a UUID the Arena issues in `welcome`; the bot echoes it in `join` (connection
-challenge) along with its **token** from registration (identity → which team's ship it gets). The
-bot learns *everything else* about the world from the observations themselves (each one is
-self-describing — see `self.id`, `seed`, `arena`, `maxTicks`).
+**Key points:**
+
+- `assigned.shipId` at connect time is the team's **stable identity** (the team name from
+  `POST /register`).  The per-match ship id (e.g. `"ship-0"`) is conveyed in every tick's
+  `self.id` field — read it from the observation, not from `assigned`.
+- After `assigned`, the connection stays open.  The Arena sends `matchStart` only when the
+  facilitator starts a match that includes this team.
+- `matchStart` is sent immediately before the first `tick` of each match.  `matchEnd` is sent
+  after the last tick, with the final scores and winner.
+- The bot plays across successive matches until **it** closes the WebSocket.
+- If the bot misses a per-tick deadline, the engine carries its previous intent forward
+  (PROTOCOL §2); no reconnect is needed.
+
+`sessionId` is a UUID the Arena issues in `welcome`; the bot echoes it in `join` (connection
+challenge) along with its **token** from registration (identity → which team's ship it gets).
 
 WASM bots skip the handshake: the Arena instantiates the module, calls `init` with the tick-0
 observation, then calls `tick` each tick (see §9).
