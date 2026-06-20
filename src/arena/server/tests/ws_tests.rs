@@ -49,6 +49,8 @@ fn test_app(registry: std::sync::Arc<TokenRegistry>) -> axum::Router {
         match_params: Params { max_ticks: TEST_MAX_TICKS, ..Params::default() },
         observer_hub: arena_server::observer::ObserverHub::new(),
         recording_store: arena_server::recording::RecordingStore::new(),
+        health_store: arena_server::health::BotHealthStore::new(),
+        dq_store: arena_server::health::DqStore::new(),
     })
 }
 

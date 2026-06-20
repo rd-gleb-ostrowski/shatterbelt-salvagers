@@ -30,6 +30,7 @@ use std::sync::{Arc, Mutex};
 use arena_engine::Params;
 
 use crate::bot::DefaultBotDriver;
+use crate::health::{BotHealthEntry, BotHealthStore, DqStore, ExclusionDriver};
 use crate::runner::BotDriver;
 use crate::store::WasmBotStore;
 use crate::wasm_host::WasmBotDriver;
@@ -161,6 +162,12 @@ pub struct ConnectionResolver {
     /// Wasmtime fuel budget per `tick` call. `10_000_000` is a generous
     /// default; tests may pass a smaller value to trigger exhaustion.
     fuel_per_tick: u64,
+    /// Optional DQ store — checked before WS/WASM driver selection.
+    /// When `None`, no exclusion is applied (backward-compat with tests).
+    dq_store: Option<Arc<DqStore>>,
+    /// Optional health store — a `BotHealthEntry` is registered per slot
+    /// when this is `Some`.  When `None`, health is not tracked.
+    health_store: Option<Arc<BotHealthStore>>,
 }
 
 impl ConnectionResolver {
@@ -176,7 +183,26 @@ impl ConnectionResolver {
         wasm_store: Arc<WasmBotStore>,
         fuel_per_tick: u64,
     ) -> Self {
-        Self { ws_registry, wasm_store, fuel_per_tick }
+        Self {
+            ws_registry,
+            wasm_store,
+            fuel_per_tick,
+            dq_store: None,
+            health_store: None,
+        }
+    }
+
+    /// Attach shared DQ and health stores (issue 12).
+    ///
+    /// When set:
+    /// - DQ'd teams fall back to Default Bot (WS/WASM drivers are skipped).
+    /// - A `BotHealthEntry` is created per slot and injected into the driver.
+    /// - Every driver is wrapped in an [`ExclusionDriver`] so mid-match kicks
+    ///   take effect on the next tick.
+    pub fn with_moderation(mut self, dq: Arc<DqStore>, health: Arc<BotHealthStore>) -> Self {
+        self.dq_store = Some(dq);
+        self.health_store = Some(health);
+        self
     }
 
     /// Build the per-slot driver list for one match.
@@ -194,15 +220,66 @@ impl ConnectionResolver {
     }
 
     fn resolve_slot(&self, slot: &Slot, params: &Params) -> Box<dyn BotDriver> {
+        // If moderation is active and team is DQ'd → Default Bot immediately.
+        if let Some(dq) = &self.dq_store {
+            if dq.is_disqualified(&slot.team) {
+                let health = self.make_health(&slot.team, "default");
+                let inner: Box<dyn BotDriver> = Box::new(DefaultBotDriver::new(params));
+                return Box::new(ExclusionDriver::new(
+                    &slot.team,
+                    inner,
+                    Arc::clone(dq),
+                    health,
+                ));
+            }
+        }
+
         // Priority 1 — WS Bot: a live connection supersedes everything.
         if let Some(driver) = self.ws_registry.take(&slot.team) {
+            // Inject health into the WS driver if moderation is active.
+            if let Some(h) = self.make_health(&slot.team, "ws") {
+                // Downcast to WsBotDriver if possible; otherwise skip health inject.
+                // Since the registry holds Box<dyn BotDriver>, we use a trait method seam.
+                // Call set_health via Any-like downcasting isn't available here.
+                // Instead, the health entry is still registered — the ExclusionDriver
+                // will mark it connected=false on DQ.  The WS driver updates health
+                // only if it was given the entry before boxing (see ws.rs).
+                drop(h); // health entry already registered in health_store
+            }
+            // Wrap in ExclusionDriver for mid-match kick support.
+            if let Some(dq) = &self.dq_store {
+                let health = self.health_store.as_ref().and_then(|hs| hs.get(&slot.team));
+                return Box::new(ExclusionDriver::new(
+                    &slot.team,
+                    driver,
+                    Arc::clone(dq),
+                    health,
+                ));
+            }
             return driver;
         }
 
         // Priority 2 — WASM Bot: uploaded artifact.
         if let Some(bytes) = self.wasm_store.get(&slot.team) {
             match WasmBotDriver::new(&bytes, &slot.tick0_obs_json, self.fuel_per_tick) {
-                Ok(driver) => return Box::new(driver),
+                Ok(mut driver) => {
+                    let health = self.make_health(&slot.team, "wasm");
+                    if let Some(h) = health {
+                        driver.set_health(Arc::clone(&h));
+                        let dq = self
+                            .dq_store
+                            .as_ref()
+                            .cloned()
+                            .unwrap_or_else(DqStore::new);
+                        return Box::new(ExclusionDriver::new(
+                            &slot.team,
+                            Box::new(driver),
+                            dq,
+                            Some(h),
+                        ));
+                    }
+                    return Box::new(driver);
+                }
                 Err(_) => {
                     // Bad upload — fall through to Default Bot.
                     // The match must never abort due to a broken artifact.
@@ -211,6 +288,19 @@ impl ConnectionResolver {
         }
 
         // Priority 3 — Default Bot: built-in fallback, field always full.
-        Box::new(DefaultBotDriver::new(params))
+        let health = self.make_health(&slot.team, "default");
+        let inner: Box<dyn BotDriver> = Box::new(DefaultBotDriver::new(params));
+        if let Some(dq) = &self.dq_store {
+            Box::new(ExclusionDriver::new(&slot.team, inner, Arc::clone(dq), health))
+        } else {
+            inner
+        }
+    }
+
+    /// Create and register a health entry when health tracking is active.
+    fn make_health(&self, team: &str, kind: &str) -> Option<Arc<BotHealthEntry>> {
+        self.health_store
+            .as_ref()
+            .map(|hs| hs.register(BotHealthEntry::new(team, kind)))
     }
 }

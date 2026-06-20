@@ -332,8 +332,8 @@ pub enum EventJson {
 ///
 /// ## Seam for issue 12 (bot health)
 ///
-/// Add `skipped_ticks: u32` and `last_seen: Instant` fields;
-/// increment `skipped_ticks` on `recv_timeout` error; reset on success.
+/// Tracks skipped ticks and last-seen timestamp; both exposed via
+/// [`BotHealthEntry`](crate::health::BotHealthEntry) for `GET /admin/bots`.
 pub struct WsBotDriver {
     /// Sends serialised tick JSON to the socket bridge task.
     obs_tx: tokio::sync::mpsc::Sender<String>,
@@ -341,9 +341,10 @@ pub struct WsBotDriver {
     action_rx: std::sync::mpsc::Receiver<Intent>,
     /// Per-tick deadline for receiving an action.
     deadline: Duration,
-    // ── Issue 12 health seam ──────────────────────────────────────────────
-    // skipped_ticks: u32,
-    // last_seen: Option<std::time::Instant>,
+    // ── Issue 12 health tracking ──────────────────────────────────────────────
+    skipped_ticks: u64,
+    last_seen: Option<std::time::Instant>,
+    health: Option<std::sync::Arc<crate::health::BotHealthEntry>>,
 }
 
 impl WsBotDriver {
@@ -372,7 +373,32 @@ impl WsBotDriver {
         let (obs_tx, obs_rx) = tokio::sync::mpsc::channel::<String>(1);
         let (action_stx, action_rx) = std::sync::mpsc::sync_channel::<Intent>(8);
         let bridge = ws_bridge_task(socket, obs_rx, action_stx);
-        (Self { obs_tx, action_rx, deadline }, bridge)
+        (
+            Self {
+                obs_tx,
+                action_rx,
+                deadline,
+                skipped_ticks: 0,
+                last_seen: None,
+                health: None,
+            },
+            bridge,
+        )
+    }
+
+    /// Inject a shared health entry so `decide` can update it each tick.
+    pub fn set_health(&mut self, health: std::sync::Arc<crate::health::BotHealthEntry>) {
+        self.health = Some(health);
+    }
+
+    /// Number of ticks where no intent was received before the deadline.
+    pub fn skipped_ticks(&self) -> u64 {
+        self.skipped_ticks
+    }
+
+    /// Wall-clock time of the most recent successful action receipt.
+    pub fn last_seen(&self) -> Option<std::time::Instant> {
+        self.last_seen
     }
 }
 
@@ -396,10 +422,34 @@ impl BotDriver for WsBotDriver {
 
         // Serialise and send the observation to the socket bridge.
         let obs_json = obs_to_tick_json(tick, obs);
-        self.obs_tx.blocking_send(obs_json).ok()?;
+        if self.obs_tx.blocking_send(obs_json).is_err() {
+            // Socket has dropped.
+            self.skipped_ticks += 1;
+            if let Some(h) = &self.health {
+                h.increment_skipped();
+                h.set_connected(false);
+            }
+            return None;
+        }
 
         // Wait up to deadline for the bot's action.
-        self.action_rx.recv_timeout(self.deadline).ok()
+        match self.action_rx.recv_timeout(self.deadline) {
+            Ok(intent) => {
+                self.last_seen = Some(std::time::Instant::now());
+                if let Some(h) = &self.health {
+                    h.touch();
+                    h.set_connected(true);
+                }
+                Some(intent)
+            }
+            Err(_) => {
+                self.skipped_ticks += 1;
+                if let Some(h) = &self.health {
+                    h.increment_skipped();
+                }
+                None
+            }
+        }
     }
 }
 
@@ -498,7 +548,7 @@ async fn handle_ws_bot(mut socket: WebSocket, state: AppState) {
     };
 
     // Validate token via the shared registry
-    let _team = match state.registry.resolve(&join.token) {
+    let team = match state.registry.resolve(&join.token) {
         Some(t) => t,
         None => {
             close_with_error(&mut socket, 1008, "invalid or absent token").await;
@@ -525,6 +575,12 @@ async fn handle_ws_bot(mut socket: WebSocket, state: AppState) {
     }
 
     // ── 2. Match setup ────────────────────────────────────────────────────────
+
+    // Register health entry for the WS bot's inline match.
+    let health_entry = state
+        .health_store
+        .register(crate::health::BotHealthEntry::new(&team, "ws"));
+    health_entry.set_connected(true);
 
     let params = state.match_params.clone();
     let seed = state.match_seed;
@@ -573,6 +629,7 @@ async fn handle_ws_bot(mut socket: WebSocket, state: AppState) {
                 .await
                 .is_err()
             {
+                health_entry.set_connected(false);
                 return; // bot disconnected
             }
         }
@@ -584,6 +641,13 @@ async fn handle_ws_bot(mut socket: WebSocket, state: AppState) {
             .ok()
             .flatten()
             .and_then(|text| parse_action(&text).ok());
+
+        // Issue 12: track per-tick health for the WS bot.
+        if ws_intent.is_some() {
+            health_entry.touch();
+        } else {
+            health_entry.increment_skipped();
+        }
 
         // Collect all intents for this tick.
         let mut intents: Vec<(ShipId, Intent)> = Vec::new();

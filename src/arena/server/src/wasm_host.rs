@@ -89,6 +89,8 @@ pub struct WasmBotDriver {
     alloc_fn: TypedFunc<i32, i32>,
     tick_fn: TypedFunc<(i32, i32), i64>,
     fuel_per_tick: u64,
+    /// Issue 12: shared health entry updated after every tick.
+    health: Option<std::sync::Arc<crate::health::BotHealthEntry>>,
 }
 
 impl WasmBotDriver {
@@ -202,7 +204,12 @@ impl WasmBotDriver {
             .call(&mut store, (buf_ptr, obs_len))
             .map_err(|e| anyhow!("init trapped during warm-up: {e}"))?;
 
-        Ok(Self { store, memory, alloc_fn, tick_fn, fuel_per_tick })
+        Ok(Self { store, memory, alloc_fn, tick_fn, fuel_per_tick, health: None })
+    }
+
+    /// Inject a shared health entry so `decide` can update it each tick.
+    pub fn set_health(&mut self, health: std::sync::Arc<crate::health::BotHealthEntry>) {
+        self.health = Some(health);
     }
 
     // ── Observability (issue 12 seams) ────────────────────────────────────────
@@ -230,29 +237,9 @@ impl WasmBotDriver {
     pub fn trap_count(&self) -> u64 {
         self.store.data().trap_count
     }
-}
 
-// ── BotDriver impl ────────────────────────────────────────────────────────────
-
-impl BotDriver for WasmBotDriver {
-    fn kind(&self) -> &'static str {
-        "wasm"
-    }
-
-    /// Run one tick of the WASM bot.
-    ///
-    /// ## Fuel reset
-    ///
-    /// The store's fuel is reset to `fuel_per_tick` at the top of each call so
-    /// every tick gets a fresh, equal budget regardless of what the previous
-    /// tick consumed.
-    ///
-    /// ## Error handling
-    ///
-    /// Any failure (fuel exhaustion, other trap, bad action JSON, memory OOB)
-    /// returns `None`.  The engine's per-field intent persistence keeps the
-    /// ship moving on its previous intent; the match never crashes.
-    fn decide(&mut self, tick: u32, obs: &Observation) -> Option<Intent> {
+    /// Inner decide — computes the intent without touching health fields.
+    fn decide_inner(&mut self, tick: u32, obs: &Observation) -> Option<Intent> {
         // Fresh fuel budget for this tick.
         self.store.set_fuel(self.fuel_per_tick).ok()?;
 
@@ -295,5 +282,47 @@ impl BotDriver for WasmBotDriver {
 
         // Parse into an engine Intent using the shared WS-path parser.
         parse_action(action_str).ok()
+    }
+}
+
+// ── BotDriver impl ────────────────────────────────────────────────────────────
+
+impl BotDriver for WasmBotDriver {
+    fn kind(&self) -> &'static str {
+        "wasm"
+    }
+
+    /// Run one tick of the WASM bot.
+    ///
+    /// ## Fuel reset
+    ///
+    /// The store's fuel is reset to `fuel_per_tick` at the top of each call so
+    /// every tick gets a fresh, equal budget regardless of what the previous
+    /// tick consumed.
+    ///
+    /// ## Error handling
+    ///
+    /// Any failure (fuel exhaustion, other trap, bad action JSON, memory OOB)
+    /// returns `None`.  The engine's per-field intent persistence keeps the
+    /// ship moving on its previous intent; the match never crashes.
+    fn decide(&mut self, tick: u32, obs: &Observation) -> Option<Intent> {
+        let result = self.decide_inner(tick, obs);
+
+        // Issue 12: sync health metrics after every tick.
+        if let Some(h) = &self.health {
+            let total_faults =
+                self.store.data().fuel_exhausted_count + self.store.data().trap_count;
+            h.set_crashes(total_faults);
+            // Drain the log buffer into the health entry.
+            let log_bytes = std::mem::take(&mut self.store.data_mut().log_buffer);
+            h.append_logs(&log_bytes);
+            if result.is_some() {
+                h.touch();
+            } else {
+                h.increment_skipped();
+            }
+        }
+
+        result
     }
 }

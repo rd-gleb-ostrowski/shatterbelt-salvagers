@@ -20,6 +20,7 @@ use uuid::Uuid;
 
 use crate::{
     headless::HeadlessRunner,
+    health::{BotHealthStore, DqStore},
     observer::ObserverHub,
     pacer::NoopPacer,
     recording::{Recording, RecordingMeta, RecordingStore},
@@ -247,6 +248,8 @@ pub async fn spawn_live_match(
         wasm_store,
         ws_registry,
         fuel_per_tick,
+        DqStore::new(),
+        BotHealthStore::new(),
     );
     tokio::task::spawn_blocking(move || {
         run_live_controlled(
@@ -460,7 +463,7 @@ pub async fn post_admin_start_match(
 
     match body.mode.as_str() {
         "headless" => {
-            let runner = HeadlessRunner::new(
+            let runner = HeadlessRunner::new_with_health(
                 Arc::clone(&state.wasm_store),
                 Arc::clone(&state.recording_store),
                 params,
@@ -468,6 +471,8 @@ pub async fn post_admin_start_match(
                 teams,
                 10_000_000,
                 seed,
+                Arc::clone(&state.dq_store),
+                Arc::clone(&state.health_store),
             );
             let result = tokio::task::spawn_blocking(move || runner.run_one_seeded(seed))
                 .await
@@ -636,6 +641,8 @@ fn spawn_registered_live_match(
             Arc::clone(&state.wasm_store),
             Arc::clone(&state.ws_registry),
             10_000_000,
+            Arc::clone(&state.dq_store),
+            Arc::clone(&state.health_store),
         );
         let pacer: Box<dyn TickPacer + Send> = Box::new(ControlledPacer::new(handle.clone()));
         let registry = Arc::clone(&state.match_registry);
@@ -658,6 +665,7 @@ fn spawn_registered_live_match(
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 fn resolve_drivers(
     seed: u64,
     params: &Params,
@@ -666,8 +674,11 @@ fn resolve_drivers(
     wasm_store: Arc<WasmBotStore>,
     ws_registry: Arc<WsConnectionRegistry>,
     fuel_per_tick: u64,
+    dq_store: Arc<DqStore>,
+    health_store: Arc<BotHealthStore>,
 ) -> Vec<Box<dyn BotDriver>> {
-    let resolver = ConnectionResolver::new(ws_registry, wasm_store, fuel_per_tick);
+    let resolver = ConnectionResolver::new(ws_registry, wasm_store, fuel_per_tick)
+        .with_moderation(dq_store, health_store);
     let engine0 = Engine::new(seed, params.clone(), specs.to_vec());
     let slots: Vec<Slot> = teams
         .iter()
@@ -684,6 +695,47 @@ fn resolve_drivers(
         })
         .collect();
     resolver.resolve(&slots, params)
+}
+
+// ── Health & moderation handlers ─────────────────────────────────────────────
+
+/// `GET /admin/bots` — list health for every known bot.
+///
+/// Returns an array of [`BotHealthSnapshot`](crate::health::BotHealthSnapshot)
+/// objects, one per team.  Facilitator-gated.
+pub async fn get_admin_bots(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(status) = check_facilitator_auth(&headers, &state.facilitator_password) {
+        return status.into_response();
+    }
+    Json(state.health_store.list_snapshots()).into_response()
+}
+
+/// `POST /admin/bots/{team}/kick` — disqualify a misbehaving bot.
+///
+/// - Adds the team to the [`DqStore`](crate::health::DqStore) so:
+///   - The live match's [`ExclusionDriver`](crate::health::ExclusionDriver) will
+///     return `None` from the next tick onward (ship falls back to engine
+///     persistence / Default behaviour).
+///   - Future match resolutions skip WS and WASM bots for this team and
+///     assign the Default Bot instead.
+/// - Marks the team's health entry `connected=false`.
+/// - Facilitator-gated.
+pub async fn post_admin_kick_bot(
+    State(state): State<AppState>,
+    Path(team): Path<String>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(status) = check_facilitator_auth(&headers, &state.facilitator_password) {
+        return status;
+    }
+    state.dq_store.disqualify(&team);
+    if let Some(entry) = state.health_store.get(&team) {
+        entry.set_connected(false);
+    }
+    StatusCode::OK
 }
 
 fn normalized_teams(teams: Option<Vec<String>>) -> Vec<String> {

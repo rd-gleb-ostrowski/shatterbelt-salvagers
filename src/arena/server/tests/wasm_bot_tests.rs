@@ -59,6 +59,8 @@ fn app_with_store() -> (axum::Router, Arc<TokenRegistry>, Arc<WasmBotStore>) {
         match_params: Params::default(),
         observer_hub: arena_server::observer::ObserverHub::new(),
         recording_store: arena_server::recording::RecordingStore::new(),
+        health_store: arena_server::health::BotHealthStore::new(),
+        dq_store: arena_server::health::DqStore::new(),
     });
     (app, registry, store)
 }

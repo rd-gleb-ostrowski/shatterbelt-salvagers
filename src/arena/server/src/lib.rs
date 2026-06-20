@@ -31,6 +31,7 @@ pub mod admin;
 pub mod auth;
 pub mod bot;
 pub mod headless;
+pub mod health;
 pub mod ladder;
 pub mod observer;
 pub mod pacer;

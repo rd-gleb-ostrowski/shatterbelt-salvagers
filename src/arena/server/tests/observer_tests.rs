@@ -61,6 +61,8 @@ fn test_app_with_hub(
         match_params: Params { max_ticks: TEST_MAX_TICKS, ..Params::default() },
         observer_hub: hub.clone(),
         recording_store: arena_server::recording::RecordingStore::new(),
+        health_store: arena_server::health::BotHealthStore::new(),
+        dq_store: arena_server::health::DqStore::new(),
     });
     (app, hub)
 }

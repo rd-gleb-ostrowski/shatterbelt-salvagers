@@ -57,6 +57,8 @@ fn test_app_with_params(
         match_params: params,
         observer_hub,
         recording_store,
+        health_store: arena_server::health::BotHealthStore::new(),
+        dq_store: arena_server::health::DqStore::new(),
     })
 }
 

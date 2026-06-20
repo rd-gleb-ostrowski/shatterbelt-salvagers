@@ -39,6 +39,7 @@ use arena_engine::Params;
 
 use crate::admin::{self, ExhibitionSupervisor, MatchRegistry};
 use crate::auth::TokenRegistry;
+use crate::health::{BotHealthStore, DqStore};
 use crate::observer::{ObserverHub, ws_viewer_handler};
 use crate::pacer::NoopPacer;
 use crate::recording::RecordingStore;
@@ -130,6 +131,17 @@ pub struct AppState {
     /// Expose `recording_store.list()` and `recording_store.get(id)` via
     /// admin-gated HTTP endpoints for download / replay.
     pub recording_store: Arc<RecordingStore>,
+
+    /// Per-bot health registry (issue 12).
+    ///
+    /// Populated by the resolver at match start.  Read by `GET /admin/bots`.
+    pub health_store: Arc<BotHealthStore>,
+
+    /// Disqualified teams (issue 12).
+    ///
+    /// Written by `POST /admin/bots/{team}/kick`.  Shared with the resolver
+    /// and every live match's [`ExclusionDriver`](crate::health::ExclusionDriver).
+    pub dq_store: Arc<DqStore>,
 }
 
 // ── Router configuration ──────────────────────────────────────────────────────
@@ -162,6 +174,10 @@ pub struct RouterConfig {
     /// Retain the `Arc` clone before passing to [`build_router_config`] if you
     /// need to inspect recordings after a match in tests.
     pub recording_store: Arc<RecordingStore>,
+    /// Bot health store. Defaults to a fresh [`BotHealthStore`] in [`build_router`].
+    pub health_store: Arc<BotHealthStore>,
+    /// Disqualification store. Defaults to a fresh [`DqStore`] in [`build_router`].
+    pub dq_store: Arc<DqStore>,
 }
 
 // ── Wire types ────────────────────────────────────────────────────────────────
@@ -399,6 +415,8 @@ pub fn build_router(event_password: String, registry: Arc<TokenRegistry>) -> Rou
         match_params: Params::default(),
         observer_hub: ObserverHub::new(),
         recording_store: RecordingStore::new(),
+        health_store: BotHealthStore::new(),
+        dq_store: DqStore::new(),
     })
 }
 
@@ -420,6 +438,8 @@ pub fn build_router_config(config: RouterConfig) -> Router {
         match_params: config.match_params,
         observer_hub: config.observer_hub,
         recording_store: config.recording_store,
+        health_store: config.health_store,
+        dq_store: config.dq_store,
     };
     Router::new()
         .route("/register", post(post_register))
@@ -448,6 +468,9 @@ pub fn build_router_config(config: RouterConfig) -> Router {
             "/admin/exhibition/stop",
             post(admin::post_admin_exhibition_stop),
         )
+        // ── Issue 12: health & moderation ─────────────────────────────────
+        .route("/admin/bots", get(admin::get_admin_bots))
+        .route("/admin/bots/{team}/kick", post(admin::post_admin_kick_bot))
         .with_state(state)
 }
 

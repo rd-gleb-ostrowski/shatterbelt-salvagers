@@ -91,6 +91,10 @@ pub struct HeadlessRunner {
     /// Monotonically-increasing match seed.  Each `run_one` call atomically
     /// increments this so successive matches use distinct seeds.
     seed_counter: AtomicU64,
+    /// Optional DQ store (issue 12): DQ'd teams fall back to Default Bot.
+    dq_store: Option<Arc<crate::health::DqStore>>,
+    /// Optional health store (issue 12): health entries are created per slot.
+    health_store: Option<Arc<crate::health::BotHealthStore>>,
 }
 
 impl HeadlessRunner {
@@ -128,6 +132,39 @@ impl HeadlessRunner {
             teams,
             fuel_per_tick,
             seed_counter: AtomicU64::new(base_seed),
+            dq_store: None,
+            health_store: None,
+        })
+    }
+
+    /// Construct a headless runner with shared DQ and health stores (issue 12).
+    ///
+    /// Identical to [`new`](Self::new) but the runner will:
+    /// - Skip WS/WASM bots for DQ'd teams (Default Bot fills the slot).
+    /// - Create a `BotHealthEntry` per slot and update it each tick.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_health(
+        wasm_store: Arc<WasmBotStore>,
+        recording_store: Arc<RecordingStore>,
+        params: Params,
+        specs: Vec<ShipSpec>,
+        teams: Vec<String>,
+        fuel_per_tick: u64,
+        base_seed: u64,
+        dq_store: Arc<crate::health::DqStore>,
+        health_store: Arc<crate::health::BotHealthStore>,
+    ) -> Arc<Self> {
+        assert_eq!(specs.len(), teams.len(), "one team per spec required");
+        Arc::new(Self {
+            wasm_store,
+            recording_store,
+            params,
+            specs,
+            teams,
+            fuel_per_tick,
+            seed_counter: AtomicU64::new(base_seed),
+            dq_store: Some(dq_store),
+            health_store: Some(health_store),
         })
     }
 
@@ -153,11 +190,16 @@ impl HeadlessRunner {
     pub fn run_one_seeded(&self, seed: u64) -> HeadlessResult {
         // ── WS exclusion: fresh empty registry, never touched externally ──────
         let empty_ws = WsConnectionRegistry::new();
-        let resolver = ConnectionResolver::new(
+        let mut resolver = ConnectionResolver::new(
             Arc::clone(&empty_ws),
             Arc::clone(&self.wasm_store),
             self.fuel_per_tick,
         );
+
+        // Wire moderation if stores are present (issue 12).
+        if let (Some(dq), Some(hs)) = (self.dq_store.as_ref(), self.health_store.as_ref()) {
+            resolver = resolver.with_moderation(Arc::clone(dq), Arc::clone(hs));
+        }
 
         // Build a temporary engine solely to extract tick-0 observations for
         // WASM bot warm-up (ADR-0004).  The real match engine is created
