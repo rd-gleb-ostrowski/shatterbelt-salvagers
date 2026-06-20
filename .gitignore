@@ -23,3 +23,9 @@
 !retreat/**
 !Cargo.toml
 !Cargo.lock
+
+# Re-ignore build/dependency artifacts under the otherwise-allowed src/ tree
+src/**/node_modules/
+src/**/dist/
+src/**/.vite/
+src/**/coverage/
