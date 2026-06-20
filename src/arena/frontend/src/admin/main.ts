@@ -127,6 +127,7 @@ function renderDashboard(): void {
               <th>Skipped ticks</th>
               <th>Crashes</th>
               <th>Recent logs</th>
+              <th>Actions</th>
             </tr>
           </thead>
           <tbody id="bots-body"></tbody>
@@ -177,11 +178,68 @@ function renderBotsTable(bots: BotHealthSnapshot[]): void {
       <td class="col-skipped">${bot.skippedTicks}</td>
       <td class="col-crashes">${bot.crashes}</td>
       <td class="col-logs"><pre class="log-pre">${escHtml(logSnippet) || "<em class='no-logs'>—</em>"}</pre></td>
+      <td class="col-actions"><button class="btn-kick" data-team="${escHtml(bot.team)}">Kick</button></td>
     `;
     tbody.appendChild(tr);
   }
 
   table.hidden = false;
+
+  // Delegate click events for Kick buttons
+  tbody.addEventListener("click", handleKickClick);
+}
+
+async function handleKickClick(e: Event): Promise<void> {
+  const btn = (e.target as HTMLElement).closest(".btn-kick") as HTMLButtonElement | null;
+  if (!btn) return;
+
+  const team = btn.dataset.team;
+  if (!team) return;
+
+  const confirmed = window.confirm(
+    `Kick "${team}"?\n\nThis will disqualify the bot and remove it from the current match.`,
+  );
+  if (!confirmed) return;
+
+  const session = getSession();
+  if (!session) return;
+
+  btn.disabled = true;
+  btn.textContent = "Kicking…";
+
+  try {
+    const result = await session.client.kickBot(team);
+
+    if (result.unauthorized) {
+      btn.disabled = false;
+      btn.textContent = "Kick";
+      alert("Action denied — session may have expired. Please sign out and sign in again.");
+      return;
+    }
+
+    if (!result.ok) {
+      btn.disabled = false;
+      btn.textContent = "Kick";
+      alert(`Failed to kick "${team}" — server returned an error.`);
+      return;
+    }
+
+    // Optimistically mark the row as offline while the next poll confirms it
+    const row = btn.closest("tr");
+    if (row) {
+      row.classList.add("row-offline");
+      const statusCell = row.querySelector(".col-status");
+      if (statusCell) {
+        statusCell.textContent = "Disqualified";
+        statusCell.className = "col-status offline";
+      }
+    }
+    btn.textContent = "Kicked";
+  } catch {
+    btn.disabled = false;
+    btn.textContent = "Kick";
+    alert(`Network error while kicking "${team}".`);
+  }
 }
 
 // ── Polling ───────────────────────────────────────────────────────────────────

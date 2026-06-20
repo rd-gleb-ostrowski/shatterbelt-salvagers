@@ -48,6 +48,14 @@ export interface AuthResult {
   unauthorized: boolean;
 }
 
+/** Result of `kickBot()`. Never throws for HTTP-level errors. */
+export interface KickResult {
+  /** `true` when the server accepted the kick (200). */
+  ok: boolean;
+  /** `true` when the server responded with 401 (wrong / absent password). */
+  unauthorized: boolean;
+}
+
 /**
  * Minimal fetch-like interface accepted by `createAdminClient`.
  *
@@ -80,6 +88,17 @@ export interface AdminClient {
    * Returns the parsed `BotHealthSnapshot[]` on success.
    */
   getBots(): Promise<BotHealthSnapshot[]>;
+
+  /**
+   * Kick (disqualify) a bot via `POST /admin/bots/{team}/kick`.
+   *
+   * The team name is URL-encoded. No request body is sent.
+   * Returns `{ ok: true, unauthorized: false }` on 200.
+   * Returns `{ ok: false, unauthorized: true }` on 401.
+   * Returns `{ ok: false, unauthorized: false }` on other HTTP errors.
+   * Never throws for HTTP-level failures (network errors still throw).
+   */
+  kickBot(team: string): Promise<KickResult>;
 }
 
 // ── Factory ───────────────────────────────────────────────────────────────────
@@ -110,6 +129,13 @@ export function createAdminClient(
     });
   }
 
+  async function post(path: string): Promise<HttpResponse> {
+    return fetchFn(`${baseUrl}${path}`, {
+      method: "POST",
+      headers: authHeaders,
+    });
+  }
+
   return {
     async verifyAuth(): Promise<AuthResult> {
       const res = await get("/admin/bots");
@@ -125,6 +151,14 @@ export function createAdminClient(
       }
       const data = await res.json();
       return data as BotHealthSnapshot[];
+    },
+
+    async kickBot(team: string): Promise<KickResult> {
+      const path = `/admin/bots/${encodeURIComponent(team)}/kick`;
+      const res = await post(path);
+      if (res.status === 200) return { ok: true, unauthorized: false };
+      if (res.status === 401) return { ok: false, unauthorized: true };
+      return { ok: false, unauthorized: false };
     },
   };
 }

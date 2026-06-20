@@ -217,4 +217,114 @@ describe("createAdminClient", () => {
       expect(result.unauthorized).toBe(false);
     });
   });
+
+  // ── kickBot slices ────────────────────────────────────────────────────────
+
+  // Slice 8 — kickBot builds POST to correct path with auth header
+  describe("kickBot request building", () => {
+    it("sends a POST request (not GET)", async () => {
+      const { fetchFn, captured } = makeFakeFetch(200, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await client.kickBot("alpha");
+      expect(captured[0].init?.method).toBe("POST");
+    });
+
+    it("sends to /admin/bots/{team}/kick", async () => {
+      const { fetchFn, captured } = makeFakeFetch(200, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await client.kickBot("alpha");
+      expect(captured[0].url).toBe(`${BASE}/admin/bots/alpha/kick`);
+    });
+
+    it("attaches Authorization: Facilitator <password> header", async () => {
+      const { fetchFn, captured } = makeFakeFetch(200, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await client.kickBot("alpha");
+      const headers = captured[0].init?.headers as Record<string, string>;
+      expect(headers["Authorization"]).toBe(`Facilitator ${PASSWORD}`);
+    });
+
+    it("sends no body", async () => {
+      const { fetchFn, captured } = makeFakeFetch(200, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await client.kickBot("alpha");
+      expect(captured[0].init?.body).toBeUndefined();
+    });
+  });
+
+  // Slice 9 — kickBot URL-encodes team names with special chars
+  describe("kickBot URL encoding", () => {
+    it("URL-encodes a team name containing a space", async () => {
+      const { fetchFn, captured } = makeFakeFetch(200, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await client.kickBot("team a");
+      expect(captured[0].url).toBe(`${BASE}/admin/bots/team%20a/kick`);
+    });
+
+    it("URL-encodes a team name containing a slash", async () => {
+      const { fetchFn, captured } = makeFakeFetch(200, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await client.kickBot("team/x");
+      expect(captured[0].url).toBe(`${BASE}/admin/bots/team%2Fx/kick`);
+    });
+  });
+
+  // Slice 10 — kickBot 200 → ok
+  describe("kickBot on 200", () => {
+    it("returns { ok: true, unauthorized: false } on 200", async () => {
+      const { fetchFn } = makeFakeFetch(200, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      const result = await client.kickBot("alpha");
+      expect(result.ok).toBe(true);
+      expect(result.unauthorized).toBe(false);
+    });
+
+    it("does not throw on 200", async () => {
+      const { fetchFn } = makeFakeFetch(200, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await expect(client.kickBot("alpha")).resolves.not.toThrow();
+    });
+  });
+
+  // Slice 11 — kickBot 401 → unauthorized (no throw)
+  describe("kickBot on 401", () => {
+    it("returns { ok: false, unauthorized: true } on 401", async () => {
+      const { fetchFn } = makeFakeFetch(401, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      const result = await client.kickBot("alpha");
+      expect(result.ok).toBe(false);
+      expect(result.unauthorized).toBe(true);
+    });
+
+    it("does not throw on 401", async () => {
+      const { fetchFn } = makeFakeFetch(401, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await expect(client.kickBot("alpha")).resolves.not.toThrow();
+    });
+  });
+
+  // Slice 12 — kickBot non-200/401 → error result (no throw)
+  describe("kickBot on other HTTP errors", () => {
+    it("returns { ok: false, unauthorized: false } on 500", async () => {
+      const { fetchFn } = makeFakeFetch(500, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      const result = await client.kickBot("alpha");
+      expect(result.ok).toBe(false);
+      expect(result.unauthorized).toBe(false);
+    });
+
+    it("returns { ok: false, unauthorized: false } on 403", async () => {
+      const { fetchFn } = makeFakeFetch(403, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      const result = await client.kickBot("alpha");
+      expect(result.ok).toBe(false);
+      expect(result.unauthorized).toBe(false);
+    });
+
+    it("does not throw on non-200/401 response", async () => {
+      const { fetchFn } = makeFakeFetch(500, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await expect(client.kickBot("alpha")).resolves.not.toThrow();
+    });
+  });
 });
