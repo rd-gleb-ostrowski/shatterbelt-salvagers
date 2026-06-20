@@ -20,6 +20,7 @@ import {
   type FetchFn,
   type LadderStanding,
   type RecordingListItem,
+  type RecordingArtifact,
 } from "./adminClient.ts";
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -1677,16 +1678,23 @@ describe("createAdminClient", () => {
 
   // Slice 39 — downloadRecording GETs /admin/recordings/{id}/download with auth
   describe("downloadRecording request building and response mapping", () => {
-    const SAMPLE_DTO = {
-      matchId: "rec-1",
+    const SAMPLE_ARTIFACT: RecordingArtifact = {
+      match_id: "rec-1",
       seed: 42,
-      tickCount: 1000,
-      winner: "alpha",
-      scores: { alpha: 3, beta: 1 },
+      params: { max_ticks: 300 },
+      specs: [{ id: "ship-0", class: "Skiff" }],
+      intent_log: [[["ship-0", { thrust: 1.0 }]]],
+      meta: {
+        match_id: "rec-1",
+        seed: 42,
+        tick_count: 1000,
+        winner: "alpha",
+        scores: [["alpha", 3], ["beta", 1]],
+      },
     };
 
     it("sends a GET request to /admin/recordings/{id}/download", async () => {
-      const { fetchFn, captured } = makeFakeFetch(200, SAMPLE_DTO);
+      const { fetchFn, captured } = makeFakeFetch(200, SAMPLE_ARTIFACT);
       const client = createAdminClient(BASE, PASSWORD, fetchFn);
       await client.downloadRecording("rec-1");
       expect(captured[0].init?.method).toBe("GET");
@@ -1694,7 +1702,7 @@ describe("createAdminClient", () => {
     });
 
     it("attaches Authorization: Facilitator <password> header", async () => {
-      const { fetchFn, captured } = makeFakeFetch(200, SAMPLE_DTO);
+      const { fetchFn, captured } = makeFakeFetch(200, SAMPLE_ARTIFACT);
       const client = createAdminClient(BASE, PASSWORD, fetchFn);
       await client.downloadRecording("rec-1");
       const headers = captured[0].init?.headers as Record<string, string>;
@@ -1702,34 +1710,37 @@ describe("createAdminClient", () => {
     });
 
     it("URL-encodes recording id containing a slash", async () => {
-      const { fetchFn, captured } = makeFakeFetch(200, SAMPLE_DTO);
+      const { fetchFn, captured } = makeFakeFetch(200, SAMPLE_ARTIFACT);
       const client = createAdminClient(BASE, PASSWORD, fetchFn);
       await client.downloadRecording("rec/1");
       expect(captured[0].url).toBe(`${BASE}/admin/recordings/rec%2F1/download`);
     });
 
-    it("returns { ok: true, data: DownloadDTO, ... } on 200", async () => {
-      const { fetchFn } = makeFakeFetch(200, SAMPLE_DTO);
+    it("returns { ok: true, data: RecordingArtifact, ... } on 200", async () => {
+      const { fetchFn } = makeFakeFetch(200, SAMPLE_ARTIFACT);
       const client = createAdminClient(BASE, PASSWORD, fetchFn);
       const result = await client.downloadRecording("rec-1");
       expect(result.ok).toBe(true);
       expect(result.unauthorized).toBe(false);
       expect(result.notFound).toBe(false);
       expect(result.data).not.toBeNull();
-      expect(result.data?.matchId).toBe("rec-1");
+      expect(result.data?.match_id).toBe("rec-1");
       expect(result.data?.seed).toBe(42);
-      expect(result.data?.tickCount).toBe(1000);
-      expect(result.data?.winner).toBe("alpha");
-      expect(result.data?.scores).toEqual({ alpha: 3, beta: 1 });
+      expect(result.data?.meta.tick_count).toBe(1000);
+      expect(result.data?.meta.winner).toBe("alpha");
+      expect(result.data?.meta.scores).toEqual([["alpha", 3], ["beta", 1]]);
     });
 
-    it("preserves null winner in downloaded DTO", async () => {
-      const dtoWithNull = { ...SAMPLE_DTO, winner: null };
-      const { fetchFn } = makeFakeFetch(200, dtoWithNull);
+    it("preserves null winner in downloaded artifact", async () => {
+      const artifactWithNull: RecordingArtifact = {
+        ...SAMPLE_ARTIFACT,
+        meta: { ...SAMPLE_ARTIFACT.meta, winner: null },
+      };
+      const { fetchFn } = makeFakeFetch(200, artifactWithNull);
       const client = createAdminClient(BASE, PASSWORD, fetchFn);
       const result = await client.downloadRecording("rec-2");
       expect(result.ok).toBe(true);
-      expect(result.data?.winner).toBeNull();
+      expect(result.data?.meta.winner).toBeNull();
     });
 
     it("returns { ok: false, unauthorized: true, notFound: false } on 401", async () => {
@@ -1778,6 +1789,110 @@ describe("createAdminClient", () => {
       const { fetchFn } = makeFakeFetch(500, null);
       const client = createAdminClient(BASE, PASSWORD, fetchFn);
       await expect(client.downloadRecording("rec-1")).resolves.not.toThrow();
+    });
+  });
+
+  // Slice 40 — importRecording POSTs /admin/recordings/import with auth + artifact body
+  describe("importRecording request building and response mapping", () => {
+    const SAMPLE_ARTIFACT: RecordingArtifact = {
+      match_id: "rec-import-1",
+      seed: 7,
+      params: { max_ticks: 500 },
+      specs: [{ id: "ship-0", class: "Skiff" }, { id: "ship-1", class: "Skiff" }],
+      intent_log: [[["ship-0", { thrust: 0.5 }]]],
+      meta: {
+        match_id: "rec-import-1",
+        seed: 7,
+        tick_count: 500,
+        winner: "ship-0",
+        scores: [["ship-0", 2], ["ship-1", 0]],
+      },
+    };
+
+    it("sends a POST request to /admin/recordings/import", async () => {
+      const { fetchFn, captured } = makeFakeFetch(200, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await client.importRecording(SAMPLE_ARTIFACT);
+      expect(captured[0].init?.method).toBe("POST");
+      expect(captured[0].url).toBe(`${BASE}/admin/recordings/import`);
+    });
+
+    it("attaches Authorization: Facilitator <password> header", async () => {
+      const { fetchFn, captured } = makeFakeFetch(200, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await client.importRecording(SAMPLE_ARTIFACT);
+      const headers = captured[0].init?.headers as Record<string, string>;
+      expect(headers["Authorization"]).toBe(`Facilitator ${PASSWORD}`);
+    });
+
+    it("attaches Content-Type: application/json header", async () => {
+      const { fetchFn, captured } = makeFakeFetch(200, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await client.importRecording(SAMPLE_ARTIFACT);
+      const headers = captured[0].init?.headers as Record<string, string>;
+      expect(headers["Content-Type"]).toBe("application/json");
+    });
+
+    it("sends the artifact as JSON body", async () => {
+      const { fetchFn, captured } = makeFakeFetch(200, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await client.importRecording(SAMPLE_ARTIFACT);
+      const body = captured[0].init?.body as string;
+      expect(JSON.parse(body)).toEqual(SAMPLE_ARTIFACT);
+    });
+
+    it("returns { ok: true, badRequest: false, unauthorized: false } on 200", async () => {
+      const { fetchFn } = makeFakeFetch(200, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      const result = await client.importRecording(SAMPLE_ARTIFACT);
+      expect(result.ok).toBe(true);
+      expect(result.badRequest).toBe(false);
+      expect(result.unauthorized).toBe(false);
+    });
+
+    it("returns { ok: false, badRequest: true, unauthorized: false } on 400", async () => {
+      const { fetchFn } = makeFakeFetch(400, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      const result = await client.importRecording(SAMPLE_ARTIFACT);
+      expect(result.ok).toBe(false);
+      expect(result.badRequest).toBe(true);
+      expect(result.unauthorized).toBe(false);
+    });
+
+    it("returns { ok: false, badRequest: false, unauthorized: true } on 401", async () => {
+      const { fetchFn } = makeFakeFetch(401, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      const result = await client.importRecording(SAMPLE_ARTIFACT);
+      expect(result.ok).toBe(false);
+      expect(result.badRequest).toBe(false);
+      expect(result.unauthorized).toBe(true);
+    });
+
+    it("returns { ok: false, badRequest: false, unauthorized: false } on 500", async () => {
+      const { fetchFn } = makeFakeFetch(500, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      const result = await client.importRecording(SAMPLE_ARTIFACT);
+      expect(result.ok).toBe(false);
+      expect(result.badRequest).toBe(false);
+      expect(result.unauthorized).toBe(false);
+    });
+
+    it("does not throw on 400", async () => {
+      const { fetchFn } = makeFakeFetch(400, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await expect(client.importRecording(SAMPLE_ARTIFACT)).resolves.not.toThrow();
+    });
+
+    it("does not throw on 401", async () => {
+      const { fetchFn } = makeFakeFetch(401, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await expect(client.importRecording(SAMPLE_ARTIFACT)).resolves.not.toThrow();
+    });
+
+    it("does not throw on 500", async () => {
+      const { fetchFn } = makeFakeFetch(500, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await expect(client.importRecording(SAMPLE_ARTIFACT)).resolves.not.toThrow();
     });
   });
 });

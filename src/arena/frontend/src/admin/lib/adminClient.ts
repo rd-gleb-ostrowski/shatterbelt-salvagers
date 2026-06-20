@@ -9,8 +9,9 @@
  *   LadderStanding             — one entry from GET /ladder/standings
  *   LadderRunnerResult         — result of getLadderRunner()
  *   RecordingListItem          — one entry from GET /recordings
- *   DownloadDTO                — payload from GET /admin/recordings/{id}/download
+ *   RecordingArtifact          — full re-importable artifact from GET /admin/recordings/{id}/download
  *   DownloadRecordingResult    — result of downloadRecording()
+ *   ImportRecordingResult      — result of importRecording()
  *   HttpResponse               — minimal interface for the injected fetch function
  *   FetchFn                    — injectable fetch-like type (enables unit tests)
  *   AdminClient                — typed client interface
@@ -204,15 +205,25 @@ export interface RecordingListItem {
 }
 
 /**
- * Metadata DTO returned by `GET /admin/recordings/{id}/download`.
- * Mirrors the server's JSON response shape.
+ * Full re-importable Recording artifact returned by
+ * `GET /admin/recordings/{id}/download` (snake_case, mirrors server shape).
+ *
+ * `params`, `specs`, and `intent_log` are treated as opaque payloads by the
+ * Admin — only `meta` fields are used for display.
  */
-export interface DownloadDTO {
-  matchId: string;
+export interface RecordingArtifact {
+  match_id: string;
   seed: number;
-  tickCount: number;
-  winner: string | null;
-  scores: Record<string, number>;
+  params: unknown;
+  specs: unknown[];
+  intent_log: unknown[];
+  meta: {
+    match_id: string;
+    seed: number;
+    tick_count: number;
+    winner: string | null;
+    scores: [string, number][];
+  };
 }
 
 /**
@@ -222,12 +233,25 @@ export interface DownloadDTO {
 export interface DownloadRecordingResult {
   /** `true` when the server returned 200 and data was parsed. */
   ok: boolean;
-  /** The parsed DTO on success; `null` otherwise. */
-  data: DownloadDTO | null;
+  /** The parsed artifact on success; `null` otherwise. */
+  data: RecordingArtifact | null;
   /** `true` when the server responded with 401. */
   unauthorized: boolean;
   /** `true` when the server responded with 404 (recording not found). */
   notFound: boolean;
+}
+
+/**
+ * Result of `importRecording()`.
+ * Exactly one discriminant is `true`.
+ */
+export interface ImportRecordingResult {
+  /** `true` when the server accepted the artifact (200). */
+  ok: boolean;
+  /** `true` when the server rejected the artifact as malformed (400). */
+  badRequest: boolean;
+  /** `true` when the server responded with 401. */
+  unauthorized: boolean;
 }
 
 /**
@@ -515,16 +539,28 @@ export interface AdminClient {
   replayRecording(id: string): Promise<LadderActionResult>;
 
   /**
-   * Download recording metadata via `GET /admin/recordings/{id}/download`.
+   * Download the full Recording artifact via `GET /admin/recordings/{id}/download`.
    *
    * The id is URL-encoded.
-   * Returns `{ ok: true, data: DownloadDTO, unauthorized: false, notFound: false }` on 200.
+   * Returns `{ ok: true, data: RecordingArtifact, unauthorized: false, notFound: false }` on 200.
    * Returns `{ ok: false, data: null, unauthorized: true,  notFound: false }` on 401.
    * Returns `{ ok: false, data: null, unauthorized: false, notFound: true  }` on 404.
    * Returns `{ ok: false, data: null, unauthorized: false, notFound: false }` on other errors.
    * Never throws for HTTP-level failures.
    */
   downloadRecording(id: string): Promise<DownloadRecordingResult>;
+
+  /**
+   * Import a full Recording artifact via `POST /admin/recordings/import`.
+   *
+   * `artifact` is JSON.stringify'd and sent as `application/json`.
+   * Returns `{ ok: true, badRequest: false, unauthorized: false }` on 200.
+   * Returns `{ ok: false, badRequest: true,  unauthorized: false }` on 400.
+   * Returns `{ ok: false, badRequest: false, unauthorized: true  }` on 401.
+   * Returns `{ ok: false, badRequest: false, unauthorized: false }` on other errors.
+   * Never throws for HTTP-level failures.
+   */
+  importRecording(artifact: unknown): Promise<ImportRecordingResult>;
 }
 
 // ── Factory ───────────────────────────────────────────────────────────────────
@@ -786,7 +822,7 @@ export function createAdminClient(
       const path = `/admin/recordings/${encodeURIComponent(id)}/download`;
       const res = await get(path);
       if (res.status === 200) {
-        const data = (await res.json()) as DownloadDTO;
+        const data = (await res.json()) as RecordingArtifact;
         return { ok: true, data, unauthorized: false, notFound: false };
       }
       if (res.status === 401) {
@@ -796,6 +832,21 @@ export function createAdminClient(
         return { ok: false, data: null, unauthorized: false, notFound: true };
       }
       return { ok: false, data: null, unauthorized: false, notFound: false };
+    },
+
+    async importRecording(artifact: unknown): Promise<ImportRecordingResult> {
+      const res = await fetchFn(`${baseUrl}/admin/recordings/import`, {
+        method: "POST",
+        headers: {
+          ...authHeaders,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(artifact),
+      });
+      if (res.status === 200) return { ok: true, badRequest: false, unauthorized: false };
+      if (res.status === 400) return { ok: false, badRequest: true, unauthorized: false };
+      if (res.status === 401) return { ok: false, badRequest: false, unauthorized: true };
+      return { ok: false, badRequest: false, unauthorized: false };
     },
   };
 }

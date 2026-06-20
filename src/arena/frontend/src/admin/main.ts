@@ -1027,7 +1027,8 @@ function wireLadderResetControls(): void {
  *   1. Recordings list — GET /recordings with Replay + Download per row.
  *      Replay: POST /recordings/{id}/replay → feeds the observer hub;
  *              link to /index.html (Viewer) shown after success.
- *      Download: GET /admin/recordings/{id}/download → triggers browser save.
+ *      Download: GET /admin/recordings/{id}/download → saves the full artifact JSON.
+ *   2. Import replay — file picker → POST /admin/recordings/import → refresh list.
  */
 function renderReplaysPanel(): void {
   const container = document.getElementById("admin-panels");
@@ -1048,7 +1049,7 @@ function renderReplaysPanel(): void {
         <strong>Replay</strong> streams a recording to the observer hub — open the
         <a href="/index.html" target="_blank" rel="noopener">Viewer (/index.html)</a>
         on the projector screen to watch it.
-        <strong>Download</strong> saves the match metadata as JSON.
+        <strong>Download</strong> saves the full replay artifact as JSON (re-importable).
       </p>
       <p id="recordings-status" class="status-line" hidden></p>
       <div class="table-wrap">
@@ -1066,6 +1067,19 @@ function renderReplaysPanel(): void {
           <tbody id="recordings-body"></tbody>
         </table>
       </div>
+    </div>
+
+    <div class="subpanel" id="import-recording-subpanel">
+      <h3>Import Replay</h3>
+      <p class="hint">
+        Load a previously downloaded <code>replay-*.json</code> artifact back into the server.
+        After import the match will appear in the list above and can be replayed.
+      </p>
+      <div class="recordings-controls">
+        <input type="file" id="import-recording-file" accept=".json" />
+        <button id="import-recording-btn" class="btn-secondary">⬆ Import</button>
+      </div>
+      <p id="import-recording-status" class="status-line" hidden></p>
     </div>
   `;
 
@@ -1166,7 +1180,7 @@ async function handleRecordingAction(e: Event): Promise<void> {
     try {
       const r = await session.client.downloadRecording(id);
       if (r.ok && r.data) {
-        // Trigger a browser file download of the JSON metadata
+        // Trigger a browser file download of the full artifact JSON
         const json = JSON.stringify(r.data, null, 2);
         const blob = new Blob([json], { type: "application/json" });
         const url = URL.createObjectURL(blob);
@@ -1221,6 +1235,62 @@ function wireRecordingsControls(): void {
 
   refreshBtn.addEventListener("click", loadRecordings);
   void loadRecordings();
+
+  // ── Import replay ──────────────────────────────────────────────────────────
+  const importBtn = document.getElementById("import-recording-btn") as HTMLButtonElement | null;
+  const importFile = document.getElementById("import-recording-file") as HTMLInputElement | null;
+  const importStatus = document.getElementById("import-recording-status") as HTMLElement | null;
+  if (!importBtn || !importFile || !importStatus) return;
+
+  importBtn.addEventListener("click", async () => {
+    const file = importFile.files?.[0];
+    if (!file) {
+      importStatus.textContent = "⚠ Please select a replay JSON file first.";
+      importStatus.hidden = false;
+      return;
+    }
+    const session = getSession();
+    if (!session) return;
+
+    importBtn.disabled = true;
+    importBtn.textContent = "Importing…";
+    importStatus.hidden = true;
+
+    try {
+      const text = await file.text();
+      let artifact: unknown;
+      try {
+        artifact = JSON.parse(text) as unknown;
+      } catch {
+        importStatus.textContent = "⚠ File is not valid JSON.";
+        importStatus.hidden = false;
+        return;
+      }
+
+      const r = await session.client.importRecording(artifact);
+      if (r.ok) {
+        importStatus.textContent = `✓ Imported "${file.name}" — refreshing list…`;
+        importStatus.hidden = false;
+        importFile.value = "";
+        void loadRecordings();
+      } else if (r.badRequest) {
+        importStatus.textContent = "⚠ Import rejected — file is not a valid replay artifact.";
+        importStatus.hidden = false;
+      } else if (r.unauthorized) {
+        importStatus.textContent = "⚠ Import denied — session may have expired. Please sign out and sign in again.";
+        importStatus.hidden = false;
+      } else {
+        importStatus.textContent = "⚠ Import failed — server returned an error.";
+        importStatus.hidden = false;
+      }
+    } catch {
+      importStatus.textContent = "⚠ Network error during import.";
+      importStatus.hidden = false;
+    } finally {
+      importBtn.disabled = false;
+      importBtn.textContent = "⬆ Import";
+    }
+  });
 }
 
 // ── Bootstrap ─────────────────────────────────────────────────────────────────
