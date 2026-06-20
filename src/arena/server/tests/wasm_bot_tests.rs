@@ -50,8 +50,10 @@ fn app_with_store() -> (axum::Router, Arc<TokenRegistry>, Arc<WasmBotStore>) {
     let store = WasmBotStore::new();
     let app = build_router_config(RouterConfig {
         event_password: EVENT_PASSWORD.to_owned(),
+        facilitator_password: "test-facilitator".to_owned(),
         registry: registry.clone(),
         wasm_store: store.clone(),
+        ws_registry: arena_server::resolver::WsConnectionRegistry::new(),
         tick_deadline: Duration::from_millis(33),
         match_seed: 42,
         match_params: Params::default(),

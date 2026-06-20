@@ -29,7 +29,7 @@ use axum::{
     extract::{Path, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
-    routing::{any, get, post},
+    routing::{any, delete, get, post},
     Json, Router,
 };
 use bytes::Bytes;
@@ -37,11 +37,13 @@ use serde::{Deserialize, Serialize};
 
 use arena_engine::Params;
 
+use crate::admin::{self, ExhibitionSupervisor, MatchRegistry};
 use crate::auth::TokenRegistry;
 use crate::observer::{ObserverHub, ws_viewer_handler};
 use crate::pacer::NoopPacer;
 use crate::recording::RecordingStore;
 use crate::replay::run_replay;
+use crate::resolver::WsConnectionRegistry;
 use crate::store::WasmBotStore;
 use crate::ws::ws_bot_handler;
 
@@ -67,12 +69,25 @@ pub struct AppState {
     /// It is intentionally distinct from the facilitator password (issue 11).
     pub(crate) event_password: String,
 
+    /// Pre-shared facilitator password (distinct from event_password) gating admin endpoints.
+    /// PROTOCOL §4: a SEPARATE facilitator password gates match-control/admin/ladder/kicks.
+    pub(crate) facilitator_password: String,
+
     /// Token registry — shared with WS-join (issue 03) and WASM-upload (issue 04).
     pub registry: Arc<TokenRegistry>,
 
     /// WASM Bot artifact store — shared with the wasmtime host (issue 05),
     /// connection resolver (issue 06), and Admin (issue 11).
     pub wasm_store: Arc<WasmBotStore>,
+
+    /// Live WS bot connection registry — bots connect here before a match starts.
+    pub ws_registry: Arc<WsConnectionRegistry>,
+
+    /// Registry of currently-running live matches (by match_id).
+    pub match_registry: Arc<MatchRegistry>,
+
+    /// Exhibition supervisor — keeps one live match always running.
+    pub exhibition: Arc<ExhibitionSupervisor>,
 
     /// Per-tick deadline for receiving an action from a WS bot.
     ///
@@ -125,10 +140,12 @@ pub struct AppState {
 /// match and a fast deadline).
 pub struct RouterConfig {
     pub event_password: String,
+    pub facilitator_password: String,
     pub registry: Arc<TokenRegistry>,
     /// WASM Bot artifact store.  Create with [`WasmBotStore::new`] and retain
     /// the `Arc` if tests need to inspect the store after requests.
     pub wasm_store: Arc<WasmBotStore>,
+    pub ws_registry: Arc<WsConnectionRegistry>,
     /// Per-tick deadline. Defaults to 33 ms in [`build_router`].
     pub tick_deadline: Duration,
     /// Match RNG seed. Defaults to 42 in [`build_router`].
@@ -373,8 +390,10 @@ fn extract_bearer_token(headers: &HeaderMap) -> Option<String> {
 pub fn build_router(event_password: String, registry: Arc<TokenRegistry>) -> Router {
     build_router_config(RouterConfig {
         event_password,
+        facilitator_password: String::new(),
         registry,
         wasm_store: WasmBotStore::new(),
+        ws_registry: WsConnectionRegistry::new(),
         tick_deadline: Duration::from_millis(33),
         match_seed: 42,
         match_params: Params::default(),
@@ -390,8 +409,12 @@ pub fn build_router(event_password: String, registry: Arc<TokenRegistry>) -> Rou
 pub fn build_router_config(config: RouterConfig) -> Router {
     let state = AppState {
         event_password: config.event_password,
+        facilitator_password: config.facilitator_password,
         registry: config.registry,
         wasm_store: config.wasm_store,
+        ws_registry: config.ws_registry,
+        match_registry: MatchRegistry::new(),
+        exhibition: ExhibitionSupervisor::new(),
         tick_deadline: config.tick_deadline,
         match_seed: config.match_seed,
         match_params: config.match_params,
@@ -405,6 +428,26 @@ pub fn build_router_config(config: RouterConfig) -> Router {
         .route("/observe", any(ws_viewer_handler))
         .route("/recordings", get(get_recordings))
         .route("/recordings/{id}/replay", post(post_replay))
+        .route("/admin/matches", post(admin::post_admin_start_match))
+        .route(
+            "/admin/matches/{id}/pause",
+            post(admin::post_admin_pause_match),
+        )
+        .route(
+            "/admin/matches/{id}/resume",
+            post(admin::post_admin_resume_match),
+        )
+        .route("/admin/matches/{id}/tps", post(admin::post_admin_set_tps))
+        .route("/admin/matches/{id}", delete(admin::delete_admin_match))
+        .route("/admin/exhibition", get(admin::get_admin_exhibition))
+        .route(
+            "/admin/exhibition/start",
+            post(admin::post_admin_exhibition_start),
+        )
+        .route(
+            "/admin/exhibition/stop",
+            post(admin::post_admin_exhibition_stop),
+        )
         .with_state(state)
 }
 

@@ -27,6 +27,7 @@
 //! | Match outcome | [`runner::MatchOutcome`] | 14 (ladder) |
 //! | WASM artifact storage | [`store::WasmBotStore`] | 04 (this issue), 05 (wasmtime host), 06 (resolver), 11 (admin) |
 
+pub mod admin;
 pub mod auth;
 pub mod bot;
 pub mod headless;

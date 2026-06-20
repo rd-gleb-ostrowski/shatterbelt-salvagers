@@ -209,6 +209,10 @@ impl MatchRunner {
         }
     }
 
+    pub(crate) fn wait_for_next_tick(&mut self) {
+        self.pacer.wait_for_next_tick();
+    }
+
     /// Borrow the underlying engine for inspection.
     ///
     /// Callers can use `engine.god_view()` (issue 07 observer),
