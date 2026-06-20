@@ -2,30 +2,54 @@
  * renderer — PixiJS WebGL renderer for the Drift Viewer.
  *
  * Renders: Drift bounds, asteroids, ships (with heading indicator),
- * relics (glowing), Anchors (team home beacons), projectiles, singularities,
- * mines.
+ * relics (glowing), Anchors (team home beacons), rune-cannon projectiles,
+ * singularity gravity wells, deployed Aether Mines, and transient explosions.
  *
  * Design:
  * - All entity graphics are drawn to a single Graphics object per tick
  *   (cleared + redrawn) for simplicity in this first slice.
  * - The world->screen transform is produced by the Camera model (camera.ts),
  *   which replaced the direct fitDriftTransform call from issue 01.
+ * - Layer order (bottom → top):
+ *     driftGraphics  — arena border
+ *     glowGraphics   — additive glow halos (relics, anchors, singularities,
+ *                      explosion blooms)
+ *     entityGraphics — solid game entities
+ *     effectsGraphics — transient effects (explosions) rendered above entities
+ *     labelContainer — ship name labels always on top
+ *
+ * KNOWN LIMITATION — Arc Lance beams (issue 04 seam):
+ *   Arc Lance is emitted by the engine as an event (a one-shot discharge),
+ *   not as a persistent entity.  The god-view frame contains only STATE arrays
+ *   (singularities, mines, projectiles); it does NOT include an `events` field.
+ *   Therefore Arc Lance beams CANNOT be drawn from god-view state in v1.
+ *   The `effectsGraphics` layer is the correct place to render them if/when
+ *   the server adds Arc Lance to the god-view event stream.
+ *   See also: PROTOCOL.md / observer.rs — the same gap noted in issues 01 + 06.
  *
  * Seams for future issues:
- *   03  — add ship team colours, hull/shield bars, name labels, thrust flames
- *   04  — add Sigil effects (singularity well, mine indicator, arc-lance beam, explosions)
- *   05  — add HUD overlay (scoreboard, tick timer); read camera.followTarget for highlight
- *   06  — read frame events for Web Audio triggers (sound module)
+ *   05  — add HUD overlay (scoreboard, tick timer); read camera.followTarget
+ *   06  — sound module reuses `detectExplosions` return value from renderFrame
+ *         to trigger explosion/sigil SFX without duplicating delta detection
+ *   07  — replay loader feeds the same `renderFrame` callback from recorded
+ *         frames; the effectsModel and explosionDetector advance naturally
  */
 
 import { Application, Graphics, Container, Text } from "pixi.js";
-import type { GodViewFrame } from "../lib/frameParser.ts";
+import type { GodViewFrame, GodShipView } from "../lib/frameParser.ts";
 import {
   worldToScreen,
   type CameraTransform,
 } from "../lib/worldTransform.ts";
 import { Camera } from "../lib/camera.ts";
 import { teamColour, barFillRatio, isThrusting } from "../lib/shipPresentation.ts";
+import { detectExplosions } from "../lib/explosionDetector.ts";
+import {
+  EMPTY_EFFECTS,
+  addExplosions,
+  advanceEffects,
+  type EffectsState,
+} from "../lib/effectsModel.ts";
 
 // ── Palette ───────────────────────────────────────────────────────────────────
 
@@ -52,6 +76,9 @@ const PALETTE = {
   singularity: 0xcc44ff,
   mine: 0xff4444,
   mineFriendly: 0x44aaff,
+  explosionCore: 0xffffff,
+  explosionMid: 0xff8800,
+  explosionOuter: 0xff2200,
 } as const;
 
 // ── DriftRenderer ─────────────────────────────────────────────────────────────
@@ -61,23 +88,36 @@ export class DriftRenderer {
   private driftGraphics: Graphics;
   private entityGraphics: Graphics;
   private glowGraphics: Graphics;
+  /**
+   * Transient effects layer — rendered above entityGraphics, below labels.
+   * Used for explosions; the correct place for Arc Lance beams when the
+   * server exposes them in the god-view stream.
+   */
+  private effectsGraphics: Graphics;
   /** Container for per-ship name labels; cleared and rebuilt every frame. */
   private labelContainer: Container;
 
   /** Camera instance — main.ts wires input handlers against this object. */
   readonly camera: Camera = new Camera();
 
+  /** Ships from the most-recently-rendered frame, used for explosion delta. */
+  private prevShips: readonly GodShipView[] = [];
+  /** Active transient effects (explosions). */
+  private effectsState: EffectsState = EMPTY_EFFECTS;
+
   private constructor(
     app: Application,
     driftGraphics: Graphics,
     entityGraphics: Graphics,
     glowGraphics: Graphics,
+    effectsGraphics: Graphics,
     labelContainer: Container,
   ) {
     this.app = app;
     this.driftGraphics = driftGraphics;
     this.entityGraphics = entityGraphics;
     this.glowGraphics = glowGraphics;
+    this.effectsGraphics = effectsGraphics;
     this.labelContainer = labelContainer;
   }
 
@@ -99,16 +139,18 @@ export class DriftRenderer {
 
     container.appendChild(app.canvas);
 
-    // Layer order: drift bg → glows (additive) → entities → labels on top
+    // Layer order: drift bg → glows (additive) → entities → effects → labels on top
     const worldLayer = new Container();
     const driftGraphics = new Graphics();
     const glowGraphics = new Graphics();
     const entityGraphics = new Graphics();
+    const effectsGraphics = new Graphics();
     const labelContainer = new Container();
 
     worldLayer.addChild(driftGraphics);
     worldLayer.addChild(glowGraphics);
     worldLayer.addChild(entityGraphics);
+    worldLayer.addChild(effectsGraphics);
     worldLayer.addChild(labelContainer);
     app.stage.addChild(worldLayer);
 
@@ -117,6 +159,7 @@ export class DriftRenderer {
       driftGraphics,
       entityGraphics,
       glowGraphics,
+      effectsGraphics,
       labelContainer,
     );
   }
@@ -134,6 +177,9 @@ export class DriftRenderer {
    *
    * Resolves the followed ship's world position from the frame (when in follow
    * mode) and delegates transform computation to `this.camera.getTransform`.
+   *
+   * Also: detects ship destructions via frame delta, advances the effects
+   * model, and returns the new explosion events (seam for issue 06 sound).
    */
   renderFrame(frame: GodViewFrame): void {
     const canvas = { width: this.canvasWidth, height: this.canvasHeight };
@@ -145,9 +191,18 @@ export class DriftRenderer {
       : undefined;
 
     const transform = this.camera.getTransform(frame.arena, canvas, shipPos);
+
+    // ── Explosion detection (pure delta) ─────────────────────────────────────
+    const newExplosions = detectExplosions(this.prevShips, frame.ships);
+    this.effectsState = advanceEffects(
+      addExplosions(this.effectsState, newExplosions),
+    );
+    this.prevShips = frame.ships;
+
     this.drawDrift(frame, transform);
     this.drawGlows(frame, transform);
     this.drawEntities(frame, transform);
+    this.drawEffects(transform);
   }
 
   // ── Layer: Drift border ───────────────────────────────────────────────────
@@ -202,6 +257,20 @@ export class DriftRenderer {
       this.glowGraphics
         .circle(sp.x, sp.y, r * 0.5)
         .fill({ color: PALETTE.singularity, alpha: 0.25 });
+    }
+
+    // Explosion bloom halos — drawn in the glow layer for additive feel
+    for (const fx of this.effectsState.effects) {
+      if (fx.kind !== "explosion") continue;
+      const sp = worldToScreen(fx.pos, t);
+      // Fade out as the effect ages: alpha proportional to remaining life
+      const life = fx.ticksLeft / 20; // normalised 0→1
+      this.glowGraphics
+        .circle(sp.x, sp.y, 40 * life + 4)
+        .fill({ color: PALETTE.explosionOuter, alpha: 0.18 * life });
+      this.glowGraphics
+        .circle(sp.x, sp.y, 22 * life + 2)
+        .fill({ color: PALETTE.explosionMid, alpha: 0.28 * life });
     }
   }
 
@@ -416,6 +485,45 @@ export class DriftRenderer {
         this.entityGraphics
           .circle(sp.x, sp.y - 12, 3)
           .fill({ color: PALETTE.relic });
+      }
+    }
+  }
+
+  // ── Layer: Transient effects (explosions) ─────────────────────────────────
+
+  /**
+   * Draw all active transient effects onto the effectsGraphics layer.
+   *
+   * Currently renders explosions as a bright core + decaying ring.
+   *
+   * Arc Lance beams would be drawn here when the server adds them to the
+   * god-view stream — see the KNOWN LIMITATION comment at the top of this file.
+   */
+  private drawEffects(t: CameraTransform): void {
+    this.effectsGraphics.clear();
+
+    for (const fx of this.effectsState.effects) {
+      if (fx.kind !== "explosion") continue;
+      const sp = worldToScreen(fx.pos, t);
+      // Normalised life fraction (1 = fresh, approaching 0 = fading)
+      const life = fx.ticksLeft / 20;
+
+      // Outer ring — expands and fades
+      const outerR = 6 + (1 - life) * 18;
+      this.effectsGraphics
+        .circle(sp.x, sp.y, outerR)
+        .stroke({ width: 2, color: PALETTE.explosionOuter, alpha: 0.7 * life });
+
+      // Mid burst — shrinks as it fades
+      this.effectsGraphics
+        .circle(sp.x, sp.y, 10 * life + 2)
+        .fill({ color: PALETTE.explosionMid, alpha: 0.6 * life });
+
+      // Bright core — only visible in first half of lifetime
+      if (life > 0.5) {
+        this.effectsGraphics
+          .circle(sp.x, sp.y, 5 * life)
+          .fill({ color: PALETTE.explosionCore, alpha: (life - 0.5) * 2 });
       }
     }
   }
