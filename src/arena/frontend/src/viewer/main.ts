@@ -31,6 +31,8 @@ import { screenToWorld, worldToScreen } from "../lib/worldTransform.ts";
 import type { GodViewFrame } from "../lib/frameParser.ts";
 import type { Vec2 } from "../lib/worldTransform.ts";
 import { HudOverlay } from "./hud.ts";
+import { SoundEngine } from "./sound.ts";
+import { deriveSoundCues } from "../lib/soundCues.ts";
 
 // ── Follow-select threshold ───────────────────────────────────────────────────
 
@@ -219,6 +221,20 @@ async function init(): Promise<void> {
   // Fetch ladder standings on startup; silently degrades if unavailable
   hud.fetchLadder().catch(() => undefined);
 
+  // ── Sound engine (issue 06) ──────────────────────────────────────────────
+  // Arena width is not known until the first frame; use a default that will be
+  // corrected on first play. The engine is unlocked on any user gesture so
+  // browsers don't block audio before the first click.
+  const sound = new SoundEngine(1000);
+
+  const unlockOnce = (): void => {
+    sound.unlock();
+    window.removeEventListener("click", unlockOnce);
+    window.removeEventListener("keydown", unlockOnce);
+  };
+  window.addEventListener("click", unlockOnce);
+  window.addEventListener("keydown", unlockOnce);
+
   // Wire camera input after renderer (and thus the PixiJS canvas) exists
   const pixiCanvas = container.querySelector("canvas");
   if (pixiCanvas instanceof HTMLCanvasElement) {
@@ -231,6 +247,10 @@ async function init(): Promise<void> {
   const client = new ObserverClient({
     url: wsUrl,
     onFrame(frame) {
+      // Derive and play sound cues BEFORE advancing lastFrame
+      const cues = deriveSoundCues(lastFrame, frame);
+      sound.playCues(cues);
+
       lastFrame = frame;
       renderer.renderFrame(frame);
       hud.update(frame);
