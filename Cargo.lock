@@ -45,6 +45,8 @@ dependencies = [
  "rand 0.10.1",
  "rand_pcg",
  "rapier2d",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

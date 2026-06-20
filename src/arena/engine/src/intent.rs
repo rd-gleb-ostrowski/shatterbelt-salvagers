@@ -5,7 +5,7 @@ use crate::types::Vec2;
 /// Rate-first, inspired by Robocode Tank Royale.  **All fields are optional**:
 /// an omitted field (`None`) keeps its previously applied value in the engine.
 /// The Arena applies physics clamps; bots never set absolute state.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Intent {
     /// Turn rate fraction in −1..1 (positive = counter-clockwise).
     pub turn: Option<f32>,

@@ -6,7 +6,7 @@ pub type ShipId = String;
 
 /// 2-D position or velocity in arena units (origin top-left, x right, y down).
 /// Angles are radians; 0 = +x (East), increasing counter-clockwise (PROTOCOL §3).
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Vec2 {
     pub x: f32,
     pub y: f32,
@@ -37,7 +37,7 @@ impl Resource {
 
 /// The five Sigils a Ship can carry at most one of.
 /// Granted when picking up a Relic; discharged with `Intent::sigil = true`.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Sigil {
     Afterburner,
     Bulwark,
@@ -47,13 +47,13 @@ pub enum Sigil {
 }
 
 /// Ship archetypes. `Skiff` is the only class in v1.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum ShipClass {
     Skiff,
 }
 
 /// Caller-supplied descriptor for a Ship entering a Match.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ShipSpec {
     pub id: ShipId,
     pub class: ShipClass,

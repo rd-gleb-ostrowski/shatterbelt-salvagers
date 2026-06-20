@@ -5827,3 +5827,128 @@ fn no_relic_banked_event_when_not_at_anchor() {
         "expected NO RelicBanked when ship is not at its anchor; got {evs:?}"
     );
 }
+
+// ─── serde round-trip tests ───────────────────────────────────────────────────
+
+#[cfg(test)]
+mod serde_tests {
+    use arena_engine::{
+        harness::{replay_match, run_match, Policy},
+        Intent, Params, ShipClass, ShipSpec, Vec2,
+    };
+
+    /// Basic serde round-trip: Params, ShipSpec, Intent, and a small intent_log
+    /// all survive a JSON serialise → deserialise cycle with identical values.
+    #[test]
+    fn serde_roundtrip_recording_types() {
+        // Params
+        let mut params = Params::default();
+        params.max_ticks = 120;
+        let json = serde_json::to_string(&params).expect("serialize Params");
+        let params2: Params = serde_json::from_str(&json).expect("deserialize Params");
+        assert_eq!(params, params2, "Params round-trip mismatch");
+
+        // ShipSpec
+        let spec = ShipSpec {
+            id: "ship-0".to_string(),
+            class: ShipClass::Skiff,
+            anchor_pos: Vec2::new(400.0, 600.0),
+        };
+        let json = serde_json::to_string(&spec).expect("serialize ShipSpec");
+        let spec2: ShipSpec = serde_json::from_str(&json).expect("deserialize ShipSpec");
+        assert_eq!(spec, spec2, "ShipSpec round-trip mismatch");
+
+        // Intent (mix of Some/None fields)
+        let intent = Intent {
+            turn: Some(0.5),
+            thrust: Some(-0.3),
+            fire: Some(true),
+            sigil: None,
+            sigil_target: Some(Vec2::new(100.0, 200.0)),
+        };
+        let json = serde_json::to_string(&intent).expect("serialize Intent");
+        let intent2: Intent = serde_json::from_str(&json).expect("deserialize Intent");
+        assert_eq!(intent, intent2, "Intent round-trip mismatch");
+
+        // intent_log (Vec<IntentFrame> = Vec<Vec<(String, Intent)>>)
+        let intent_log = vec![
+            vec![
+                ("ship-0".to_string(), intent.clone()),
+                ("ship-1".to_string(), Intent::default()),
+            ],
+            vec![
+                ("ship-0".to_string(), Intent { turn: None, thrust: Some(1.0), ..Default::default() }),
+            ],
+        ];
+        let json = serde_json::to_string(&intent_log).expect("serialize intent_log");
+        let log2: Vec<Vec<(String, Intent)>> = serde_json::from_str(&json).expect("deserialize intent_log");
+        assert_eq!(intent_log, log2, "intent_log round-trip mismatch");
+    }
+
+    /// Replay round-trip: run a real short match, serialise the recording inputs
+    /// to JSON, deserialise them back, replay with the deserialised inputs, and
+    /// assert the final god-view/scores/winner are identical to the original.
+    #[test]
+    fn serde_replay_roundtrip_preserves_determinism() {
+        let mut params = Params::default();
+        params.max_ticks = 300; // short match: 10 seconds at 30 tps
+
+        let result = run_match(params, &[Policy::Salvager, Policy::Aggressor], 1234);
+
+        // Serialise the full recording.
+        let seed_json = serde_json::to_string(&result.seed).expect("serialize seed");
+        let params_json = serde_json::to_string(&result.params).expect("serialize params");
+        let specs_json = serde_json::to_string(&result.specs).expect("serialize specs");
+        let log_json = serde_json::to_string(&result.intent_log).expect("serialize intent_log");
+
+        // Deserialise back.
+        let seed2: u64 = serde_json::from_str(&seed_json).expect("deserialize seed");
+        let params2: Params = serde_json::from_str(&params_json).expect("deserialize params");
+        let specs2: Vec<ShipSpec> = serde_json::from_str(&specs_json).expect("deserialize specs");
+        let log2: Vec<Vec<(String, Intent)>> =
+            serde_json::from_str(&log_json).expect("deserialize intent_log");
+
+        assert_eq!(result.seed, seed2);
+        assert_eq!(result.params, params2);
+        assert_eq!(result.specs, specs2);
+        assert_eq!(result.intent_log, log2);
+
+        // Replay with the round-tripped inputs.
+        let replayed = replay_match(params2, specs2, seed2, &log2);
+
+        // The replay must reproduce an identical result.
+        assert_eq!(
+            result.winner, replayed.winner,
+            "winner mismatch after serde round-trip"
+        );
+        assert_eq!(
+            result.scores, replayed.scores,
+            "scores mismatch after serde round-trip"
+        );
+        assert_eq!(
+            result.final_god_view.tick, replayed.final_god_view.tick,
+            "final tick mismatch"
+        );
+        // Verify ship positions are identical (bit-for-bit f32).
+        for (orig_ship, rep_ship) in result
+            .final_god_view
+            .ships
+            .iter()
+            .zip(replayed.final_god_view.ships.iter())
+        {
+            assert_eq!(orig_ship.id, rep_ship.id);
+            assert_eq!(
+                orig_ship.pos.x.to_bits(),
+                rep_ship.pos.x.to_bits(),
+                "pos.x diverged for ship {}",
+                orig_ship.id
+            );
+            assert_eq!(
+                orig_ship.pos.y.to_bits(),
+                rep_ship.pos.y.to_bits(),
+                "pos.y diverged for ship {}",
+                orig_ship.id
+            );
+        }
+    }
+}

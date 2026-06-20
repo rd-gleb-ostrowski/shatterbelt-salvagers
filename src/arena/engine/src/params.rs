@@ -3,7 +3,7 @@
 /// Every number here is a tunable first-pass value.  Engine logic must never
 /// hardcode gameplay constants — read them from `Params` instead.
 /// Units: arena units for distance, ticks for time (30 ticks/second default).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Params {
     // ── Match setup ──────────────────────────────────────────────────────────
     pub tick_rate: u32,
