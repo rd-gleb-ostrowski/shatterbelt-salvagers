@@ -1175,6 +1175,10 @@ impl Engine {
                     next_proj_id += 1;
                     ship.aether.cur -= p.shot_cost;
                     ship.cannon_cooldown = p.cannon_cooldown;
+                    ship_events
+                        .entry(ship.id.clone())
+                        .or_default()
+                        .push(Event::CannonFired);
                 }
             }
 
@@ -1326,6 +1330,12 @@ impl Engine {
                         relics.swap_remove(i);
                         // Do NOT increment i: the swapped-in element needs checking.
 
+                        // Emit one RelicTaken per relic picked up.
+                        ship_events
+                            .entry(ship.id.clone())
+                            .or_default()
+                            .push(Event::RelicTaken);
+
                         // Sigil grant: first relic pickup while holding none.
                         if enable_sigils && ship.sigil.is_none() && !this_ship_queued {
                             needs_sigil.push(ship_idx);
@@ -1376,6 +1386,10 @@ impl Engine {
                     let banked = ship.relics_carried as f32 * relic_value;
                     score_deltas.push((ship.id.clone(), banked));
                     ship.relics_carried = 0;
+                    ship_events
+                        .entry(ship.id.clone())
+                        .or_default()
+                        .push(Event::RelicBanked { value: banked });
                 }
             }
 

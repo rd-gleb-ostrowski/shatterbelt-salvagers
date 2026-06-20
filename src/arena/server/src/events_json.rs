@@ -33,6 +33,10 @@ pub enum EventJson {
     KilledShip { victim: String },
     Died { by: Option<String> },
     Respawned,
+    // ── Issue 11: Authoritative action events ────────────────────────────
+    CannonFired,
+    RelicTaken,
+    RelicBanked { value: f32 },
 }
 
 /// Convert an engine [`arena_engine::Event`] to [`EventJson`].
@@ -87,5 +91,8 @@ pub(crate) fn event_to_json(e: &arena_engine::Event) -> Option<EventJson> {
         }
         Event::Died { by } => EventJson::Died { by: by.clone() },
         Event::Respawned => EventJson::Respawned,
+        Event::CannonFired => EventJson::CannonFired,
+        Event::RelicTaken => EventJson::RelicTaken,
+        Event::RelicBanked { value } => EventJson::RelicBanked { value: *value },
     })
 }

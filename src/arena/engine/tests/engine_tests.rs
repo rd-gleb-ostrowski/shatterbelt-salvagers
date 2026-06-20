@@ -5567,3 +5567,263 @@ fn determinism_world_effect_sigils() {
         assert_eq!(a.pos.y, b.pos.y, "relic pos.y must be identical ({})", a.id);
     }
 }
+// ═══════════════════════════════════════════════════════════════════════════
+// Issue 11: Authoritative action events — CannonFired, RelicTaken, RelicBanked
+// TDD tracer-bullet order:
+//   A1. A ship that fires (off-cooldown, enough aether, fire intent) gets a
+//       `CannonFired` event on the firing tick.
+//   A2. A ship that does NOT fire (on cooldown / no intent) gets NO CannonFired.
+//   A3. A ship overlapping a relic gets a `RelicTaken` event on the pickup tick.
+//   A4. A ship NOT picking up gets no `RelicTaken`.
+//   A5. A ship banking carried relics at its Anchor gets a `RelicBanked { value }`
+//       event with the correct value on the banking tick.
+//   A6. A ship not banking gets no `RelicBanked`.
+// ══════════════
+
+/// Helper: extract all events for `ship_id` from a step result.
+fn events_for<'a>(
+    result: &'a [(String, Vec<Event>)],
+    ship_id: &str,
+) -> &'a Vec<Event> {
+    result
+        .iter()
+        .find(|(id, _)| id == ship_id)
+        .map(|(_, evs)| evs)
+        .unwrap_or_else(|| panic!("ship {ship_id} not found in step result"))
+}
+
+// ─── test A1: ship fires → CannonFired emitted ────────────────────────────
+
+#[test]
+fn cannon_fired_event_emitted_on_firing_tick() {
+    // Single ship, cannon ready (cannon_start_hot=0), full aether, fire intent.
+    let mut p = Params::default();
+    p.cannon_start_hot = 0;
+    p.relic_field_cap = 0; // no relics — isolate cannon behaviour
+    let spec = ShipSpec {
+        id: "shooter".to_string(),
+        class: ShipClass::Skiff,
+        anchor_pos: Vec2 { x: 0.0, y: 0.0 },
+    };
+    let mut engine = Engine::new(1, p, vec![spec]);
+
+    let result = engine.step(vec![("shooter".to_string(), fire_intent())]);
+
+    let evs = events_for(&result, "shooter");
+    assert!(
+        evs.contains(&Event::CannonFired),
+        "expected CannonFired in events; got {evs:?}"
+    );
+}
+
+// ─── test A2: ship on cooldown / no fire intent → no CannonFired ─────────
+
+#[test]
+fn no_cannon_fired_event_when_on_cooldown() {
+    // Cannon starts with full cooldown (cannon_start_hot = default = 15).
+    let mut p = Params::default();
+    p.relic_field_cap = 0;
+    let spec = ShipSpec {
+        id: "shooter".to_string(),
+        class: ShipClass::Skiff,
+        anchor_pos: Vec2 { x: 0.0, y: 0.0 },
+    };
+    let mut engine = Engine::new(1, p, vec![spec]);
+
+    // cannon_start_hot = 15 → cooldown > 0, even with fire intent no shot fires.
+    let result = engine.step(vec![("shooter".to_string(), fire_intent())]);
+
+    let evs = events_for(&result, "shooter");
+    assert!(
+        !evs.contains(&Event::CannonFired),
+        "expected NO CannonFired while on cooldown; got {evs:?}"
+    );
+}
+
+#[test]
+fn no_cannon_fired_event_without_fire_intent() {
+    // Cannon ready but no fire intent.
+    let mut p = Params::default();
+    p.cannon_start_hot = 0;
+    p.relic_field_cap = 0;
+    let spec = ShipSpec {
+        id: "shooter".to_string(),
+        class: ShipClass::Skiff,
+        anchor_pos: Vec2 { x: 0.0, y: 0.0 },
+    };
+    let mut engine = Engine::new(1, p, vec![spec]);
+
+    let result = engine.step(vec![]); // no intent → persisted fire defaults false
+
+    let evs = events_for(&result, "shooter");
+    assert!(
+        !evs.contains(&Event::CannonFired),
+        "expected NO CannonFired without fire intent; got {evs:?}"
+    );
+}
+
+// ─── test A3: ship picks up a relic → RelicTaken emitted ─────────────────
+
+#[test]
+fn relic_taken_event_emitted_on_pickup_tick() {
+    // tiny_single_engine: ship at (100,100) which is also its anchor, relics
+    // spawn in the tiny arena within pickup radius.
+    // Banking radius also covers the ship, so relics are banked too — but we
+    // can still observe RelicTaken in the same step result.
+    let mut engine = tiny_single_engine();
+
+    // Confirm there is at least one relic to pick up.
+    assert!(
+        !engine.god_view().relics.is_empty(),
+        "need at least one relic to test pickup"
+    );
+
+    let result = engine.step(vec![]);
+
+    let evs = events_for(&result, "ship-1");
+    assert!(
+        evs.contains(&Event::RelicTaken),
+        "expected at least one RelicTaken event; got {evs:?}"
+    );
+}
+
+// ─── test A4: ship not near any relic → no RelicTaken ────────────────────
+
+#[test]
+fn no_relic_taken_event_when_not_near_relic() {
+    // Ship far from all relics; tiny pickup radius so no accidental pickups.
+    let mut p = Params::default();
+    p.arena_w = 2000.0;
+    p.arena_h = 1200.0;
+    p.relic_pickup_radius = 1.0; // near-zero so ship can't reach relics
+    p.relic_field_cap = 4;
+    p.relic_spawn_period = 9999;
+    let spec = ShipSpec {
+        id: "loner".to_string(),
+        class: ShipClass::Skiff,
+        // Anchor far from arena centre where relics spawn.
+        anchor_pos: Vec2 { x: 1990.0, y: 1190.0 },
+    };
+    let mut engine = Engine::new(7, p, vec![spec]);
+
+    let result = engine.step(vec![]);
+
+    let evs = events_for(&result, "loner");
+    assert!(
+        !evs.iter().any(|e| matches!(e, Event::RelicTaken)),
+        "expected NO RelicTaken when ship is far from relics; got {evs:?}"
+    );
+}
+
+// ─── test A5: ship banks relics at Anchor → RelicBanked { value } emitted ─
+
+#[test]
+fn relic_banked_event_emitted_with_correct_value() {
+    // Use an engine where banking is guaranteed: ship is at its anchor AND
+    // there are relics within pickup range.  tiny_single_engine satisfies both.
+    let mut p = Params::default();
+    p.arena_w = 202.0;
+    p.arena_h = 202.0;
+    p.relic_field_cap = 4;
+    p.carry_cap = 5;
+    p.relic_spawn_period = 9999;
+    p.relic_value = 2.5; // non-default so we can verify the exact value
+    let spec = ShipSpec {
+        id: "banker".to_string(),
+        class: ShipClass::Skiff,
+        anchor_pos: Vec2 { x: 100.0, y: 100.0 },
+    };
+    let mut engine = Engine::new(42, p.clone(), vec![spec]);
+
+    // Sanity: relics present.
+    assert!(
+        !engine.god_view().relics.is_empty(),
+        "need relics to bank"
+    );
+
+    let result = engine.step(vec![]);
+
+    let evs = events_for(&result, "banker");
+
+    // There must be exactly one RelicBanked event (all relics banked together).
+    let banked_events: Vec<&Event> = evs
+        .iter()
+        .filter(|e| matches!(e, Event::RelicBanked { .. }))
+        .collect();
+    assert_eq!(
+        banked_events.len(),
+        1,
+        "expected exactly one RelicBanked event; got {evs:?}"
+    );
+
+    // The value must equal relics_taken × relic_value.
+    // We know at least one relic was taken (tiny arena, ship at anchor).
+    if let Event::RelicBanked { value } = banked_events[0] {
+        assert!(
+            *value > 0.0,
+            "RelicBanked value must be positive; got {value}"
+        );
+        // value must be a multiple of relic_value.
+        let count = (*value / p.relic_value).round() as u32;
+        assert!(
+            (value - count as f32 * p.relic_value).abs() < 1e-4,
+            "RelicBanked value={value} must equal count × relic_value={}", p.relic_value
+        );
+    } else {
+        panic!("expected RelicBanked variant");
+    }
+}
+
+// ─── test A6: ship not at Anchor (carrying relics) → no RelicBanked ───────
+
+#[test]
+fn no_relic_banked_event_when_not_at_anchor() {
+    // Ships always spawn at their anchor, so we thrust the ship away first
+    // then check that banking does not occur while it is out of range.
+    //
+    // Anchor at (100, 100); bank_radius = 60.  Thrust East for 20 ticks
+    // (thrust_accel=0.5, lin_damping=0.97 → ship reaches ~15 u/tick and
+    // travels well beyond 60 units from anchor).
+    let mut p = Params::default();
+    p.relic_field_cap = 0;          // no relics in field
+    p.relic_spawn_period = 9999;    // no replenishment
+    p.cannon_start_hot = 999;       // keep cannon locked so no accidental shots
+    let spec = ShipSpec {
+        id: "carrier".to_string(),
+        class: ShipClass::Skiff,
+        anchor_pos: Vec2 { x: 100.0, y: 600.0 },
+    };
+    let mut engine = Engine::new(1, p.clone(), vec![spec]);
+
+    // Thrust East to move away from anchor.
+    let thrust_intent = Intent {
+        thrust: Some(1.0),
+        ..Default::default()
+    };
+    for _ in 0..25 {
+        engine.step(vec![("carrier".to_string(), thrust_intent.clone())]);
+    }
+
+    // Confirm ship is now outside bank_radius (default 60).
+    let ship_pos = engine.god_view().ships[0].pos;
+    let dx = ship_pos.x - 100.0;
+    let dy = ship_pos.y - 600.0;
+    let dist_sq = dx * dx + dy * dy;
+    assert!(
+        dist_sq > p.anchor_bank_radius * p.anchor_bank_radius,
+        "ship must be outside bank_radius for this test; dist={:.1}",
+        dist_sq.sqrt()
+    );
+
+    // Now give the ship carried relics.
+    engine.set_relics_carried_for_test("carrier", 3);
+
+    // Step with no intent and verify no RelicBanked is emitted.
+    let result = engine.step(vec![]);
+
+    let evs = events_for(&result, "carrier");
+    assert!(
+        !evs.iter().any(|e| matches!(e, Event::RelicBanked { .. })),
+        "expected NO RelicBanked when ship is not at its anchor; got {evs:?}"
+    );
+}

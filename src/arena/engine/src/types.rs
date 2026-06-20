@@ -189,4 +189,17 @@ pub enum Event {
     /// The ship's Hull took `amount` direct damage from an Arc Lance bolt fired
     /// by `by`. Shields are bypassed entirely.
     LanceTookHull { amount: f32, by: ShipId },
+
+    // ── Issue 11: Authoritative action events ─────────────────────────────
+    /// This ship fired its rune-cannon this tick (a projectile was spawned).
+    /// Emitted once per firing tick, regardless of whether the projectile hits.
+    CannonFired,
+    /// This ship picked up one relic from the Drift this tick.
+    /// Emitted once per relic taken (so multiple events if several relics are
+    /// picked up in the same tick, consistent with `RelicDropped` per-relic
+    /// semantics).
+    RelicTaken,
+    /// This ship banked its carried relics at its Anchor this tick.
+    /// `value` is the total score amount added (relics_carried × relic_value).
+    RelicBanked { value: f32 },
 }
