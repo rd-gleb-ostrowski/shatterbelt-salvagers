@@ -8,6 +8,7 @@
 //! | `ARENA_EVENT_PASSWORD`      | `arena`                      | Pre-shared event password for `POST /register`.          |
 //! | `ARENA_FACILITATOR_PASSWORD`| `facilitator`                | Pre-shared facilitator password for admin endpoints.     |
 //! | `ARENA_STATIC_DIR`          | `src/arena/frontend/dist`    | Path to the built frontend `dist/` directory.            |
+//! | `ARENA_DATA_DIR`            | `arena-data/recordings`      | Directory for durable recording storage.                 |
 //!
 //! ## Quick start
 //!
@@ -27,7 +28,8 @@
 
 use std::path::PathBuf;
 
-use arena_server::routes::build_app;
+use arena_server::recording::RecordingStore;
+use arena_server::routes::build_app_with_store;
 
 #[tokio::main]
 async fn main() {
@@ -46,7 +48,14 @@ async fn main() {
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("src/arena/frontend/dist"));
 
-    let router = build_app(event_password, facilitator_password, Some(static_dir));
+    let data_dir = std::env::var("ARENA_DATA_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("arena-data/recordings"));
+
+    let recording_store = RecordingStore::with_dir(data_dir);
+
+    let router =
+        build_app_with_store(event_password, facilitator_password, Some(static_dir), recording_store);
 
     let listener = match tokio::net::TcpListener::bind(format!("0.0.0.0:{port}")).await {
         Ok(l) => l,

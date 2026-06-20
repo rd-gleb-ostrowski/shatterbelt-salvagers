@@ -228,15 +228,20 @@ async fn download_recording_returns_seed_and_meta() {
 
     assert_eq!(status, StatusCode::OK, "expected 200, got {status}; body: {body}");
 
-    // The DTO must contain seed and meta fields
-    assert_eq!(body["matchId"], Value::String(match_id));
+    // The response is now the full Recording (snake_case), not the old metadata-only DTO.
+    assert_eq!(body["match_id"], Value::String(match_id));
     assert_eq!(body["seed"], Value::Number(serde_json::Number::from(seed)));
-    assert_eq!(body["tickCount"], Value::Number(serde_json::Number::from(5_u32)));
-    assert_eq!(body["winner"], Value::String("ship-0".to_owned()));
+    assert_eq!(body["meta"]["tick_count"], Value::Number(serde_json::Number::from(5_u32)));
+    assert_eq!(body["meta"]["winner"], Value::String("ship-0".to_owned()));
 
-    // Scores array: [[shipId, score], ...]
-    let scores_val = &body["scores"];
-    assert!(scores_val.is_array(), "scores must be an array");
+    // Full recording also includes specs, params, intent_log.
+    assert!(body["specs"].is_array(), "full recording must include specs");
+    assert!(body["params"].is_object(), "full recording must include params");
+    assert!(body["intent_log"].is_array(), "full recording must include intent_log");
+
+    // Scores in meta: [[shipId, score], ...]
+    let scores_val = &body["meta"]["scores"];
+    assert!(scores_val.is_array(), "meta.scores must be an array");
     assert_eq!(scores_val.as_array().unwrap().len(), 2);
 }
 

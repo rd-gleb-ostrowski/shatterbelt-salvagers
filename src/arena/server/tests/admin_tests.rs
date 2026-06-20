@@ -327,3 +327,299 @@ async fn event_password_does_not_grant_admin_access() {
 
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// B2b — full download + import tests
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Run a headless match via the HTTP API and return the match_id.
+async fn run_headless_match(app: axum::Router) -> String {
+    let resp = post_admin_matches(
+        app,
+        Some(&format!("Facilitator {FACILITATOR_PASSWORD}")),
+        serde_json::json!({ "mode": "headless", "seed": 55, "maxTicks": 10 }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK, "headless match must start");
+    let json = response_json(resp).await;
+    json["matchId"].as_str().expect("matchId string").to_owned()
+}
+
+// ── (3) GET /admin/recordings/{id}/download returns full Recording JSON ───────
+
+#[tokio::test]
+async fn download_returns_full_recording_json() {
+    let store = RecordingStore::new();
+    let app = test_app(store.clone(), ObserverHub::new());
+
+    let match_id = run_headless_match(app.clone()).await;
+
+    let resp = request_json(
+        app,
+        Method::GET,
+        &format!("/admin/recordings/{match_id}/download"),
+        Some(&format!("Facilitator {FACILITATOR_PASSWORD}")),
+        None,
+    )
+    .await;
+
+    assert_eq!(resp.status(), StatusCode::OK, "download must return 200");
+    let body = response_json(resp).await;
+
+    // Must contain all Recording fields (not just metadata).
+    assert_eq!(body["match_id"], match_id, "match_id field must be present");
+    assert!(body["seed"].is_number(), "seed must be present");
+    assert!(body["params"].is_object(), "params must be present");
+    assert!(body["specs"].is_array(), "specs must be present");
+    assert!(body["intent_log"].is_array(), "intent_log must be present");
+    assert!(body["meta"].is_object(), "meta must be present");
+    assert!(body["meta"]["tick_count"].is_number(), "meta.tick_count must be present");
+}
+
+#[tokio::test]
+async fn download_returns_404_for_unknown_id() {
+    let app = test_app(RecordingStore::new(), ObserverHub::new());
+
+    let resp = request_json(
+        app,
+        Method::GET,
+        "/admin/recordings/nonexistent-id/download",
+        Some(&format!("Facilitator {FACILITATOR_PASSWORD}")),
+        None,
+    )
+    .await;
+
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn download_returns_401_without_auth() {
+    let store = RecordingStore::new();
+    let app = test_app(store.clone(), ObserverHub::new());
+
+    let match_id = run_headless_match(app.clone()).await;
+
+    let resp = request_json(
+        app,
+        Method::GET,
+        &format!("/admin/recordings/{match_id}/download"),
+        None,
+        None,
+    )
+    .await;
+
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+// ── (4) POST /admin/recordings/import stores recording + appears in listing ───
+
+#[tokio::test]
+async fn import_stores_recording_and_appears_in_listing() {
+    // Step 1: run a match and download the full artifact.
+    let source_store = RecordingStore::new();
+    let source_app = test_app(source_store.clone(), ObserverHub::new());
+    let match_id = run_headless_match(source_app.clone()).await;
+
+    let dl_resp = request_json(
+        source_app,
+        Method::GET,
+        &format!("/admin/recordings/{match_id}/download"),
+        Some(&format!("Facilitator {FACILITATOR_PASSWORD}")),
+        None,
+    )
+    .await;
+    assert_eq!(dl_resp.status(), StatusCode::OK);
+    let recording_json = response_json(dl_resp).await;
+
+    // Step 2: import into a FRESH, empty store.
+    let fresh_store = RecordingStore::new();
+    let fresh_app = test_app(fresh_store.clone(), ObserverHub::new());
+
+    let import_resp = request_json(
+        fresh_app.clone(),
+        Method::POST,
+        "/admin/recordings/import",
+        Some(&format!("Facilitator {FACILITATOR_PASSWORD}")),
+        Some(recording_json),
+    )
+    .await;
+    assert_eq!(import_resp.status(), StatusCode::OK, "import must return 200");
+
+    // Step 3: verify it appears in GET /recordings.
+    let list_resp = request_json(
+        fresh_app,
+        Method::GET,
+        "/recordings",
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(list_resp.status(), StatusCode::OK);
+    let list = response_json(list_resp).await;
+    let ids: Vec<&str> = list
+        .as_array()
+        .expect("array")
+        .iter()
+        .filter_map(|item| item["matchId"].as_str())
+        .collect();
+    assert!(ids.contains(&match_id.as_str()), "imported match_id must be in GET /recordings");
+
+    // Step 4: verify store.get() returns it.
+    assert!(
+        fresh_store.get(&match_id).is_some(),
+        "fresh_store.get() must find the imported recording"
+    );
+}
+
+// ── (5) import → recording is replayable ─────────────────────────────────────
+
+#[tokio::test]
+async fn import_makes_recording_replayable() {
+    // Download artifact from a source app.
+    let source_app = test_app(RecordingStore::new(), ObserverHub::new());
+    let match_id = run_headless_match(source_app.clone()).await;
+
+    let dl_resp = request_json(
+        source_app,
+        Method::GET,
+        &format!("/admin/recordings/{match_id}/download"),
+        Some(&format!("Facilitator {FACILITATOR_PASSWORD}")),
+        None,
+    )
+    .await;
+    let recording_json = response_json(dl_resp).await;
+
+    // Import into a fresh app.
+    let fresh_app = test_app(RecordingStore::new(), ObserverHub::new());
+    let import_resp = request_json(
+        fresh_app.clone(),
+        Method::POST,
+        "/admin/recordings/import",
+        Some(&format!("Facilitator {FACILITATOR_PASSWORD}")),
+        Some(recording_json),
+    )
+    .await;
+    assert_eq!(import_resp.status(), StatusCode::OK);
+
+    // Replay the imported recording.
+    let replay_resp = request_json(
+        fresh_app,
+        Method::POST,
+        &format!("/recordings/{match_id}/replay"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(
+        replay_resp.status(),
+        StatusCode::OK,
+        "replay of imported recording must succeed"
+    );
+}
+
+// ── (6) import malformed body → 400; no auth → 401 ────────────────────────────
+
+#[tokio::test]
+async fn import_malformed_body_returns_400() {
+    let app = test_app(RecordingStore::new(), ObserverHub::new());
+
+    let resp = request_json(
+        app,
+        Method::POST,
+        "/admin/recordings/import",
+        Some(&format!("Facilitator {FACILITATOR_PASSWORD}")),
+        Some(serde_json::json!({"not": "a recording"})),
+    )
+    .await;
+
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "malformed body must return 400");
+}
+
+#[tokio::test]
+async fn import_without_auth_returns_401() {
+    let app = test_app(RecordingStore::new(), ObserverHub::new());
+
+    let resp = request_json(
+        app,
+        Method::POST,
+        "/admin/recordings/import",
+        None,
+        Some(serde_json::json!({})),
+    )
+    .await;
+
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+// ── (7) download → import → fresh store → list + replay round-trip ───────────
+
+#[tokio::test]
+async fn download_import_replay_round_trip() {
+    // Phase A: run a real match in source app, download the full artifact.
+    let source_store = RecordingStore::new();
+    let source_app = test_app(source_store, ObserverHub::new());
+    let match_id = run_headless_match(source_app.clone()).await;
+
+    let dl_resp = request_json(
+        source_app,
+        Method::GET,
+        &format!("/admin/recordings/{match_id}/download"),
+        Some(&format!("Facilitator {FACILITATOR_PASSWORD}")),
+        None,
+    )
+    .await;
+    assert_eq!(dl_resp.status(), StatusCode::OK);
+    let artifact = response_json(dl_resp).await;
+
+    // Sanity-check the artifact shape before round-tripping it.
+    assert!(artifact["intent_log"].is_array());
+    assert!(!artifact["intent_log"].as_array().unwrap().is_empty(), "intent_log must not be empty");
+
+    // Phase B: import the artifact into a COMPLETELY FRESH app (simulates
+    // a different server instance receiving the artifact via HTTP).
+    let fresh_hub = ObserverHub::new();
+    let fresh_app = test_app(RecordingStore::new(), fresh_hub.clone());
+
+    let import_resp = request_json(
+        fresh_app.clone(),
+        Method::POST,
+        "/admin/recordings/import",
+        Some(&format!("Facilitator {FACILITATOR_PASSWORD}")),
+        Some(artifact),
+    )
+    .await;
+    assert_eq!(import_resp.status(), StatusCode::OK, "import into fresh server must succeed");
+
+    // Phase C: verify listing.
+    let list_resp = request_json(
+        fresh_app.clone(),
+        Method::GET,
+        "/recordings",
+        None,
+        None,
+    )
+    .await;
+    let list = response_json(list_resp).await;
+    let listed_ids: Vec<&str> = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|v| v["matchId"].as_str())
+        .collect();
+    assert!(listed_ids.contains(&match_id.as_str()), "artifact must be listed after import");
+
+    // Phase D: replay must succeed (proves the artifact is genuinely portable).
+    let replay_resp = request_json(
+        fresh_app,
+        Method::POST,
+        &format!("/recordings/{match_id}/replay"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(
+        replay_resp.status(),
+        StatusCode::OK,
+        "round-tripped artifact must be replayable"
+    );
+}

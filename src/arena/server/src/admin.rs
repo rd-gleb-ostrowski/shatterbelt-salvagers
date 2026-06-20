@@ -1066,27 +1066,10 @@ struct LadderRunnerStatus {
 
 // ── Recording download DTO ────────────────────────────────────────────────────
 
-/// Download DTO for `GET /admin/recordings/{id}/download`.
-///
-/// Engine types ([`arena_engine::Params`], [`arena_engine::ShipSpec`],
-/// [`arena_engine::IntentFrame`]) do not implement `Serialize`, so this DTO
-/// contains the fields that are serialisable:
-///
-/// - `match_id`, `seed` — from [`crate::recording::Recording`].
-/// - `tick_count`, `winner`, `scores` — from [`crate::recording::RecordingMeta`].
-///
-/// `params`, `specs`, and `intent_log` are excluded.  A future issue that adds
-/// `Serialize` to engine types can replace this DTO with the full
-/// `Recording` struct without changing the endpoint contract.
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RecordingDownloadDto {
-    pub match_id: String,
-    pub seed: u64,
-    pub tick_count: u32,
-    pub winner: Option<String>,
-    pub scores: Vec<(String, f32)>,
-}
+// NOTE: RecordingDownloadDto was removed in issue B2b.  The download endpoint
+// now returns a full `Recording` (serde_json serialised), which is a complete,
+// re-importable artifact containing match_id, seed, params, specs, intent_log,
+// and meta.  See `get_admin_recording_download` and PROTOCOL.md §download.
 
 // ── Ladder runner handlers ────────────────────────────────────────────────────
 
@@ -1172,11 +1155,32 @@ pub async fn post_admin_ladder_runner_stop(
 
 // ── Recording download handler ────────────────────────────────────────────────
 
-/// `GET /admin/recordings/{id}/download` — download a recording as JSON.
+/// `GET /admin/recordings/{id}/download` — download a recording as a full JSON artifact.
 ///
-/// Returns a [`RecordingDownloadDto`] with seed + metadata.  Engine types
-/// (`Params`, `ShipSpec`, `IntentFrame`) are excluded because they do not
-/// implement `Serialize`; the DTO shape is documented and stable.
+/// Returns the complete [`Recording`] serialised as JSON — a re-importable
+/// artifact containing `match_id`, `seed`, `params`, `specs`, `intent_log`,
+/// and `meta`.  This artifact can be fed directly to
+/// `POST /admin/recordings/import` on any server instance to restore the
+/// recording and make it replayable.
+///
+/// ## Response shape
+///
+/// ```json
+/// {
+///   "match_id": "…",
+///   "seed": 42,
+///   "params": { … },
+///   "specs": [ … ],
+///   "intent_log": [ … ],
+///   "meta": {
+///     "match_id": "…",
+///     "seed": 42,
+///     "tick_count": 30,
+///     "winner": "ship-0",
+///     "scores": [["ship-0", 1.5], ["ship-1", 0.0]]
+///   }
+/// }
+/// ```
 ///
 /// # Auth
 ///
@@ -1186,7 +1190,7 @@ pub async fn post_admin_ladder_runner_stop(
 ///
 /// | Status | Meaning |
 /// |--------|---------|
-/// | **200 OK** | Recording returned as JSON. |
+/// | **200 OK** | Full recording returned as JSON. |
 /// | **401 Unauthorized** | Missing, malformed, or wrong facilitator password. |
 /// | **404 Not Found** | No recording with the given `id`. |
 pub async fn get_admin_recording_download(
@@ -1203,13 +1207,50 @@ pub async fn get_admin_recording_download(
             Json(serde_json::json!({"error": "recording not found"})),
         )
             .into_response(),
-        Some(rec) => Json(RecordingDownloadDto {
-            match_id: rec.match_id,
-            seed: rec.seed,
-            tick_count: rec.meta.tick_count,
-            winner: rec.meta.winner,
-            scores: rec.meta.scores,
-        })
-        .into_response(),
+        Some(rec) => Json(rec).into_response(),
+    }
+}
+
+// ── Recording import handler ──────────────────────────────────────────────────
+
+/// `POST /admin/recordings/import` — import a recording artifact into the store.
+///
+/// Accepts a full [`Recording`] JSON body (as produced by
+/// `GET /admin/recordings/{id}/download`).  After import the recording is:
+/// - Returned by `GET /recordings` (appears in the listing).
+/// - Retrievable via `recording_store.get(match_id)`.
+/// - Replayable via `POST /recordings/{id}/replay`.
+/// - If the store has a persistence directory configured, the recording is
+///   also written to disk immediately.
+///
+/// # Auth
+///
+/// ```text
+/// Authorization: Facilitator <facilitator_password>
+/// ```
+///
+/// | Status | Meaning |
+/// |--------|---------|
+/// | **200 OK** | Recording imported and stored. |
+/// | **400 Bad Request** | Body is absent or not a valid Recording JSON. |
+/// | **401 Unauthorized** | Missing, malformed, or wrong facilitator password. |
+pub async fn post_admin_recording_import(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> impl IntoResponse {
+    if let Err(status) = check_facilitator_auth(&headers, &state.facilitator_password) {
+        return status.into_response();
+    }
+    match serde_json::from_slice::<Recording>(&body) {
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": format!("malformed recording body: {e}")})),
+        )
+            .into_response(),
+        Ok(rec) => {
+            state.recording_store.record(rec);
+            StatusCode::OK.into_response()
+        }
     }
 }

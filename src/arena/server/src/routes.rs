@@ -617,8 +617,9 @@ pub fn build_router_config(config: RouterConfig) -> Router {
         .route("/admin/ladder/runner", get(admin::get_admin_ladder_runner))
         .route("/admin/ladder/runner/start", post(admin::post_admin_ladder_runner_start))
         .route("/admin/ladder/runner/stop", post(admin::post_admin_ladder_runner_stop))
-        // ── Issue 12/admin: recording download ────────────────────────────
+        // ── Issue 12/admin: recording download + import ───────────────────
         .route("/admin/recordings/{id}/download", get(admin::get_admin_recording_download))
+        .route("/admin/recordings/import", post(admin::post_admin_recording_import))
         .with_state(state)
 }
 
@@ -642,6 +643,9 @@ async fn redirect_to_admin_html() -> impl IntoResponse {
 ///   still served normally; a warning is printed when a path was given but
 ///   the directory does not exist.
 ///
+/// Uses a fresh in-memory [`RecordingStore`]. To inject a persistent (disk-backed)
+/// store, use [`build_app_with_store`] instead.
+///
 /// ## Route precedence
 ///
 /// All API routes registered by [`build_router_config`] are explicit routes
@@ -651,6 +655,26 @@ pub fn build_app(
     event_password: String,
     facilitator_password: String,
     static_dir: Option<PathBuf>,
+) -> Router {
+    build_app_with_store(
+        event_password,
+        facilitator_password,
+        static_dir,
+        RecordingStore::new(),
+    )
+}
+
+/// Like [`build_app`] but accepts an explicit [`RecordingStore`] — use this to
+/// inject a disk-backed store (constructed with [`RecordingStore::with_dir`])
+/// from the binary entry point so recordings survive server restarts.
+///
+/// Existing callers that only need the in-memory default should continue to
+/// use [`build_app`].
+pub fn build_app_with_store(
+    event_password: String,
+    facilitator_password: String,
+    static_dir: Option<PathBuf>,
+    recording_store: Arc<RecordingStore>,
 ) -> Router {
     let api_router = build_router_config(RouterConfig {
         event_password,
@@ -662,7 +686,7 @@ pub fn build_app(
         match_seed: 42,
         match_params: Params::default(),
         observer_hub: ObserverHub::new(),
-        recording_store: RecordingStore::new(),
+        recording_store,
         health_store: BotHealthStore::new(),
         dq_store: DqStore::new(),
         ladder: Ladder::new(),

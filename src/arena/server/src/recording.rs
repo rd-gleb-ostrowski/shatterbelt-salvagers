@@ -19,6 +19,7 @@
 //! | 11 (Admin UI)         | `GET /recordings` → `list()`; `POST /recordings/{id}/replay` |
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
 use arena_engine::{IntentFrame, Params, ShipId, ShipSpec};
@@ -27,7 +28,7 @@ use arena_engine::{IntentFrame, Params, ShipId, ShipSpec};
 
 /// Everything needed to replay a finished match exactly, plus lightweight
 /// metadata shown in the listing.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Recording {
     /// Stable identifier for this recording (UUID v4).
     pub match_id: String,
@@ -48,7 +49,7 @@ pub struct Recording {
 /// Lightweight per-recording metadata returned by [`RecordingStore::list`].
 ///
 /// Intentionally a small, cloneable type so listing is cheap.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RecordingMeta {
     /// Stable identifier for this recording (UUID v4).
     pub match_id: String,
@@ -64,10 +65,21 @@ pub struct RecordingMeta {
 
 // ── RecordingStore ────────────────────────────────────────────────────────────
 
-/// Shared in-memory store of finished-match recordings, keyed by `match_id`.
+/// Shared store of finished-match recordings, keyed by `match_id`.
 ///
-/// Create one instance at server startup with [`RecordingStore::new`] and
-/// share it as `Arc<RecordingStore>`.
+/// Create one instance at server startup with [`RecordingStore::new`] (in-memory
+/// only) or [`RecordingStore::with_dir`] (disk-backed) and share it as
+/// `Arc<RecordingStore>`.
+///
+/// ## Persistence
+///
+/// When constructed via [`RecordingStore::with_dir`]:
+/// - Existing `*.json` files in the directory are loaded into memory on
+///   construction (survives a server restart).
+/// - Each call to [`record`](RecordingStore::record) additionally writes a
+///   `{match_id}.json` file to the directory.
+/// - Disk I/O failures are logged (via `eprintln!`) but never panic — the
+///   match result is always stored in memory regardless.
 ///
 /// ## Seams for future issues
 ///
@@ -78,20 +90,104 @@ pub struct RecordingMeta {
 #[derive(Debug, Default)]
 pub struct RecordingStore {
     inner: RwLock<HashMap<String, Recording>>,
+    /// Optional persistence directory. When `Some`, recordings are written as
+    /// `{match_id}.json` on every [`record`](RecordingStore::record) call.
+    dir: Option<PathBuf>,
 }
 
 impl RecordingStore {
-    /// Create a new, empty store wrapped in `Arc`.
+    /// Create a new, empty in-memory store wrapped in `Arc`.
+    ///
+    /// No disk I/O is performed. Recordings survive only for the lifetime of
+    /// the process.
     pub fn new() -> Arc<Self> {
         Arc::new(Self::default())
     }
 
-    /// Persist a finished-match recording.
+    /// Create a disk-backed store rooted at `path`, wrapped in `Arc`.
+    ///
+    /// On construction:
+    /// 1. The directory is created (including parents) if it does not exist.
+    /// 2. All `*.json` files present in the directory are deserialised and
+    ///    loaded into the in-memory map — recordings from a previous server
+    ///    run are immediately available.
+    ///
+    /// Failures (unreadable dir, malformed JSON) are reported via `eprintln!`
+    /// and skipped; the store is still usable.
+    pub fn with_dir(path: PathBuf) -> Arc<Self> {
+        if let Err(e) = std::fs::create_dir_all(&path) {
+            eprintln!(
+                "[arena-server] WARNING: could not create recordings dir {:?}: {e}",
+                path
+            );
+        }
+
+        let store = Arc::new(Self {
+            inner: RwLock::new(HashMap::new()),
+            dir: Some(path.clone()),
+        });
+
+        match std::fs::read_dir(&path) {
+            Err(e) => {
+                eprintln!(
+                    "[arena-server] WARNING: could not read recordings dir {:?}: {e}",
+                    path
+                );
+            }
+            Ok(entries) => {
+                let mut map = store.inner.write().unwrap();
+                for entry in entries.flatten() {
+                    let entry_path = entry.path();
+                    if entry_path.extension().is_some_and(|ext| ext == "json") {
+                        match std::fs::read_to_string(&entry_path) {
+                            Err(e) => eprintln!(
+                                "[arena-server] WARNING: could not read recording {:?}: {e}",
+                                entry_path
+                            ),
+                            Ok(json) => match serde_json::from_str::<Recording>(&json) {
+                                Err(e) => eprintln!(
+                                    "[arena-server] WARNING: could not parse recording {:?}: {e}",
+                                    entry_path
+                                ),
+                                Ok(rec) => {
+                                    map.insert(rec.match_id.clone(), rec);
+                                }
+                            },
+                        }
+                    }
+                }
+            }
+        }
+
+        store
+    }
+
+    /// Persist a finished-match recording (memory + optional disk).
     ///
     /// The `recording.match_id` is used as the key; callers should generate
     /// a UUID before constructing the [`Recording`].  If the same `match_id`
     /// is stored again the entry is replaced.
+    ///
+    /// When a persistence directory is configured, the recording is also
+    /// written as `{match_id}.json`.  Disk failures are logged, never panicked.
     pub fn record(&self, recording: Recording) {
+        if let Some(dir) = &self.dir {
+            let file_path = dir.join(format!("{}.json", recording.match_id));
+            match serde_json::to_string(&recording) {
+                Err(e) => eprintln!(
+                    "[arena-server] WARNING: could not serialise recording {}: {e}",
+                    recording.match_id
+                ),
+                Ok(json) => {
+                    if let Err(e) = std::fs::write(&file_path, json) {
+                        eprintln!(
+                            "[arena-server] WARNING: could not write recording to {:?}: {e}",
+                            file_path
+                        );
+                    }
+                }
+            }
+        }
         self.inner
             .write()
             .unwrap()
