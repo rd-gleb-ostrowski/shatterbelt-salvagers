@@ -1,0 +1,16 @@
+{
+  "name": "arena-bot-wasm-assemblyscript",
+  "version": "1.0.0",
+  "description": "Minimal AssemblyScript WASM bot for Shatterbelt Salvagers",
+  "type": "module",
+  "scripts": {
+    "build": "asc assembly/bot.ts --outFile build/bot.wasm --optimize --runtime stub"
+  },
+  "license": "ISC",
+  "devDependencies": {
+    "assemblyscript": "^0.28.19"
+  },
+  "dependencies": {
+    "assemblyscript-json": "^1.1.0"
+  }
+}
