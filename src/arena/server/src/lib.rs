@@ -20,6 +20,7 @@
 //! | Registration & tokens | [`auth::TokenRegistry`] + [`routes::build_router`] | 02 (this issue) |
 //! | Bot transport | [`runner::BotDriver`] trait | 03 (WS bots), 06 (resolver) |
 //! | Connection resolution | [`resolver::ConnectionResolver`] + [`resolver::WsConnectionRegistry`] | 06 (this issue), 09 (headless), 11 (admin) |
+//! | Headless-fast runner | [`headless::HeadlessRunner`] + [`headless::HeadlessResult`] | 09 (this issue), 10 (ladder), 11 (admin) |
 //! | Tick pacing | [`runner::TickPacer`] trait | already used by [`pacer::LivePacer`] |
 //! | Engine state | `runner.engine()` | 07 (observer god_view), 08 (intent_log) |
 //! | Observer stream | [`observer::ObserverHub`] | 07 (this issue), 08 (recording tap), 11 (admin projector) |
@@ -28,6 +29,7 @@
 
 pub mod auth;
 pub mod bot;
+pub mod headless;
 pub mod observer;
 pub mod pacer;
 pub mod recording;
