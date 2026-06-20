@@ -40,6 +40,7 @@ use arena_engine::Params;
 use crate::admin::{self, ExhibitionSupervisor, MatchRegistry};
 use crate::auth::TokenRegistry;
 use crate::health::{BotHealthStore, DqStore};
+use crate::ladder::Ladder;
 use crate::observer::{ObserverHub, ws_viewer_handler};
 use crate::pacer::NoopPacer;
 use crate::recording::RecordingStore;
@@ -142,6 +143,12 @@ pub struct AppState {
     /// Written by `POST /admin/bots/{team}/kick`.  Shared with the resolver
     /// and every live match's [`ExclusionDriver`](crate::health::ExclusionDriver).
     pub dq_store: Arc<DqStore>,
+
+    /// TrueSkill ladder (issue 10).
+    ///
+    /// Updated by every finished match (headless and live).  Exposed via
+    /// `GET /ladder/standings` (public) and `POST /ladder/reset` (facilitator-gated).
+    pub ladder: Arc<Ladder>,
 }
 
 // ── Router configuration ──────────────────────────────────────────────────────
@@ -178,6 +185,11 @@ pub struct RouterConfig {
     pub health_store: Arc<BotHealthStore>,
     /// Disqualification store. Defaults to a fresh [`DqStore`] in [`build_router`].
     pub dq_store: Arc<DqStore>,
+    /// TrueSkill ladder.  Defaults to a fresh [`Ladder`] in [`build_router`].
+    ///
+    /// Retain the `Arc` clone before passing to [`build_router_config`] if you
+    /// need to inspect or seed the ladder in tests.
+    pub ladder: Arc<Ladder>,
 }
 
 // ── Wire types ────────────────────────────────────────────────────────────────
@@ -377,6 +389,81 @@ fn extract_bearer_token(headers: &HeaderMap) -> Option<String> {
         .map(str::to_owned)
 }
 
+// ── Ladder handlers ───────────────────────────────────────────────────────────
+
+/// JSON response shape for a single ladder entry in `GET /ladder/standings`.
+///
+/// Fields use **camelCase** as per the API contract documented in `ADR-0005`.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LadderEntryDto {
+    competitor: String,
+    mu: f64,
+    sigma: f64,
+    conservative_skill: f64,
+    matches: u32,
+}
+
+/// `GET /ladder/standings` — public read-only standings endpoint.
+///
+/// Returns a JSON array of competitors ordered by **conservative skill**
+/// (μ − 3σ) descending.  No authentication required — the Viewer's ladder
+/// panel calls this directly.
+///
+/// ## Response shape
+///
+/// ```json
+/// [
+///   { "competitor": "alpha", "mu": 27.1, "sigma": 7.5,
+///     "conservativeSkill": 4.6, "matches": 3 },
+///   …
+/// ]
+/// ```
+async fn get_ladder_standings(State(state): State<AppState>) -> impl IntoResponse {
+    let entries: Vec<LadderEntryDto> = state
+        .ladder
+        .standings()
+        .into_iter()
+        .map(|e| LadderEntryDto {
+            conservative_skill: e.conservative_skill(),
+            competitor: e.competitor,
+            mu: e.mu,
+            sigma: e.sigma,
+            matches: e.matches,
+        })
+        .collect();
+    (StatusCode::OK, Json(entries))
+}
+
+/// `POST /ladder/reset` — facilitator-gated ladder wipe.
+///
+/// Clears all TrueSkill ratings and match counts, returning the ladder to its
+/// empty initial state.  Useful for starting a fresh competition without
+/// restarting the server.
+///
+/// # Auth
+///
+/// ```text
+/// Authorization: Facilitator <facilitator_password>
+/// ```
+///
+/// # Responses
+///
+/// | Status | Meaning |
+/// |--------|---------|
+/// | **200 OK** | Ladder cleared. |
+/// | **401 Unauthorized** | Missing, malformed, or wrong facilitator password. |
+async fn post_ladder_reset(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(status) = admin::check_facilitator_auth(&headers, &state.facilitator_password) {
+        return status.into_response();
+    }
+    state.ladder.reset();
+    StatusCode::OK.into_response()
+}
+
 // ── Router constructors ───────────────────────────────────────────────────────
 
 /// Build the axum [`Router`] for the Arena server with default WS match settings.
@@ -417,6 +504,7 @@ pub fn build_router(event_password: String, registry: Arc<TokenRegistry>) -> Rou
         recording_store: RecordingStore::new(),
         health_store: BotHealthStore::new(),
         dq_store: DqStore::new(),
+        ladder: Ladder::new(),
     })
 }
 
@@ -440,6 +528,7 @@ pub fn build_router_config(config: RouterConfig) -> Router {
         recording_store: config.recording_store,
         health_store: config.health_store,
         dq_store: config.dq_store,
+        ladder: config.ladder,
     };
     Router::new()
         .route("/register", post(post_register))
@@ -471,6 +560,9 @@ pub fn build_router_config(config: RouterConfig) -> Router {
         // ── Issue 12: health & moderation ─────────────────────────────────
         .route("/admin/bots", get(admin::get_admin_bots))
         .route("/admin/bots/{team}/kick", post(admin::post_admin_kick_bot))
+        // ── Issue 10: TrueSkill ladder ────────────────────────────────────
+        .route("/ladder/standings", get(get_ladder_standings))
+        .route("/ladder/reset", post(post_ladder_reset))
         .with_state(state)
 }
 

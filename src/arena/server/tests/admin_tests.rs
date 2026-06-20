@@ -59,6 +59,7 @@ fn test_app_with_params(
         recording_store,
         health_store: arena_server::health::BotHealthStore::new(),
         dq_store: arena_server::health::DqStore::new(),
+        ladder: arena_server::ladder::Ladder::new(),
     })
 }
 

@@ -125,6 +125,7 @@ fn test_app(
         recording_store: RecordingStore::new(),
         health_store,
         dq_store,
+        ladder: arena_server::ladder::Ladder::new(),
     })
 }
 

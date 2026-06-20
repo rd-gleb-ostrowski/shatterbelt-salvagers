@@ -467,8 +467,8 @@ pub async fn post_admin_start_match(
                 Arc::clone(&state.wasm_store),
                 Arc::clone(&state.recording_store),
                 params,
-                specs,
-                teams,
+                specs.clone(),
+                teams.clone(),
                 10_000_000,
                 seed,
                 Arc::clone(&state.dq_store),
@@ -477,6 +477,21 @@ pub async fn post_admin_start_match(
             let result = tokio::task::spawn_blocking(move || runner.run_one_seeded(seed))
                 .await
                 .expect("headless match task panicked");
+
+            // Feed the ladder.  Map each ship (specs[i]) to its team (teams[i])
+            // by positional index — the same mapping used by consume_headless_results.
+            let ship_to_team: HashMap<String, String> = specs
+                .iter()
+                .zip(teams.iter())
+                .map(|(spec, team)| (spec.id.clone(), team.clone()))
+                .collect();
+            state.ladder.update_from_match(&result.outcome, |ship_id| {
+                ship_to_team
+                    .get(ship_id.as_str())
+                    .cloned()
+                    .unwrap_or_else(|| ship_id.to_string())
+            });
+
             Json(StartMatchResponse {
                 match_id: result.match_id,
                 mode: "headless".to_owned(),
@@ -647,7 +662,16 @@ fn spawn_registered_live_match(
         let pacer: Box<dyn TickPacer + Send> = Box::new(ControlledPacer::new(handle.clone()));
         let registry = Arc::clone(&state.match_registry);
         let id_for_remove = match_id.clone();
-        let _ = tokio::task::spawn_blocking(move || {
+
+        // Build ship→team map before specs are moved into spawn_blocking.
+        // Map: specs[i].id → teams[i], matching the headless and consume_headless_results approach.
+        let ship_to_team: HashMap<String, String> = specs
+            .iter()
+            .zip(teams.iter())
+            .map(|(spec, team)| (spec.id.clone(), team.clone()))
+            .collect();
+
+        let result = tokio::task::spawn_blocking(move || {
             run_live_controlled_with_id(
                 match_id,
                 seed,
@@ -661,6 +685,17 @@ fn spawn_registered_live_match(
             )
         })
         .await;
+
+        // Feed the ladder once the match finishes (state.ladder was not moved above).
+        if let Ok((_, outcome)) = result {
+            state.ladder.update_from_match(&outcome, |ship_id| {
+                ship_to_team
+                    .get(ship_id.as_str())
+                    .cloned()
+                    .unwrap_or_else(|| ship_id.to_string())
+            });
+        }
+
         registry.remove(&id_for_remove);
     });
 }

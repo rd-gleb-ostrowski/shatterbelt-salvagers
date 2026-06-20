@@ -51,6 +51,7 @@ fn test_app(registry: std::sync::Arc<TokenRegistry>) -> axum::Router {
         recording_store: arena_server::recording::RecordingStore::new(),
         health_store: arena_server::health::BotHealthStore::new(),
         dq_store: arena_server::health::DqStore::new(),
+        ladder: arena_server::ladder::Ladder::new(),
     })
 }
 
