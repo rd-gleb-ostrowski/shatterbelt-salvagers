@@ -30,6 +30,7 @@
 pub mod auth;
 pub mod bot;
 pub mod headless;
+pub mod ladder;
 pub mod observer;
 pub mod pacer;
 pub mod recording;

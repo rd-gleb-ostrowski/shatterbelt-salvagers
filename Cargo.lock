@@ -61,6 +61,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "skillratings",
  "tokio",
  "tokio-tungstenite",
  "tower",
@@ -2264,6 +2265,12 @@ name = "simdutf8"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
+
+[[package]]
+name = "skillratings"
+version = "0.29.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6d092cda2fa802e2e64f9ca9c6b54ffbb9a64c8bb585f6f7a601fedaea22b8b2"
 
 [[package]]
 name = "slab"
