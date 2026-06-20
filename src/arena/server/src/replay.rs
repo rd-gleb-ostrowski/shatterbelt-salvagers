@@ -73,8 +73,8 @@ pub fn run_replay(
     );
 
     for frame in &recording.intent_log {
-        engine.step(frame.clone());
-        hub.publish_god_view(&engine.god_view());
+        let events = engine.step(frame.clone());
+        hub.publish_god_view(&engine.god_view(), &events);
         pacer.wait_for_next_tick();
     }
 

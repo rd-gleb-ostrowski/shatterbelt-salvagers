@@ -179,11 +179,11 @@ async fn observer_hub_publishes_one_frame_per_tick() {
     let mut engine = Engine::new(1, params, specs);
 
     // Step twice, publishing god view after each step (mirroring the tick loop).
-    engine.step(vec![]);
-    hub.publish_god_view(&engine.god_view());
+    let events1 = engine.step(vec![]);
+    hub.publish_god_view(&engine.god_view(), &events1);
 
-    engine.step(vec![]);
-    hub.publish_god_view(&engine.god_view());
+    let events2 = engine.step(vec![]);
+    hub.publish_god_view(&engine.god_view(), &events2);
 
     // Should receive exactly 2 frames, no more.
     let f1 = rx.try_recv().expect("frame 1");
@@ -221,7 +221,7 @@ async fn observer_frame_is_full_god_view_not_fog_filtered() {
     let mut engine = Engine::new(42, params, specs);
 
     engine.step(vec![]);
-    hub.publish_god_view(&engine.god_view());
+    hub.publish_god_view(&engine.god_view(), &[]);
 
     let frame_str = rx.try_recv().expect("one frame");
     let frame: Value = serde_json::from_str(&frame_str).expect("valid JSON");
@@ -287,8 +287,8 @@ async fn observer_frame_tick_advances_with_match() {
 
     let n = 4u32;
     for _ in 0..n {
-        engine.step(vec![]);
-        hub.publish_god_view(&engine.god_view());
+        let evts = engine.step(vec![]);
+        hub.publish_god_view(&engine.god_view(), &evts);
     }
 
     let mut ticks = Vec::new();
@@ -488,4 +488,183 @@ async fn viewer_sending_bytes_is_ignored() {
         got_match_end,
         "bot must receive matchEnd even when Viewer sends unsolicited data"
     );
+}
+
+// ── Test 7: god_view_to_json with empty events has an events array ────────────
+
+/// RED→GREEN (tracer 1): `god_view_to_json(gv, &[])` produces a well-formed
+/// godView frame that contains an `"events"` key whose value is an empty array.
+#[test]
+fn god_view_to_json_empty_events_has_events_array() {
+    use arena_engine::{Engine, Params, ShipClass, ShipSpec, Vec2};
+    use arena_server::observer::god_view_to_json;
+
+    let params = Params { max_ticks: 3, ..Params::default() };
+    let specs = vec![ShipSpec {
+        id: "s0".into(),
+        class: ShipClass::Skiff,
+        anchor_pos: Vec2::new(params.arena_w * 0.25, params.arena_h * 0.5),
+    }];
+    let mut engine = Engine::new(1, params, specs);
+    engine.step(vec![]);
+    let gv = engine.god_view();
+
+    let json_str = god_view_to_json(&gv, &[]);
+    let frame: Value = serde_json::from_str(&json_str).expect("valid JSON");
+
+    assert_eq!(frame["type"], "godView");
+    assert!(
+        frame["events"].is_array(),
+        "events must be an array; frame={frame:?}"
+    );
+    assert_eq!(
+        frame["events"].as_array().unwrap().len(),
+        0,
+        "events array must be empty when no events passed"
+    );
+}
+
+// ── Test 8: god_view_to_json includes a Died event tagged with the subject ship ─
+
+/// RED→GREEN (tracer 2): passing a `Died` event for ship `"s0"` produces a
+/// god-view frame whose `events` array contains one entry with the correct
+/// shape: `{"ship":"s0","event":"died","by":null}`.
+#[test]
+fn god_view_to_json_includes_died_event_tagged_with_ship() {
+    use arena_engine::{Engine, Event, Params, ShipClass, ShipSpec, Vec2};
+    use arena_server::observer::god_view_to_json;
+
+    let params = Params { max_ticks: 10, ..Params::default() };
+    let specs = vec![ShipSpec {
+        id: "s0".into(),
+        class: ShipClass::Skiff,
+        anchor_pos: Vec2::new(params.arena_w * 0.25, params.arena_h * 0.5),
+    }];
+    let mut engine = Engine::new(1, params, specs);
+    engine.step(vec![]);
+    let gv = engine.god_view();
+
+    let events: Vec<(String, Vec<Event>)> = vec![
+        ("s0".to_string(), vec![Event::Died { by: None }]),
+    ];
+
+    let json_str = god_view_to_json(&gv, &events);
+    let frame: Value = serde_json::from_str(&json_str).expect("valid JSON");
+
+    let evts = frame["events"].as_array().expect("events is array");
+    assert_eq!(evts.len(), 1, "should have exactly one event");
+
+    let e = &evts[0];
+    assert_eq!(e["ship"], "s0", "event tagged with ship");
+    assert_eq!(e["event"], "died", "event discriminant");
+    assert!(e["by"].is_null(), "by is null for Died{{by:None}}");
+}
+
+// ── Test 9: multi-ship / multi-event tick lists all events tagged correctly ────
+
+/// RED→GREEN (tracer 3): two ships each emit two events; the resulting events
+/// array has 4 entries, each tagged with the correct ship id.
+#[test]
+fn god_view_to_json_multi_ship_multi_event() {
+    use arena_engine::{Engine, Event, Params, ShipClass, ShipSpec, Vec2};
+    use arena_server::observer::god_view_to_json;
+
+    let params = Params { max_ticks: 10, ..Params::default() };
+    let specs = vec![
+        ShipSpec {
+            id: "s0".into(),
+            class: ShipClass::Skiff,
+            anchor_pos: Vec2::new(params.arena_w * 0.25, params.arena_h * 0.5),
+        },
+        ShipSpec {
+            id: "s1".into(),
+            class: ShipClass::Skiff,
+            anchor_pos: Vec2::new(params.arena_w * 0.75, params.arena_h * 0.5),
+        },
+    ];
+    let mut engine = Engine::new(2, params, specs);
+    engine.step(vec![]);
+    let gv = engine.god_view();
+
+    let events: Vec<(String, Vec<Event>)> = vec![
+        ("s0".to_string(), vec![Event::TookHull { amount: 30.0, by: "s1".into() }, Event::ShieldDown]),
+        ("s1".to_string(), vec![Event::KilledShip { victim: "s0".into() }, Event::Respawned]),
+    ];
+
+    let json_str = god_view_to_json(&gv, &events);
+    let frame: Value = serde_json::from_str(&json_str).expect("valid JSON");
+
+    let evts = frame["events"].as_array().expect("events array");
+    assert_eq!(evts.len(), 4, "4 events total");
+
+    // First two belong to s0
+    assert_eq!(evts[0]["ship"], "s0");
+    assert_eq!(evts[0]["event"], "tookHull");
+    assert_eq!(evts[0]["amount"], 30.0);
+    assert_eq!(evts[0]["by"], "s1");
+
+    assert_eq!(evts[1]["ship"], "s0");
+    assert_eq!(evts[1]["event"], "shieldDown");
+
+    // Last two belong to s1
+    assert_eq!(evts[2]["ship"], "s1");
+    assert_eq!(evts[2]["event"], "killedShip");
+    assert_eq!(evts[2]["victim"], "s0");
+
+    assert_eq!(evts[3]["ship"], "s1");
+    assert_eq!(evts[3]["event"], "respawned");
+}
+
+// ── Test 10: live path threads events end-to-end ─────────────────────────────
+
+/// RED→GREEN (tracer 4): a Viewer WS client receives godView frames that
+/// always contain an `"events"` array (may be empty when no events fire, but
+/// the key must always be present).
+#[tokio::test]
+async fn viewer_god_view_frames_always_include_events_array() {
+    let registry = TokenRegistry::new();
+    let token = registry.register("events-e2e-bot");
+    let (app, _hub) = test_app_with_hub(registry);
+    let addr = spawn_server(app).await;
+
+    let mut viewer = ws_connect(addr, "/observe").await;
+    let mut bot = ws_connect(addr, "/ws").await;
+    bot_handshake(&mut bot, &token).await;
+
+    // Drain bot + collect viewer frames concurrently.
+    let bot_task = tokio::spawn(async move {
+        for _ in 0..TEST_MAX_TICKS + 5 {
+            let msg = tokio::time::timeout(
+                Duration::from_millis(TEST_DEADLINE_MS * 4),
+                next_text(&mut bot),
+            )
+            .await;
+            match msg {
+                Ok(m) if m["type"] == "matchEnd" => break,
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+    });
+
+    let mut god_frames: Vec<Value> = Vec::new();
+    let deadline =
+        Duration::from_millis((TEST_MAX_TICKS as u64 + 5) * TEST_DEADLINE_MS * 6);
+    let start = tokio::time::Instant::now();
+    while start.elapsed() < deadline && god_frames.len() < TEST_MAX_TICKS as usize {
+        if let Some(frame) = try_next_text(&mut viewer, TEST_DEADLINE_MS * 4).await {
+            if frame["type"] == "godView" {
+                god_frames.push(frame);
+            }
+        }
+    }
+    bot_task.await.expect("bot task");
+
+    assert!(!god_frames.is_empty(), "must receive at least one godView frame");
+    for (i, frame) in god_frames.iter().enumerate() {
+        assert!(
+            frame["events"].is_array(),
+            "frame {i} must have an 'events' array; frame={frame:?}"
+        );
+    }
 }

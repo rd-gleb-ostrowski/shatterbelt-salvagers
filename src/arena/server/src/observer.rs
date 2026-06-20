@@ -60,8 +60,9 @@ use axum::response::Response;
 use serde::Serialize;
 use tokio::sync::broadcast;
 
-use arena_engine::GodView;
+use arena_engine::{Event, GodView, ShipId};
 
+use crate::events_json::{EventJson, event_to_json};
 use crate::routes::AppState;
 use crate::ws::{
     AnchorViewJson, ArenaDimsJson, AsteroidViewJson, MineViewJson, ProjectileViewJson,
@@ -109,8 +110,8 @@ impl ObserverHub {
     }
 
     /// Serialise `gv` to a `"godView"` JSON frame and publish it.
-    pub fn publish_god_view(&self, gv: &GodView) {
-        self.publish(god_view_to_json(gv));
+    pub fn publish_god_view(&self, gv: &GodView, events: &[(ShipId, Vec<Event>)]) {
+        self.publish(god_view_to_json(gv, events));
     }
 
     /// Subscribe to the god-mode frame stream.
@@ -139,6 +140,20 @@ impl Default for ObserverHub {
 }
 
 // ── JSON mirror types ─────────────────────────────────────────────────────────
+
+/// A god-view event entry: an engine [`EventJson`] tagged with the subject ship.
+///
+/// Serialises as a flat object, e.g.:
+/// `{"ship":"ship-0","event":"lanceTookHull","amount":50.0,"by":"ship-1"}`.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GodEventJson {
+    /// The ship ID that experienced this event.
+    pub ship: String,
+    /// The flattened event payload (includes the `"event"` discriminant).
+    #[serde(flatten)]
+    pub event: EventJson,
+}
 
 /// Full per-ship state in a god-view frame — includes `aether` and `sigil`
 /// which are hidden in the per-bot [`arena_engine::Observation`].
@@ -185,6 +200,8 @@ pub struct GodViewFrameJson {
     /// ALL mines — not fog-filtered (bots only see mines within detection radius).
     pub mines: Vec<MineViewJson>,
     pub scores: HashMap<String, f32>,
+    /// All engine events from this tick, each tagged with the subject ship.
+    pub events: Vec<GodEventJson>,
 }
 
 // ── Serialisation ─────────────────────────────────────────────────────────────
@@ -211,8 +228,24 @@ fn god_ship_to_json(s: &arena_engine::GodShipView) -> GodShipViewJson {
 
 /// Serialise a [`GodView`] to a `"godView"` JSON frame string.
 ///
+/// `events` is the `Vec<(ShipId, Vec<Event>)>` returned by `engine.step()`.
+/// Each (ship, event) pair becomes one [`GodEventJson`] entry in the frame.
+/// Events for which [`event_to_json`] returns `None` are silently skipped.
+///
 /// Public so tests can call it directly without going through the hub.
-pub fn god_view_to_json(gv: &GodView) -> String {
+pub fn god_view_to_json(gv: &GodView, events: &[(ShipId, Vec<Event>)]) -> String {
+    let god_events: Vec<GodEventJson> = events
+        .iter()
+        .flat_map(|(ship_id, ship_events)| {
+            ship_events.iter().filter_map(|e| {
+                event_to_json(e).map(|ej| GodEventJson {
+                    ship: ship_id.clone(),
+                    event: ej,
+                })
+            })
+        })
+        .collect();
+
     let frame = GodViewFrameJson {
         type_: "godView",
         tick: gv.tick,
@@ -227,6 +260,7 @@ pub fn god_view_to_json(gv: &GodView) -> String {
         singularities: gv.singularities.iter().map(singularity_to_json).collect(),
         mines: gv.mines.iter().map(mine_to_json).collect(),
         scores: gv.scores.clone(),
+        events: god_events,
     };
     serde_json::to_string(&frame).unwrap_or_default()
 }

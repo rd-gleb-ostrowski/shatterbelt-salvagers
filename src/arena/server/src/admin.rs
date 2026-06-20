@@ -192,9 +192,10 @@ fn run_live_controlled_with_id(
         if handle.is_aborted() {
             break;
         }
-        runner.step_once();
+        let events = runner.step_once();
         handle.increment_tick();
-        observer_hub.publish_god_view(&runner.engine().god_view());
+        let gv = runner.engine().god_view();
+        observer_hub.publish_god_view(&gv, &events);
         runner.wait_for_next_tick();
     }
 

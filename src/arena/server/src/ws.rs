@@ -284,31 +284,10 @@ pub struct MineViewJson {
     pub own: bool,
 }
 
-/// PROTOCOL §7 event — serialised with an `"event"` discriminant field.
-///
-/// Variant names become camelCase in JSON via `rename_all = "camelCase"`.
-/// E.g. `TookShield` → `"tookShield"`, `ShieldDown` → `"shieldDown"`.
-#[derive(Debug, Serialize)]
-#[serde(tag = "event", rename_all = "camelCase")]
-pub enum EventJson {
-    TookShield { amount: f32, by: String },
-    TookHull { amount: f32, by: String },
-    ShieldDown,
-    LanceTookHull { amount: f32, by: String },
-    CollisionTookShield { amount: f32 },
-    CollisionTookHull { amount: f32 },
-    RelicDropped { relic_id: String, pos: Vec2Json },
-    SigilGranted { which: String },
-    SigilDischarged { which: String },
-    AfterburnerExpired,
-    BulwarkExpired,
-    SingularityDeployed { id: String, pos: Vec2Json },
-    MineDeployed { id: String, pos: Vec2Json },
-    MineDetonated { mine_id: String, pos: Vec2Json },
-    KilledShip { victim: String },
-    Died { by: Option<String> },
-    Respawned,
-}
+// Re-export from the shared events_json module so the TickMsg.events field
+// continues to compile unchanged, and downstream code (observer.rs) can also
+// use EventJson without duplicating the mapping.
+pub use crate::events_json::EventJson;
 
 // ── WsBotDriver — BotDriver seam for issue 06 ────────────────────────────────
 
@@ -661,8 +640,8 @@ async fn handle_ws_bot(mut socket: WebSocket, state: AppState) {
         }
 
         // Issue 07: broadcast the full world state to Viewer clients after each tick.
-        engine.step(intents);
-        state.observer_hub.publish_god_view(&engine.god_view());
+        let events = engine.step(intents);
+        state.observer_hub.publish_god_view(&engine.god_view(), &events);
     }
 
     // ── 5. matchEnd ───────────────────────────────────────────────────────────
@@ -909,54 +888,6 @@ pub(crate) fn mine_to_json(m: &arena_engine::MineView) -> MineViewJson {
 
 /// Convert an engine [`arena_engine::Event`] to [`EventJson`].
 ///
-/// Returns `None` for event variants not yet mapped to PROTOCOL §7 JSON
-/// (none currently — all engine variants are covered).
-fn event_to_json(e: &arena_engine::Event) -> Option<EventJson> {
-    use arena_engine::Event;
-    Some(match e {
-        Event::TookShield { amount, by } => {
-            EventJson::TookShield { amount: *amount, by: by.clone() }
-        }
-        Event::TookHull { amount, by } => {
-            EventJson::TookHull { amount: *amount, by: by.clone() }
-        }
-        Event::ShieldDown => EventJson::ShieldDown,
-        Event::LanceTookHull { amount, by } => {
-            EventJson::LanceTookHull { amount: *amount, by: by.clone() }
-        }
-        Event::CollisionTookShield { amount } => {
-            EventJson::CollisionTookShield { amount: *amount }
-        }
-        Event::CollisionTookHull { amount } => {
-            EventJson::CollisionTookHull { amount: *amount }
-        }
-        Event::RelicDropped { relic_id, pos } => EventJson::RelicDropped {
-            relic_id: relic_id.clone(),
-            pos: vec2_to_json(*pos),
-        },
-        Event::SigilGranted { which } => {
-            EventJson::SigilGranted { which: sigil_to_str(which) }
-        }
-        Event::SigilDischarged { which } => {
-            EventJson::SigilDischarged { which: sigil_to_str(which) }
-        }
-        Event::AfterburnerExpired => EventJson::AfterburnerExpired,
-        Event::BulwarkExpired => EventJson::BulwarkExpired,
-        Event::SingularityDeployed { id, pos } => EventJson::SingularityDeployed {
-            id: id.clone(),
-            pos: vec2_to_json(*pos),
-        },
-        Event::MineDeployed { id, pos } => {
-            EventJson::MineDeployed { id: id.clone(), pos: vec2_to_json(*pos) }
-        }
-        Event::MineDetonated { mine_id, pos } => EventJson::MineDetonated {
-            mine_id: mine_id.clone(),
-            pos: vec2_to_json(*pos),
-        },
-        Event::KilledShip { victim } => {
-            EventJson::KilledShip { victim: victim.clone() }
-        }
-        Event::Died { by } => EventJson::Died { by: by.clone() },
-        Event::Respawned => EventJson::Respawned,
-    })
-}
+/// Thin re-export of [`crate::events_json::event_to_json`] kept here so that
+/// the `observation_to_tick_json` call-site does not need to change.
+use crate::events_json::event_to_json;

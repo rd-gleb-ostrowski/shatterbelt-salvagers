@@ -29,6 +29,7 @@
 
 pub mod admin;
 pub mod auth;
+pub mod events_json;
 pub mod bot;
 pub mod headless;
 pub mod health;
