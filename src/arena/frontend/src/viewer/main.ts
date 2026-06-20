@@ -33,6 +33,8 @@ import type { Vec2 } from "../lib/worldTransform.ts";
 import { HudOverlay } from "./hud.ts";
 import { SoundEngine } from "./sound.ts";
 import { deriveSoundCues } from "../lib/soundCues.ts";
+import { ReplayPlayer } from "./replayPlayer.ts";
+import { indexToPosition } from "../lib/replayTimeline.ts";
 
 // ── Follow-select threshold ───────────────────────────────────────────────────
 
@@ -263,6 +265,189 @@ async function init(): Promise<void> {
   });
 
   client.connect();
+
+  // ── Replay mode (issue 07) ────────────────────────────────────────────────
+  wireReplayPanel(renderer, hud, sound, client, setStatus);
+}
+
+// ── Replay panel wiring ───────────────────────────────────────────────────────
+
+/**
+ * Wire the replay panel DOM controls.
+ *
+ * When the user loads a replay:
+ *   - The live ObserverClient is disconnected so it doesn't race with the
+ *     replay WS buffer.
+ *   - A ReplayPlayer buffers frames from the server replay over /observe.
+ *   - The same onFrame pipeline (renderer + hud + sound) drives replay frames.
+ * When the user returns to live:
+ *   - The ReplayPlayer is stopped.
+ *   - The ObserverClient reconnects.
+ */
+function wireReplayPanel(
+  renderer: DriftRenderer,
+  hud: HudOverlay,
+  sound: SoundEngine,
+  liveClient: ObserverClient,
+  setStatus: (msg: string) => void,
+): void {
+  // ── DOM references ─────────────────────────────────────────────────────────
+  const panel = document.getElementById("replay-panel");
+  const toggleBtn = document.getElementById("replay-toggle-btn");
+  const select = document.getElementById("replay-recording-select") as HTMLSelectElement | null;
+  const loadBtn = document.getElementById("replay-load-btn") as HTMLButtonElement | null;
+  const playPauseBtn = document.getElementById("replay-playpause-btn") as HTMLButtonElement | null;
+  const liveBtn = document.getElementById("replay-live-btn") as HTMLButtonElement | null;
+  const timeline = document.getElementById("replay-timeline") as HTMLInputElement | null;
+  const speedSelect = document.getElementById("replay-speed-select") as HTMLSelectElement | null;
+  const tickLabel = document.getElementById("replay-tick-label");
+
+  if (!panel || !toggleBtn || !select || !loadBtn || !playPauseBtn ||
+      !liveBtn || !timeline || !speedSelect || !tickLabel) {
+    console.warn("[Viewer] replay panel DOM not found — replay wiring skipped");
+    return;
+  }
+
+  // ── State ─────────────────────────────────────────────────────────────────
+  let inReplayMode = false;
+  let isScrubbing = false;
+  let prevReplayFrame: GodViewFrame | null = null;
+
+  // ── ReplayPlayer ──────────────────────────────────────────────────────────
+  const player = new ReplayPlayer({
+    onFrame(frame) {
+      const cues = deriveSoundCues(prevReplayFrame, frame);
+      sound.playCues(cues);
+      prevReplayFrame = frame;
+      renderer.renderFrame(frame);
+      hud.update(frame);
+    },
+    onStatus: setStatus,
+    onBuffered(count) {
+      if (playPauseBtn) {
+        playPauseBtn.disabled = false;
+        playPauseBtn.textContent = "Play";
+      }
+      if (timeline) timeline.disabled = false;
+      setStatus(`Replay ready — ${count} frames buffered`);
+    },
+    onProgress(index, bufferLength) {
+      if (isScrubbing) return;
+      if (timeline) {
+        const pos = indexToPosition(bufferLength, index);
+        timeline.value = String(Math.round(pos * 1000));
+      }
+      if (tickLabel) {
+        tickLabel.textContent = `tick ${index + 1}/${bufferLength}`;
+      }
+      if (playPauseBtn) {
+        playPauseBtn.textContent = player.isPlaying ? "Pause" : "Play";
+      }
+    },
+  });
+
+  // ── Show/hide panel ───────────────────────────────────────────────────────
+  toggleBtn.addEventListener("click", async () => {
+    const hidden = panel.classList.toggle("hidden");
+    if (!hidden && select.options.length <= 1) {
+      // Populate recordings list on first open
+      try {
+        const recordings = await ReplayPlayer.listRecordings();
+        while (select.options.length > 1) select.remove(1);
+        if (recordings.length === 0) {
+          const opt = document.createElement("option");
+          opt.value = "";
+          opt.textContent = "(no recordings available)";
+          select.appendChild(opt);
+        } else {
+          for (const r of recordings) {
+            const opt = document.createElement("option");
+            opt.value = r.matchId;
+            const winner = r.winner ? ` — winner: ${r.winner}` : "";
+            opt.textContent = `${r.matchId.slice(0, 8)}… seed=${r.seed} ticks=${r.tickCount}${winner}`;
+            select.appendChild(opt);
+          }
+        }
+      } catch (err) {
+        setStatus(`Failed to load recordings: ${String(err)}`);
+      }
+    }
+  });
+
+  // ── Load ──────────────────────────────────────────────────────────────────
+  loadBtn.addEventListener("click", async () => {
+    const matchId = select.value;
+    if (!matchId) return;
+
+    // Disable controls while buffering
+    loadBtn.disabled = true;
+    playPauseBtn.disabled = true;
+    playPauseBtn.textContent = "Play";
+    timeline.disabled = true;
+    timeline.value = "0";
+    tickLabel.textContent = "tick —/—";
+    prevReplayFrame = null;
+
+    // Switch to replay mode: pause the live stream
+    if (!inReplayMode) {
+      liveClient.disconnect();
+      inReplayMode = true;
+    }
+    player.stop();
+
+    try {
+      await player.load(matchId);
+    } catch (err) {
+      setStatus(`Replay load failed: ${String(err)}`);
+    } finally {
+      loadBtn.disabled = false;
+    }
+  });
+
+  // ── Play / Pause ──────────────────────────────────────────────────────────
+  playPauseBtn.addEventListener("click", () => {
+    if (player.isPlaying) {
+      player.pause();
+      playPauseBtn.textContent = "Play";
+    } else {
+      player.play();
+      playPauseBtn.textContent = "Pause";
+    }
+  });
+
+  // ── Speed ─────────────────────────────────────────────────────────────────
+  speedSelect.addEventListener("change", () => {
+    player.setSpeed(Number(speedSelect.value));
+  });
+
+  // ── Timeline scrub ────────────────────────────────────────────────────────
+  timeline.addEventListener("pointerdown", () => { isScrubbing = true; });
+  timeline.addEventListener("pointerup", () => { isScrubbing = false; });
+
+  timeline.addEventListener("input", () => {
+    const pos = Number(timeline.value) / 1000;
+    player.scrubTo(pos);
+    if (tickLabel) {
+      tickLabel.textContent = `tick ${player.frameIndex + 1}/${player.frameCount}`;
+    }
+  });
+
+  // ── Return to live ────────────────────────────────────────────────────────
+  liveBtn.addEventListener("click", () => {
+    player.stop();
+    prevReplayFrame = null;
+    playPauseBtn.disabled = true;
+    playPauseBtn.textContent = "Play";
+    timeline.disabled = true;
+    timeline.value = "0";
+    tickLabel.textContent = "tick —/—";
+
+    if (inReplayMode) {
+      inReplayMode = false;
+      liveClient.connect();
+      setStatus("Returned to live stream");
+    }
+  });
 }
 
 init().catch(console.error);

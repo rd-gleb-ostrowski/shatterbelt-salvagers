@@ -77,11 +77,79 @@
       .hud-competitor { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
       .hud-skill { color: #a8e6cf; text-align: right; }
       .hud-matches { color: #7b6fcf; text-align: right; font-size: 10px; }
+
+      /* ── Replay panel (issue 07) ──────────────────────────────────────────── */
+      #replay-panel {
+        position: fixed; bottom: 28px; left: 50%; transform: translateX(-50%);
+        background: rgba(10,8,30,0.92); border: 1px solid #2a2050;
+        border-radius: 8px; padding: 10px 16px; display: flex;
+        flex-direction: column; gap: 8px; z-index: 20;
+        font-family: monospace; font-size: 12px; color: #e0daf8;
+        min-width: 480px; max-width: 90vw;
+        pointer-events: all;
+      }
+      #replay-panel.hidden { display: none; }
+      #replay-top-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+      #replay-recording-select {
+        flex: 1; background: #0d0b22; color: #e0daf8; border: 1px solid #2a2050;
+        border-radius: 4px; padding: 3px 6px; font-family: monospace; font-size: 11px;
+      }
+      #replay-load-btn, #replay-live-btn, #replay-playpause-btn {
+        background: #1a1640; color: #a89ee0; border: 1px solid #2a2050;
+        border-radius: 4px; padding: 3px 10px; cursor: pointer; font-family: monospace;
+        font-size: 11px; white-space: nowrap;
+      }
+      #replay-load-btn:hover, #replay-live-btn:hover, #replay-playpause-btn:hover {
+        background: #2a2050; color: #e0daf8;
+      }
+      #replay-playpause-btn { min-width: 52px; }
+      #replay-bottom-row { display: flex; align-items: center; gap: 8px; }
+      #replay-timeline { flex: 1; accent-color: #7b6fcf; cursor: pointer; }
+      #replay-speed-select {
+        background: #0d0b22; color: #e0daf8; border: 1px solid #2a2050;
+        border-radius: 4px; padding: 3px 6px; font-family: monospace; font-size: 11px;
+      }
+      #replay-tick-label {
+        color: #7b6fcf; font-size: 11px; white-space: nowrap; min-width: 80px;
+        text-align: right;
+      }
+      #replay-toggle-btn {
+        position: fixed; bottom: 4px; right: 12px;
+        background: rgba(10,8,30,0.7); color: #7b6fcf; border: 1px solid #2a2050;
+        border-radius: 4px; padding: 2px 8px; cursor: pointer; font-family: monospace;
+        font-size: 10px; z-index: 25; pointer-events: all;
+      }
+      #replay-toggle-btn:hover { background: #1a1640; color: #e0daf8; }
     </style>
   </head>
   <body>
     <div id="viewer-canvas-container"></div>
     <div id="status-bar">⬡ Shatterbelt Salvagers — connecting…</div>
+
+    <!-- Replay panel (issue 07) — wired in main.ts -->
+    <div id="replay-panel" class="hidden">
+      <div id="replay-top-row">
+        <select id="replay-recording-select">
+          <option value="">— select a recording… —</option>
+        </select>
+        <button id="replay-load-btn">▶ Load</button>
+        <button id="replay-playpause-btn" disabled>Play</button>
+        <button id="replay-live-btn">↩ Live</button>
+      </div>
+      <div id="replay-bottom-row">
+        <input id="replay-timeline" type="range" min="0" max="1000" step="1" value="0" disabled />
+        <select id="replay-speed-select">
+          <option value="0.25">0.25×</option>
+          <option value="0.5">0.5×</option>
+          <option value="1" selected>1×</option>
+          <option value="2">2×</option>
+          <option value="4">4×</option>
+        </select>
+        <span id="replay-tick-label">tick —/—</span>
+      </div>
+    </div>
+    <button id="replay-toggle-btn">⏺ Replay</button>
+
     <script type="module" src="/src/viewer/main.ts"></script>
   </body>
 </html>
