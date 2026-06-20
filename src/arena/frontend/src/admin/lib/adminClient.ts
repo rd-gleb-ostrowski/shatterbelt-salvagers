@@ -79,6 +79,71 @@ export interface UploadResult {
 export type BotActionResult = KickResult;
 
 /**
+ * Options for `startMatch()`. Mirrors `StartMatchRequest` in admin.rs
+ * (`#[serde(rename_all = "camelCase")]`).
+ * Optional fields are omitted from the JSON body if not provided.
+ */
+export interface StartMatchOptions {
+  /** `"live"` for a real-time observable match; `"headless"` for instant. */
+  mode: "live" | "headless";
+  /** RNG seed. Server uses its configured default when absent. */
+  seed?: number;
+  /** Maximum tick count. Server uses its configured default when absent. */
+  maxTicks?: number;
+  /** Team names. Server uses the full registered field when absent. */
+  teams?: string[];
+  /** Ticks-per-second for live matches. Server defaults to 30. */
+  tps?: number;
+}
+
+/**
+ * Result of `startMatch()`.
+ * Exactly one discriminant is `true`; `matchId` + `mode` are set on success.
+ */
+export interface StartMatchResult {
+  /** `true` when the server accepted the request (200). */
+  ok: boolean;
+  /** Assigned match identifier (populated when `ok` is `true`). */
+  matchId: string;
+  /** Match mode echoed by the server (`"live"` or `"headless"`). */
+  mode: string;
+  /** `true` when the server responded with 401 (wrong / absent password). */
+  unauthorized: boolean;
+}
+
+/**
+ * Result of a simple match control action (pause / resume / abort).
+ * Mirrors `KickResult` — 200/401/other mapping. Never throws.
+ */
+export type MatchActionResult = KickResult;
+
+/**
+ * Result of `setMatchTps()`. Mirrors `KickResult`. Never throws.
+ */
+export type SetTpsResult = KickResult;
+
+/**
+ * Result of `getExhibition()`.
+ * Exactly one discriminant is `true`; `running` + `matchCount` set on success.
+ */
+export interface ExhibitionResult {
+  /** `true` when the server returned 200. */
+  ok: boolean;
+  /** Whether the exhibition loop is currently running. */
+  running: boolean;
+  /** Total matches played in the current exhibition run. */
+  matchCount: number;
+  /** `true` when the server responded with 401. */
+  unauthorized: boolean;
+}
+
+/**
+ * Result of `startExhibition()` or `stopExhibition()`.
+ * Mirrors `KickResult` — 200/401/other mapping. Never throws.
+ */
+export type ExhibitionActionResult = KickResult;
+
+/**
  * Minimal fetch-like interface accepted by `createAdminClient`.
  *
  * Deliberately narrower than `typeof fetch` so tests can pass a simple
@@ -188,6 +253,108 @@ export interface AdminClient {
    * Never throws for HTTP-level failures.
    */
   clearDefaultBot(): Promise<BotActionResult>;
+
+  // ── Issue 11: match control & push-to-projector ──────────────────────────
+
+  /**
+   * Start an on-demand match via `POST /admin/matches`.
+   *
+   * JSON body: `{ mode, seed?, maxTicks?, teams?, tps? }` (camelCase).
+   * Optional fields are omitted when not provided (not sent as `null`).
+   * `Content-Type: application/json` is set automatically.
+   *
+   * On 200 parses `{ matchId, mode }` from the response.
+   * Returns `{ ok: true, matchId, mode, unauthorized: false }` on 200.
+   * Returns `{ ok: false, matchId: "", mode: "", unauthorized: true }` on 401.
+   * Returns `{ ok: false, matchId: "", mode: "", unauthorized: false }` on other errors.
+   * Never throws for HTTP-level failures.
+   *
+   * Push-to-projector note: starting a `"live"` match automatically feeds the
+   * observer hub at `/observe`, which is the endpoint the Viewer (projector)
+   * connects to. There is no separate "push" endpoint — a live match IS the
+   * projector feed.
+   */
+  startMatch(opts: StartMatchOptions): Promise<StartMatchResult>;
+
+  /**
+   * Pause a running live match via `POST /admin/matches/{id}/pause`.
+   *
+   * The match id is URL-encoded. No request body is sent.
+   * Returns `{ ok: true, unauthorized: false }` on 200.
+   * Returns `{ ok: false, unauthorized: true }` on 401.
+   * Returns `{ ok: false, unauthorized: false }` on other errors.
+   * Never throws for HTTP-level failures.
+   */
+  pauseMatch(id: string): Promise<MatchActionResult>;
+
+  /**
+   * Resume a paused live match via `POST /admin/matches/{id}/resume`.
+   *
+   * The match id is URL-encoded. No request body is sent.
+   * Returns `{ ok: true, unauthorized: false }` on 200.
+   * Returns `{ ok: false, unauthorized: true }` on 401.
+   * Returns `{ ok: false, unauthorized: false }` on other errors.
+   * Never throws for HTTP-level failures.
+   */
+  resumeMatch(id: string): Promise<MatchActionResult>;
+
+  /**
+   * Abort (delete) a live match via `DELETE /admin/matches/{id}`.
+   *
+   * The match id is URL-encoded. No request body is sent.
+   * Returns `{ ok: true, unauthorized: false }` on 200.
+   * Returns `{ ok: false, unauthorized: true }` on 401.
+   * Returns `{ ok: false, unauthorized: false }` on other errors.
+   * Never throws for HTTP-level failures.
+   */
+  abortMatch(id: string): Promise<MatchActionResult>;
+
+  /**
+   * Change the tick rate of a live match via `POST /admin/matches/{id}/tps`.
+   *
+   * JSON body: `{ tps: number }`.
+   * The match id is URL-encoded.
+   * Returns `{ ok: true, unauthorized: false }` on 200.
+   * Returns `{ ok: false, unauthorized: true }` on 401.
+   * Returns `{ ok: false, unauthorized: false }` on other errors.
+   * Never throws for HTTP-level failures.
+   */
+  setMatchTps(id: string, tps: number): Promise<SetTpsResult>;
+
+  /**
+   * Get exhibition status via `GET /admin/exhibition`.
+   *
+   * Returns `{ ok: true, running, matchCount, unauthorized: false }` on 200.
+   * Returns `{ ok: false, running: false, matchCount: 0, unauthorized: true }` on 401.
+   * Returns `{ ok: false, running: false, matchCount: 0, unauthorized: false }` on other errors.
+   * Never throws for HTTP-level failures.
+   */
+  getExhibition(): Promise<ExhibitionResult>;
+
+  /**
+   * Start the exhibition loop via `POST /admin/exhibition/start`.
+   *
+   * No request body is sent.
+   * The exhibition loop continuously runs live matches, keeping the projector
+   * Viewer (at `/observe`) active whenever no on-demand match is running.
+   *
+   * Returns `{ ok: true, unauthorized: false }` on 200.
+   * Returns `{ ok: false, unauthorized: true }` on 401.
+   * Returns `{ ok: false, unauthorized: false }` on other errors.
+   * Never throws for HTTP-level failures.
+   */
+  startExhibition(): Promise<ExhibitionActionResult>;
+
+  /**
+   * Stop the exhibition loop via `POST /admin/exhibition/stop`.
+   *
+   * No request body is sent.
+   * Returns `{ ok: true, unauthorized: false }` on 200.
+   * Returns `{ ok: false, unauthorized: true }` on 401.
+   * Returns `{ ok: false, unauthorized: false }` on other errors.
+   * Never throws for HTTP-level failures.
+   */
+  stopExhibition(): Promise<ExhibitionActionResult>;
 }
 
 // ── Factory ───────────────────────────────────────────────────────────────────
@@ -236,6 +403,17 @@ export function createAdminClient(
         "Content-Type": "application/octet-stream",
       },
       body: body as BodyInit,
+    });
+  }
+
+  async function postJson(path: string, body: Record<string, unknown>): Promise<HttpResponse> {
+    return fetchFn(`${baseUrl}${path}`, {
+      method: "POST",
+      headers: {
+        ...authHeaders,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(body),
     });
   }
 
@@ -312,6 +490,72 @@ export function createAdminClient(
 
     async clearDefaultBot(): Promise<BotActionResult> {
       const res = await del("/admin/default-bot");
+      return mapAction(res.status);
+    },
+
+    // ── Issue 11: match control & push-to-projector ──────────────────────────
+
+    async startMatch(opts: StartMatchOptions): Promise<StartMatchResult> {
+      const body: Record<string, unknown> = { mode: opts.mode };
+      if (opts.seed !== undefined) body.seed = opts.seed;
+      if (opts.maxTicks !== undefined) body.maxTicks = opts.maxTicks;
+      if (opts.teams !== undefined) body.teams = opts.teams;
+      if (opts.tps !== undefined) body.tps = opts.tps;
+
+      const res = await postJson("/admin/matches", body);
+      if (res.status === 200) {
+        const data = (await res.json()) as { matchId: string; mode: string };
+        return { ok: true, matchId: data.matchId, mode: data.mode, unauthorized: false };
+      }
+      if (res.status === 401) {
+        return { ok: false, matchId: "", mode: "", unauthorized: true };
+      }
+      return { ok: false, matchId: "", mode: "", unauthorized: false };
+    },
+
+    async pauseMatch(id: string): Promise<MatchActionResult> {
+      const path = `/admin/matches/${encodeURIComponent(id)}/pause`;
+      const res = await post(path);
+      return mapAction(res.status);
+    },
+
+    async resumeMatch(id: string): Promise<MatchActionResult> {
+      const path = `/admin/matches/${encodeURIComponent(id)}/resume`;
+      const res = await post(path);
+      return mapAction(res.status);
+    },
+
+    async abortMatch(id: string): Promise<MatchActionResult> {
+      const path = `/admin/matches/${encodeURIComponent(id)}`;
+      const res = await del(path);
+      return mapAction(res.status);
+    },
+
+    async setMatchTps(id: string, tps: number): Promise<SetTpsResult> {
+      const path = `/admin/matches/${encodeURIComponent(id)}/tps`;
+      const res = await postJson(path, { tps });
+      return mapAction(res.status);
+    },
+
+    async getExhibition(): Promise<ExhibitionResult> {
+      const res = await get("/admin/exhibition");
+      if (res.status === 200) {
+        const data = (await res.json()) as { running: boolean; matchCount: number };
+        return { ok: true, running: data.running, matchCount: data.matchCount, unauthorized: false };
+      }
+      if (res.status === 401) {
+        return { ok: false, running: false, matchCount: 0, unauthorized: true };
+      }
+      return { ok: false, running: false, matchCount: 0, unauthorized: false };
+    },
+
+    async startExhibition(): Promise<ExhibitionActionResult> {
+      const res = await post("/admin/exhibition/start");
+      return mapAction(res.status);
+    },
+
+    async stopExhibition(): Promise<ExhibitionActionResult> {
+      const res = await post("/admin/exhibition/stop");
       return mapAction(res.status);
     },
   };

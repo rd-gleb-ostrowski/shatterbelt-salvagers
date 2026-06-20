@@ -13,6 +13,7 @@
  */
 
 import { createAdminClient, type BotHealthSnapshot } from "./lib/adminClient.ts";
+import type { StartMatchResult } from "./lib/adminClient.ts";
 import { setSession, getSession, clearSession } from "./session.ts";
 import {
   formatLastSeen,
@@ -164,6 +165,7 @@ function renderDashboard(): void {
 
   wireDefaultBotControls();
   startPolling();
+  renderMatchControlPanel();
 }
 
 function renderBotsTable(bots: BotHealthSnapshot[]): void {
@@ -454,6 +456,334 @@ async function doPoll(): Promise<void> {
       statusEl.textContent = "⚠ Error fetching bot health — retrying in 5 s…";
     }
   }
+}
+
+// ── Match Control panel ───────────────────────────────────────────────────────
+
+/**
+ * Inject the match-control panel into #admin-panels.
+ *
+ * Panel sections:
+ *   1. Start Match form (mode, seed, maxTicks, teams, tps).
+ *   2. Live Match Controls (pause/resume/tps/abort) — shown after a live match
+ *      is started, or by entering a known match ID.
+ *   3. Exhibition controls (start/stop/status) — the projector is never blank.
+ *   4. Open Viewer link — opens /index.html which connects to /observe.
+ *
+ * Push-to-projector mapping:
+ *   The server streams the current live match to `/observe` automatically.
+ *   Starting a live match IS the push-to-projector action. The Viewer (at
+ *   /index.html, connecting to /observe) will pick it up immediately.
+ *   There is no separate push endpoint; exhibition keeps /observe live when
+ *   no on-demand match is running.
+ */
+function renderMatchControlPanel(): void {
+  const container = document.getElementById("admin-panels");
+  if (!container) return;
+
+  const panel = document.createElement("section");
+  panel.className = "panel";
+  panel.id = "match-control-panel";
+  panel.innerHTML = `
+    <h2>Match Control</h2>
+
+    <!-- 1. Start Match -->
+    <div class="subpanel" id="start-match-subpanel">
+      <h3>Start Match</h3>
+      <p class="hint">
+        Starting a <strong>live</strong> match streams it to the projector Viewer
+        at <code>/observe</code> automatically — no separate push needed.
+      </p>
+      <form id="start-match-form" autocomplete="off">
+        <label for="match-mode">Mode</label>
+        <select id="match-mode" name="mode">
+          <option value="live" selected>Live (streams to Viewer)</option>
+          <option value="headless">Headless (instant, no stream)</option>
+        </select>
+
+        <label for="match-seed">Seed <span class="hint">(optional)</span></label>
+        <input type="number" id="match-seed" name="seed" placeholder="leave blank for server default" />
+
+        <label for="match-max-ticks">Max Ticks <span class="hint">(optional)</span></label>
+        <input type="number" id="match-max-ticks" name="maxTicks" placeholder="leave blank for server default" min="1" />
+
+        <label for="match-tps">TPS <span class="hint">(live only, optional, default 30)</span></label>
+        <input type="number" id="match-tps" name="tps" placeholder="30" min="1" max="200" />
+
+        <label for="match-teams">Teams <span class="hint">(optional, comma-separated)</span></label>
+        <input type="text" id="match-teams" name="teams" placeholder="alpha, beta, gamma …" />
+
+        <button type="submit" id="start-match-btn" class="btn-primary">Start Match</button>
+      </form>
+      <p id="start-match-status" class="status-line" hidden></p>
+    </div>
+
+    <!-- 2. Live Match Controls -->
+    <div class="subpanel" id="live-match-subpanel">
+      <h3>Live Match Controls</h3>
+      <p class="hint">
+        Controls apply to the active match ID below. After starting a live match
+        the ID is filled in automatically.
+      </p>
+      <div class="match-id-row">
+        <label for="active-match-id">Match ID</label>
+        <input type="text" id="active-match-id" placeholder="UUID of running live match" />
+      </div>
+      <div class="match-control-buttons">
+        <button id="pause-match-btn" class="btn-secondary">⏸ Pause</button>
+        <button id="resume-match-btn" class="btn-secondary">▶ Resume</button>
+        <button id="abort-match-btn" class="btn-danger">✕ Abort</button>
+      </div>
+      <div class="tps-row">
+        <label for="match-tps-input">Change TPS</label>
+        <input type="number" id="match-tps-input" value="30" min="1" max="200" style="width:5em" />
+        <button id="set-tps-btn" class="btn-secondary">Set TPS</button>
+      </div>
+      <p id="live-match-status" class="status-line" hidden></p>
+    </div>
+
+    <!-- 3. Exhibition (projector never blank) -->
+    <div class="subpanel" id="exhibition-subpanel">
+      <h3>Exhibition</h3>
+      <p class="hint">
+        Exhibition runs an endless series of live matches streaming to
+        <code>/observe</code>, keeping the projector Viewer occupied between
+        on-demand matches.
+      </p>
+      <div class="exhibition-controls">
+        <button id="start-exhibition-btn" class="btn-primary">▶ Start Exhibition</button>
+        <button id="stop-exhibition-btn" class="btn-secondary">⏹ Stop Exhibition</button>
+        <button id="refresh-exhibition-btn" class="btn-secondary">↺ Refresh Status</button>
+      </div>
+      <p id="exhibition-status" class="status-line">Status: unknown</p>
+    </div>
+
+    <!-- 4. Open Viewer (push-to-projector convenience link) -->
+    <div class="subpanel" id="viewer-subpanel">
+      <h3>Projector Viewer</h3>
+      <p class="hint">
+        The Viewer connects to <code>/observe</code> and shows whatever live
+        match is running. Start a live match or exhibition above, then open the
+        Viewer on the projector screen.
+      </p>
+      <a href="/index.html" target="_blank" rel="noopener" class="btn-primary viewer-link">
+        ↗ Open Viewer
+      </a>
+    </div>
+  `;
+
+  container.appendChild(panel);
+
+  wireStartMatchForm();
+  wireLiveMatchControls();
+  wireExhibitionControls();
+}
+
+function wireStartMatchForm(): void {
+  const form = document.getElementById("start-match-form") as HTMLFormElement | null;
+  const btn = document.getElementById("start-match-btn") as HTMLButtonElement | null;
+  const statusEl = document.getElementById("start-match-status") as HTMLElement | null;
+  if (!form || !btn || !statusEl) return;
+
+  function showStartStatus(msg: string): void {
+    if (!statusEl) return;
+    statusEl.textContent = msg;
+    statusEl.hidden = false;
+  }
+
+  form.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const session = getSession();
+    if (!session) return;
+
+    const modeEl = document.getElementById("match-mode") as HTMLSelectElement;
+    const seedEl = document.getElementById("match-seed") as HTMLInputElement;
+    const maxTicksEl = document.getElementById("match-max-ticks") as HTMLInputElement;
+    const tpsEl = document.getElementById("match-tps") as HTMLInputElement;
+    const teamsEl = document.getElementById("match-teams") as HTMLInputElement;
+
+    const opts: Parameters<typeof session.client.startMatch>[0] = {
+      mode: (modeEl.value as "live" | "headless") || "live",
+    };
+    if (seedEl.value.trim()) opts.seed = Number(seedEl.value);
+    if (maxTicksEl.value.trim()) opts.maxTicks = Number(maxTicksEl.value);
+    if (tpsEl.value.trim()) opts.tps = Number(tpsEl.value);
+    if (teamsEl.value.trim()) {
+      opts.teams = teamsEl.value
+        .split(",")
+        .map((t) => t.trim())
+        .filter(Boolean);
+    }
+
+    btn.disabled = true;
+    btn.textContent = "Starting…";
+
+    try {
+      const result: StartMatchResult = await session.client.startMatch(opts);
+
+      if (result.unauthorized) {
+        showStartStatus("⚠ Denied — session may have expired. Please sign out and sign in again.");
+      } else if (!result.ok) {
+        showStartStatus("⚠ Failed to start match — server returned an error.");
+      } else {
+        showStartStatus(
+          `✓ Match started — ID: ${result.matchId} (mode: ${result.mode})`,
+        );
+        // Auto-populate the live controls ID field for convenience
+        if (result.mode === "live") {
+          const idInput = document.getElementById("active-match-id") as HTMLInputElement | null;
+          if (idInput) idInput.value = result.matchId;
+        }
+      }
+    } catch {
+      showStartStatus("⚠ Network error — could not reach the server.");
+    } finally {
+      btn.disabled = false;
+      btn.textContent = "Start Match";
+    }
+  });
+}
+
+function wireLiveMatchControls(): void {
+  const pauseBtn = document.getElementById("pause-match-btn") as HTMLButtonElement | null;
+  const resumeBtn = document.getElementById("resume-match-btn") as HTMLButtonElement | null;
+  const abortBtn = document.getElementById("abort-match-btn") as HTMLButtonElement | null;
+  const setTpsBtn = document.getElementById("set-tps-btn") as HTMLButtonElement | null;
+  const statusEl = document.getElementById("live-match-status") as HTMLElement | null;
+  if (!pauseBtn || !resumeBtn || !abortBtn || !setTpsBtn || !statusEl) return;
+
+  function getMatchId(): string | null {
+    const idInput = document.getElementById("active-match-id") as HTMLInputElement | null;
+    const id = idInput?.value.trim();
+    if (!id) {
+      if (statusEl) {
+        statusEl.textContent = "⚠ Enter a Match ID above first.";
+        statusEl.hidden = false;
+      }
+      return null;
+    }
+    return id;
+  }
+
+  function showLiveStatus(msg: string): void {
+    if (!statusEl) return;
+    statusEl.textContent = msg;
+    statusEl.hidden = false;
+  }
+
+  pauseBtn.addEventListener("click", async () => {
+    const session = getSession();
+    const id = getMatchId();
+    if (!session || !id) return;
+    pauseBtn.disabled = true;
+    try {
+      const r = await session.client.pauseMatch(id);
+      showLiveStatus(r.ok ? "✓ Match paused." : r.unauthorized ? "⚠ Denied." : "⚠ Error pausing match.");
+    } catch { showLiveStatus("⚠ Network error."); }
+    finally { pauseBtn.disabled = false; }
+  });
+
+  resumeBtn.addEventListener("click", async () => {
+    const session = getSession();
+    const id = getMatchId();
+    if (!session || !id) return;
+    resumeBtn.disabled = true;
+    try {
+      const r = await session.client.resumeMatch(id);
+      showLiveStatus(r.ok ? "✓ Match resumed." : r.unauthorized ? "⚠ Denied." : "⚠ Error resuming match.");
+    } catch { showLiveStatus("⚠ Network error."); }
+    finally { resumeBtn.disabled = false; }
+  });
+
+  abortBtn.addEventListener("click", async () => {
+    const session = getSession();
+    const id = getMatchId();
+    if (!session || !id) return;
+    const confirmed = window.confirm(`Abort match "${id}"?\n\nThis will immediately terminate the running match.`);
+    if (!confirmed) return;
+    abortBtn.disabled = true;
+    try {
+      const r = await session.client.abortMatch(id);
+      showLiveStatus(r.ok ? "✓ Match aborted." : r.unauthorized ? "⚠ Denied." : "⚠ Error aborting match.");
+      if (r.ok) {
+        const idInput = document.getElementById("active-match-id") as HTMLInputElement | null;
+        if (idInput) idInput.value = "";
+      }
+    } catch { showLiveStatus("⚠ Network error."); }
+    finally { abortBtn.disabled = false; }
+  });
+
+  setTpsBtn.addEventListener("click", async () => {
+    const session = getSession();
+    const id = getMatchId();
+    if (!session || !id) return;
+    const tpsInput = document.getElementById("match-tps-input") as HTMLInputElement;
+    const tps = Number(tpsInput.value);
+    if (!tps || tps < 1) {
+      showLiveStatus("⚠ Enter a valid TPS value (≥ 1).");
+      return;
+    }
+    setTpsBtn.disabled = true;
+    try {
+      const r = await session.client.setMatchTps(id, tps);
+      showLiveStatus(r.ok ? `✓ TPS set to ${tps}.` : r.unauthorized ? "⚠ Denied." : "⚠ Error setting TPS.");
+    } catch { showLiveStatus("⚠ Network error."); }
+    finally { setTpsBtn.disabled = false; }
+  });
+}
+
+function wireExhibitionControls(): void {
+  const startBtn = document.getElementById("start-exhibition-btn") as HTMLButtonElement | null;
+  const stopBtn = document.getElementById("stop-exhibition-btn") as HTMLButtonElement | null;
+  const refreshBtn = document.getElementById("refresh-exhibition-btn") as HTMLButtonElement | null;
+  const statusEl = document.getElementById("exhibition-status") as HTMLElement | null;
+  if (!startBtn || !stopBtn || !refreshBtn || !statusEl) return;
+
+  async function refreshStatus(): Promise<void> {
+    const session = getSession();
+    if (!session || !statusEl) return;
+    try {
+      const r = await session.client.getExhibition();
+      if (r.ok) {
+        statusEl.textContent = `Status: ${r.running ? "▶ Running" : "⏹ Stopped"} — ${r.matchCount} match(es) played`;
+      } else if (r.unauthorized) {
+        statusEl.textContent = "Status: ⚠ Denied — session may have expired.";
+      } else {
+        statusEl.textContent = "Status: ⚠ Could not fetch status.";
+      }
+    } catch {
+      statusEl.textContent = "Status: ⚠ Network error.";
+    }
+  }
+
+  startBtn.addEventListener("click", async () => {
+    const session = getSession();
+    if (!session) return;
+    startBtn.disabled = true;
+    try {
+      const r = await session.client.startExhibition();
+      statusEl.textContent = r.ok ? "Status: ▶ Exhibition started." : r.unauthorized ? "Status: ⚠ Denied." : "Status: ⚠ Error starting exhibition.";
+      if (r.ok) await refreshStatus();
+    } catch { statusEl.textContent = "Status: ⚠ Network error."; }
+    finally { startBtn.disabled = false; }
+  });
+
+  stopBtn.addEventListener("click", async () => {
+    const session = getSession();
+    if (!session) return;
+    stopBtn.disabled = true;
+    try {
+      const r = await session.client.stopExhibition();
+      statusEl.textContent = r.ok ? "Status: ⏹ Exhibition stopped." : r.unauthorized ? "Status: ⚠ Denied." : "Status: ⚠ Error stopping exhibition.";
+      if (r.ok) await refreshStatus();
+    } catch { statusEl.textContent = "Status: ⚠ Network error."; }
+    finally { stopBtn.disabled = false; }
+  });
+
+  refreshBtn.addEventListener("click", refreshStatus);
+
+  // Load initial status
+  void refreshStatus();
 }
 
 // ── Bootstrap ─────────────────────────────────────────────────────────────────

@@ -717,4 +717,557 @@ describe("createAdminClient", () => {
       expect(captured[0].url).toBe(`${BASE}/admin/bots/team%2Fx/enable`);
     });
   });
+
+  // ── Issue 11: startMatch slices ───────────────────────────────────────────
+
+  // Slice 24 — startMatch builds POST with JSON body + auth header
+  describe("startMatch request building", () => {
+    it("sends a POST request to /admin/matches", async () => {
+      const { fetchFn, captured } = makeFakeFetch(200, { matchId: "m1", mode: "live" });
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await client.startMatch({ mode: "live" });
+      expect(captured[0].init?.method).toBe("POST");
+      expect(captured[0].url).toBe(`${BASE}/admin/matches`);
+    });
+
+    it("attaches Authorization: Facilitator <password> header", async () => {
+      const { fetchFn, captured } = makeFakeFetch(200, { matchId: "m1", mode: "live" });
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await client.startMatch({ mode: "live" });
+      const headers = captured[0].init?.headers as Record<string, string>;
+      expect(headers["Authorization"]).toBe(`Facilitator ${PASSWORD}`);
+    });
+
+    it("sets Content-Type: application/json", async () => {
+      const { fetchFn, captured } = makeFakeFetch(200, { matchId: "m1", mode: "live" });
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await client.startMatch({ mode: "headless" });
+      const headers = captured[0].init?.headers as Record<string, string>;
+      expect(headers["Content-Type"]).toBe("application/json");
+    });
+
+    it("includes mode in the JSON body", async () => {
+      const { fetchFn, captured } = makeFakeFetch(200, { matchId: "m1", mode: "headless" });
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await client.startMatch({ mode: "headless" });
+      const body = JSON.parse(captured[0].init?.body as string);
+      expect(body.mode).toBe("headless");
+    });
+
+    it("includes optional seed when provided", async () => {
+      const { fetchFn, captured } = makeFakeFetch(200, { matchId: "m1", mode: "live" });
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await client.startMatch({ mode: "live", seed: 42 });
+      const body = JSON.parse(captured[0].init?.body as string);
+      expect(body.seed).toBe(42);
+    });
+
+    it("omits seed when not provided", async () => {
+      const { fetchFn, captured } = makeFakeFetch(200, { matchId: "m1", mode: "live" });
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await client.startMatch({ mode: "live" });
+      const body = JSON.parse(captured[0].init?.body as string);
+      expect(Object.prototype.hasOwnProperty.call(body, "seed")).toBe(false);
+    });
+
+    it("includes optional maxTicks when provided", async () => {
+      const { fetchFn, captured } = makeFakeFetch(200, { matchId: "m1", mode: "live" });
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await client.startMatch({ mode: "live", maxTicks: 1000 });
+      const body = JSON.parse(captured[0].init?.body as string);
+      expect(body.maxTicks).toBe(1000);
+    });
+
+    it("omits maxTicks when not provided", async () => {
+      const { fetchFn, captured } = makeFakeFetch(200, { matchId: "m1", mode: "live" });
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await client.startMatch({ mode: "live" });
+      const body = JSON.parse(captured[0].init?.body as string);
+      expect(Object.prototype.hasOwnProperty.call(body, "maxTicks")).toBe(false);
+    });
+
+    it("includes optional teams when provided", async () => {
+      const { fetchFn, captured } = makeFakeFetch(200, { matchId: "m1", mode: "live" });
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await client.startMatch({ mode: "live", teams: ["alpha", "beta"] });
+      const body = JSON.parse(captured[0].init?.body as string);
+      expect(body.teams).toEqual(["alpha", "beta"]);
+    });
+
+    it("omits teams when not provided", async () => {
+      const { fetchFn, captured } = makeFakeFetch(200, { matchId: "m1", mode: "live" });
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await client.startMatch({ mode: "live" });
+      const body = JSON.parse(captured[0].init?.body as string);
+      expect(Object.prototype.hasOwnProperty.call(body, "teams")).toBe(false);
+    });
+
+    it("includes optional tps when provided", async () => {
+      const { fetchFn, captured } = makeFakeFetch(200, { matchId: "m1", mode: "live" });
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await client.startMatch({ mode: "live", tps: 60 });
+      const body = JSON.parse(captured[0].init?.body as string);
+      expect(body.tps).toBe(60);
+    });
+
+    it("omits tps when not provided", async () => {
+      const { fetchFn, captured } = makeFakeFetch(200, { matchId: "m1", mode: "live" });
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await client.startMatch({ mode: "live" });
+      const body = JSON.parse(captured[0].init?.body as string);
+      expect(Object.prototype.hasOwnProperty.call(body, "tps")).toBe(false);
+    });
+  });
+
+  // Slice 25 — startMatch response mapping
+  describe("startMatch response mapping", () => {
+    it("returns { ok: true, matchId, mode, unauthorized: false } on 200", async () => {
+      const { fetchFn } = makeFakeFetch(200, { matchId: "abc-123", mode: "live" });
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      const result = await client.startMatch({ mode: "live" });
+      expect(result.ok).toBe(true);
+      expect(result.matchId).toBe("abc-123");
+      expect(result.mode).toBe("live");
+      expect(result.unauthorized).toBe(false);
+    });
+
+    it("returns headless mode from server response", async () => {
+      const { fetchFn } = makeFakeFetch(200, { matchId: "xyz-456", mode: "headless" });
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      const result = await client.startMatch({ mode: "headless" });
+      expect(result.mode).toBe("headless");
+      expect(result.matchId).toBe("xyz-456");
+    });
+
+    it("returns { ok: false, unauthorized: true } on 401", async () => {
+      const { fetchFn } = makeFakeFetch(401, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      const result = await client.startMatch({ mode: "live" });
+      expect(result.ok).toBe(false);
+      expect(result.unauthorized).toBe(true);
+      expect(result.matchId).toBe("");
+    });
+
+    it("returns { ok: false, unauthorized: false } on 500", async () => {
+      const { fetchFn } = makeFakeFetch(500, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      const result = await client.startMatch({ mode: "live" });
+      expect(result.ok).toBe(false);
+      expect(result.unauthorized).toBe(false);
+    });
+
+    it("does not throw on 401", async () => {
+      const { fetchFn } = makeFakeFetch(401, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await expect(client.startMatch({ mode: "live" })).resolves.not.toThrow();
+    });
+
+    it("does not throw on 500", async () => {
+      const { fetchFn } = makeFakeFetch(500, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await expect(client.startMatch({ mode: "live" })).resolves.not.toThrow();
+    });
+  });
+
+  // Slice 26 — pauseMatch / resumeMatch request building + response mapping
+  describe("pauseMatch request building", () => {
+    it("sends POST to /admin/matches/{id}/pause", async () => {
+      const { fetchFn, captured } = makeFakeFetch(200, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await client.pauseMatch("m1");
+      expect(captured[0].init?.method).toBe("POST");
+      expect(captured[0].url).toBe(`${BASE}/admin/matches/m1/pause`);
+    });
+
+    it("attaches auth header", async () => {
+      const { fetchFn, captured } = makeFakeFetch(200, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await client.pauseMatch("m1");
+      const headers = captured[0].init?.headers as Record<string, string>;
+      expect(headers["Authorization"]).toBe(`Facilitator ${PASSWORD}`);
+    });
+
+    it("sends no body", async () => {
+      const { fetchFn, captured } = makeFakeFetch(200, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await client.pauseMatch("m1");
+      expect(captured[0].init?.body).toBeUndefined();
+    });
+
+    it("returns { ok: true, unauthorized: false } on 200", async () => {
+      const { fetchFn } = makeFakeFetch(200, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      const result = await client.pauseMatch("m1");
+      expect(result.ok).toBe(true);
+      expect(result.unauthorized).toBe(false);
+    });
+
+    it("returns { ok: false, unauthorized: true } on 401", async () => {
+      const { fetchFn } = makeFakeFetch(401, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      const result = await client.pauseMatch("m1");
+      expect(result.ok).toBe(false);
+      expect(result.unauthorized).toBe(true);
+    });
+
+    it("returns { ok: false, unauthorized: false } on 500", async () => {
+      const { fetchFn } = makeFakeFetch(500, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      const result = await client.pauseMatch("m1");
+      expect(result.ok).toBe(false);
+      expect(result.unauthorized).toBe(false);
+    });
+
+    it("does not throw on any HTTP status", async () => {
+      const { fetchFn } = makeFakeFetch(500, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await expect(client.pauseMatch("m1")).resolves.not.toThrow();
+    });
+  });
+
+  describe("resumeMatch request building", () => {
+    it("sends POST to /admin/matches/{id}/resume", async () => {
+      const { fetchFn, captured } = makeFakeFetch(200, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await client.resumeMatch("m1");
+      expect(captured[0].init?.method).toBe("POST");
+      expect(captured[0].url).toBe(`${BASE}/admin/matches/m1/resume`);
+    });
+
+    it("attaches auth header", async () => {
+      const { fetchFn, captured } = makeFakeFetch(200, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await client.resumeMatch("m1");
+      const headers = captured[0].init?.headers as Record<string, string>;
+      expect(headers["Authorization"]).toBe(`Facilitator ${PASSWORD}`);
+    });
+
+    it("sends no body", async () => {
+      const { fetchFn, captured } = makeFakeFetch(200, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await client.resumeMatch("m1");
+      expect(captured[0].init?.body).toBeUndefined();
+    });
+
+    it("returns { ok: true, unauthorized: false } on 200", async () => {
+      const { fetchFn } = makeFakeFetch(200, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      const result = await client.resumeMatch("m1");
+      expect(result.ok).toBe(true);
+      expect(result.unauthorized).toBe(false);
+    });
+
+    it("returns { ok: false, unauthorized: true } on 401", async () => {
+      const { fetchFn } = makeFakeFetch(401, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      const result = await client.resumeMatch("m1");
+      expect(result.ok).toBe(false);
+      expect(result.unauthorized).toBe(true);
+    });
+
+    it("does not throw on any HTTP status", async () => {
+      const { fetchFn } = makeFakeFetch(500, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await expect(client.resumeMatch("m1")).resolves.not.toThrow();
+    });
+  });
+
+  // Slice 27 — abortMatch issues DELETE
+  describe("abortMatch request building", () => {
+    it("sends DELETE to /admin/matches/{id}", async () => {
+      const { fetchFn, captured } = makeFakeFetch(200, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await client.abortMatch("m1");
+      expect(captured[0].init?.method).toBe("DELETE");
+      expect(captured[0].url).toBe(`${BASE}/admin/matches/m1`);
+    });
+
+    it("attaches auth header", async () => {
+      const { fetchFn, captured } = makeFakeFetch(200, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await client.abortMatch("m1");
+      const headers = captured[0].init?.headers as Record<string, string>;
+      expect(headers["Authorization"]).toBe(`Facilitator ${PASSWORD}`);
+    });
+
+    it("sends no body", async () => {
+      const { fetchFn, captured } = makeFakeFetch(200, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await client.abortMatch("m1");
+      expect(captured[0].init?.body).toBeUndefined();
+    });
+
+    it("returns { ok: true, unauthorized: false } on 200", async () => {
+      const { fetchFn } = makeFakeFetch(200, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      const result = await client.abortMatch("m1");
+      expect(result.ok).toBe(true);
+      expect(result.unauthorized).toBe(false);
+    });
+
+    it("returns { ok: false, unauthorized: true } on 401", async () => {
+      const { fetchFn } = makeFakeFetch(401, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      const result = await client.abortMatch("m1");
+      expect(result.ok).toBe(false);
+      expect(result.unauthorized).toBe(true);
+    });
+
+    it("returns { ok: false, unauthorized: false } on 500", async () => {
+      const { fetchFn } = makeFakeFetch(500, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      const result = await client.abortMatch("m1");
+      expect(result.ok).toBe(false);
+      expect(result.unauthorized).toBe(false);
+    });
+
+    it("does not throw on any HTTP status", async () => {
+      const { fetchFn } = makeFakeFetch(500, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await expect(client.abortMatch("m1")).resolves.not.toThrow();
+    });
+  });
+
+  // Slice 28 — setMatchTps posts JSON {tps}
+  describe("setMatchTps request building", () => {
+    it("sends POST to /admin/matches/{id}/tps", async () => {
+      const { fetchFn, captured } = makeFakeFetch(200, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await client.setMatchTps("m1", 60);
+      expect(captured[0].init?.method).toBe("POST");
+      expect(captured[0].url).toBe(`${BASE}/admin/matches/m1/tps`);
+    });
+
+    it("attaches auth header", async () => {
+      const { fetchFn, captured } = makeFakeFetch(200, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await client.setMatchTps("m1", 60);
+      const headers = captured[0].init?.headers as Record<string, string>;
+      expect(headers["Authorization"]).toBe(`Facilitator ${PASSWORD}`);
+    });
+
+    it("sets Content-Type: application/json", async () => {
+      const { fetchFn, captured } = makeFakeFetch(200, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await client.setMatchTps("m1", 60);
+      const headers = captured[0].init?.headers as Record<string, string>;
+      expect(headers["Content-Type"]).toBe("application/json");
+    });
+
+    it("sends JSON body { tps: <value> }", async () => {
+      const { fetchFn, captured } = makeFakeFetch(200, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await client.setMatchTps("m1", 60);
+      const body = JSON.parse(captured[0].init?.body as string);
+      expect(body).toEqual({ tps: 60 });
+    });
+
+    it("returns { ok: true, unauthorized: false } on 200", async () => {
+      const { fetchFn } = makeFakeFetch(200, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      const result = await client.setMatchTps("m1", 30);
+      expect(result.ok).toBe(true);
+      expect(result.unauthorized).toBe(false);
+    });
+
+    it("returns { ok: false, unauthorized: true } on 401", async () => {
+      const { fetchFn } = makeFakeFetch(401, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      const result = await client.setMatchTps("m1", 30);
+      expect(result.ok).toBe(false);
+      expect(result.unauthorized).toBe(true);
+    });
+
+    it("does not throw on any HTTP status", async () => {
+      const { fetchFn } = makeFakeFetch(500, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await expect(client.setMatchTps("m1", 30)).resolves.not.toThrow();
+    });
+  });
+
+  // Slice 29 — getExhibition parses { running, matchCount }
+  describe("getExhibition request building and response mapping", () => {
+    it("sends GET to /admin/exhibition", async () => {
+      const { fetchFn, captured } = makeFakeFetch(200, { running: true, matchCount: 5 });
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await client.getExhibition();
+      expect(captured[0].init?.method).toBe("GET");
+      expect(captured[0].url).toBe(`${BASE}/admin/exhibition`);
+    });
+
+    it("attaches auth header", async () => {
+      const { fetchFn, captured } = makeFakeFetch(200, { running: false, matchCount: 0 });
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await client.getExhibition();
+      const headers = captured[0].init?.headers as Record<string, string>;
+      expect(headers["Authorization"]).toBe(`Facilitator ${PASSWORD}`);
+    });
+
+    it("returns { ok: true, running: true, matchCount: 5, unauthorized: false } on 200", async () => {
+      const { fetchFn } = makeFakeFetch(200, { running: true, matchCount: 5 });
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      const result = await client.getExhibition();
+      expect(result.ok).toBe(true);
+      expect(result.running).toBe(true);
+      expect(result.matchCount).toBe(5);
+      expect(result.unauthorized).toBe(false);
+    });
+
+    it("returns { ok: true, running: false, matchCount: 0, unauthorized: false } when stopped", async () => {
+      const { fetchFn } = makeFakeFetch(200, { running: false, matchCount: 0 });
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      const result = await client.getExhibition();
+      expect(result.ok).toBe(true);
+      expect(result.running).toBe(false);
+      expect(result.matchCount).toBe(0);
+    });
+
+    it("returns { ok: false, unauthorized: true } on 401", async () => {
+      const { fetchFn } = makeFakeFetch(401, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      const result = await client.getExhibition();
+      expect(result.ok).toBe(false);
+      expect(result.unauthorized).toBe(true);
+    });
+
+    it("returns { ok: false, unauthorized: false } on 500", async () => {
+      const { fetchFn } = makeFakeFetch(500, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      const result = await client.getExhibition();
+      expect(result.ok).toBe(false);
+      expect(result.unauthorized).toBe(false);
+    });
+
+    it("does not throw on any HTTP status", async () => {
+      const { fetchFn } = makeFakeFetch(500, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await expect(client.getExhibition()).resolves.not.toThrow();
+    });
+  });
+
+  // Slice 30 — startExhibition / stopExhibition
+  describe("startExhibition request building and response mapping", () => {
+    it("sends POST to /admin/exhibition/start", async () => {
+      const { fetchFn, captured } = makeFakeFetch(200, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await client.startExhibition();
+      expect(captured[0].init?.method).toBe("POST");
+      expect(captured[0].url).toBe(`${BASE}/admin/exhibition/start`);
+    });
+
+    it("attaches auth header", async () => {
+      const { fetchFn, captured } = makeFakeFetch(200, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await client.startExhibition();
+      const headers = captured[0].init?.headers as Record<string, string>;
+      expect(headers["Authorization"]).toBe(`Facilitator ${PASSWORD}`);
+    });
+
+    it("sends no body", async () => {
+      const { fetchFn, captured } = makeFakeFetch(200, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await client.startExhibition();
+      expect(captured[0].init?.body).toBeUndefined();
+    });
+
+    it("returns { ok: true, unauthorized: false } on 200", async () => {
+      const { fetchFn } = makeFakeFetch(200, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      const result = await client.startExhibition();
+      expect(result.ok).toBe(true);
+      expect(result.unauthorized).toBe(false);
+    });
+
+    it("returns { ok: false, unauthorized: true } on 401", async () => {
+      const { fetchFn } = makeFakeFetch(401, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      const result = await client.startExhibition();
+      expect(result.ok).toBe(false);
+      expect(result.unauthorized).toBe(true);
+    });
+
+    it("does not throw on any HTTP status", async () => {
+      const { fetchFn } = makeFakeFetch(500, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await expect(client.startExhibition()).resolves.not.toThrow();
+    });
+  });
+
+  describe("stopExhibition request building and response mapping", () => {
+    it("sends POST to /admin/exhibition/stop", async () => {
+      const { fetchFn, captured } = makeFakeFetch(200, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await client.stopExhibition();
+      expect(captured[0].init?.method).toBe("POST");
+      expect(captured[0].url).toBe(`${BASE}/admin/exhibition/stop`);
+    });
+
+    it("attaches auth header", async () => {
+      const { fetchFn, captured } = makeFakeFetch(200, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await client.stopExhibition();
+      const headers = captured[0].init?.headers as Record<string, string>;
+      expect(headers["Authorization"]).toBe(`Facilitator ${PASSWORD}`);
+    });
+
+    it("sends no body", async () => {
+      const { fetchFn, captured } = makeFakeFetch(200, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await client.stopExhibition();
+      expect(captured[0].init?.body).toBeUndefined();
+    });
+
+    it("returns { ok: true, unauthorized: false } on 200", async () => {
+      const { fetchFn } = makeFakeFetch(200, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      const result = await client.stopExhibition();
+      expect(result.ok).toBe(true);
+      expect(result.unauthorized).toBe(false);
+    });
+
+    it("returns { ok: false, unauthorized: true } on 401", async () => {
+      const { fetchFn } = makeFakeFetch(401, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      const result = await client.stopExhibition();
+      expect(result.ok).toBe(false);
+      expect(result.unauthorized).toBe(true);
+    });
+
+    it("does not throw on any HTTP status", async () => {
+      const { fetchFn } = makeFakeFetch(500, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await expect(client.stopExhibition()).resolves.not.toThrow();
+    });
+  });
+
+  // Slice 31 — match id URL-encoding
+  describe("match id URL-encoding", () => {
+    it("URL-encodes pauseMatch id containing a slash", async () => {
+      const { fetchFn, captured } = makeFakeFetch(200, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await client.pauseMatch("match/1");
+      expect(captured[0].url).toBe(`${BASE}/admin/matches/match%2F1/pause`);
+    });
+
+    it("URL-encodes resumeMatch id containing a space", async () => {
+      const { fetchFn, captured } = makeFakeFetch(200, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await client.resumeMatch("match 1");
+      expect(captured[0].url).toBe(`${BASE}/admin/matches/match%201/resume`);
+    });
+
+    it("URL-encodes abortMatch id containing special chars", async () => {
+      const { fetchFn, captured } = makeFakeFetch(200, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await client.abortMatch("match/1");
+      expect(captured[0].url).toBe(`${BASE}/admin/matches/match%2F1`);
+    });
+
+    it("URL-encodes setMatchTps id containing special chars", async () => {
+      const { fetchFn, captured } = makeFakeFetch(200, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await client.setMatchTps("match/1", 30);
+      expect(captured[0].url).toBe(`${BASE}/admin/matches/match%2F1/tps`);
+    });
+  });
 });
