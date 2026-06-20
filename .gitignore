@@ -35,3 +35,5 @@ src/**/.gradle/
 src/**/__pycache__/
 # Compiled bot artifacts (WASM build output)
 src/arena/bots/**/*.wasm
+# Compiled / vendored JVM jars (the Kotlin bot fetches json.jar per its README)
+src/arena/bots/**/*.jar
