@@ -135,6 +135,23 @@ function renderDashboard(): void {
       </div>
     </section>
 
+    <section class="panel" id="default-bot-panel">
+      <h2>Default Bot</h2>
+      <p class="hint">
+        The Default Bot fills empty slots. Upload a custom WASM artifact to
+        override the built-in heuristic, or clear it to revert.
+      </p>
+      <div class="default-bot-controls">
+        <label class="file-label">
+          Choose .wasm
+          <input type="file" id="default-bot-file" accept=".wasm" />
+        </label>
+        <button id="set-default-bot-btn" class="btn-primary">Set Default Bot</button>
+        <button id="clear-default-bot-btn" class="btn-secondary">Clear Default Bot</button>
+      </div>
+      <p id="default-bot-status" class="status-line" hidden></p>
+    </section>
+
     <!-- Seam: issues 09-12 inject their panels here -->
     <div id="admin-panels"></div>
   `;
@@ -145,6 +162,7 @@ function renderDashboard(): void {
     renderSignIn();
   });
 
+  wireDefaultBotControls();
   startPolling();
 }
 
@@ -178,15 +196,29 @@ function renderBotsTable(bots: BotHealthSnapshot[]): void {
       <td class="col-skipped">${bot.skippedTicks}</td>
       <td class="col-crashes">${bot.crashes}</td>
       <td class="col-logs"><pre class="log-pre">${escHtml(logSnippet) || "<em class='no-logs'>—</em>"}</pre></td>
-      <td class="col-actions"><button class="btn-kick" data-team="${escHtml(bot.team)}">Kick</button></td>
+      <td class="col-actions">
+        <button class="btn-kick" data-team="${escHtml(bot.team)}">Kick</button>
+        <button class="btn-disable" data-team="${escHtml(bot.team)}">Disable</button>
+        <button class="btn-enable" data-team="${escHtml(bot.team)}">Enable</button>
+        <label class="file-label-inline">
+          Upload WASM
+          <input type="file" accept=".wasm" class="file-input-bot" data-team="${escHtml(bot.team)}" />
+        </label>
+      </td>
     `;
     tbody.appendChild(tr);
+
+    // Wire the per-row file input directly (not delegated — easier with file inputs)
+    const fileInput = tr.querySelector(".file-input-bot") as HTMLInputElement;
+    fileInput.addEventListener("change", () => handleBotUploadChange(fileInput));
   }
 
   table.hidden = false;
 
   // Delegate click events for Kick buttons
   tbody.addEventListener("click", handleKickClick);
+  // Delegate click events for Disable/Enable buttons
+  tbody.addEventListener("click", handleBotToggleClick);
 }
 
 async function handleKickClick(e: Event): Promise<void> {
@@ -240,6 +272,159 @@ async function handleKickClick(e: Event): Promise<void> {
     btn.textContent = "Kick";
     alert(`Network error while kicking "${team}".`);
   }
+}
+
+async function handleBotToggleClick(e: Event): Promise<void> {
+  const btn = (e.target as HTMLElement).closest(
+    ".btn-disable, .btn-enable",
+  ) as HTMLButtonElement | null;
+  if (!btn) return;
+
+  const team = btn.dataset.team;
+  if (!team) return;
+
+  const isDisable = btn.classList.contains("btn-disable");
+  const action = isDisable ? "disable" : "enable";
+
+  const session = getSession();
+  if (!session) return;
+
+  btn.disabled = true;
+  btn.textContent = isDisable ? "Disabling…" : "Enabling…";
+
+  try {
+    const result = isDisable
+      ? await session.client.disableBot(team)
+      : await session.client.enableBot(team);
+
+    if (result.unauthorized) {
+      btn.disabled = false;
+      btn.textContent = isDisable ? "Disable" : "Enable";
+      alert("Action denied — session may have expired. Please sign out and sign in again.");
+      return;
+    }
+
+    if (!result.ok) {
+      btn.disabled = false;
+      btn.textContent = isDisable ? "Disable" : "Enable";
+      alert(`Failed to ${action} "${team}" — server returned an error.`);
+      return;
+    }
+
+    btn.disabled = false;
+    btn.textContent = isDisable ? "Disable" : "Enable";
+    // Next poll will reflect the updated state in the health snapshot
+  } catch {
+    btn.disabled = false;
+    btn.textContent = isDisable ? "Disable" : "Enable";
+    alert(`Network error while trying to ${action} "${team}".`);
+  }
+}
+
+async function handleBotUploadChange(fileInput: HTMLInputElement): Promise<void> {
+  const team = fileInput.dataset.team;
+  if (!team || !fileInput.files?.length) return;
+
+  const file = fileInput.files[0];
+  const session = getSession();
+  if (!session) return;
+
+  fileInput.disabled = true;
+
+  try {
+    const wasm = await file.arrayBuffer();
+    const result = await session.client.uploadTeamBot(team, wasm);
+
+    if (result.unauthorized) {
+      alert("Upload denied — session may have expired. Please sign out and sign in again.");
+    } else if (result.badRequest) {
+      alert(`Upload failed for "${team}" — file is not a valid WASM artifact.`);
+    } else if (!result.ok) {
+      alert(`Upload failed for "${team}" — server returned an error.`);
+    } else {
+      alert(`Bot uploaded successfully for "${team}".`);
+    }
+  } catch {
+    alert(`Network error while uploading bot for "${team}".`);
+  } finally {
+    fileInput.disabled = false;
+    fileInput.value = "";
+  }
+}
+
+// ── Default Bot controls ──────────────────────────────────────────────────────
+
+function wireDefaultBotControls(): void {
+  const fileInput = document.getElementById("default-bot-file") as HTMLInputElement | null;
+  const setBtn = document.getElementById("set-default-bot-btn") as HTMLButtonElement | null;
+  const clearBtn = document.getElementById("clear-default-bot-btn") as HTMLButtonElement | null;
+  const statusEl = document.getElementById("default-bot-status") as HTMLElement | null;
+  if (!fileInput || !setBtn || !clearBtn || !statusEl) return;
+
+  function showStatus(msg: string): void {
+    if (!statusEl) return;
+    statusEl.textContent = msg;
+    statusEl.hidden = false;
+  }
+
+  setBtn.addEventListener("click", async () => {
+    if (!fileInput.files?.length) {
+      alert("Please choose a .wasm file first.");
+      return;
+    }
+    const file = fileInput.files[0];
+    const session = getSession();
+    if (!session) return;
+
+    setBtn.disabled = true;
+    setBtn.textContent = "Uploading…";
+
+    try {
+      const wasm = await file.arrayBuffer();
+      const result = await session.client.setDefaultBot(wasm);
+
+      if (result.unauthorized) {
+        showStatus("⚠ Denied — session may have expired.");
+      } else if (result.badRequest) {
+        showStatus("⚠ Upload rejected — not a valid WASM artifact.");
+      } else if (!result.ok) {
+        showStatus("⚠ Upload failed — server returned an error.");
+      } else {
+        showStatus("✓ Default Bot updated.");
+        fileInput.value = "";
+      }
+    } catch {
+      showStatus("⚠ Network error during upload.");
+    } finally {
+      setBtn.disabled = false;
+      setBtn.textContent = "Set Default Bot";
+    }
+  });
+
+  clearBtn.addEventListener("click", async () => {
+    const session = getSession();
+    if (!session) return;
+
+    clearBtn.disabled = true;
+    clearBtn.textContent = "Clearing…";
+
+    try {
+      const result = await session.client.clearDefaultBot();
+
+      if (result.unauthorized) {
+        showStatus("⚠ Denied — session may have expired.");
+      } else if (!result.ok) {
+        showStatus("⚠ Clear failed — server returned an error.");
+      } else {
+        showStatus("✓ Default Bot cleared (reverted to built-in).");
+      }
+    } catch {
+      showStatus("⚠ Network error during clear.");
+    } finally {
+      clearBtn.disabled = false;
+      clearBtn.textContent = "Clear Default Bot";
+    }
+  });
 }
 
 // ── Polling ───────────────────────────────────────────────────────────────────

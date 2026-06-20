@@ -327,4 +327,394 @@ describe("createAdminClient", () => {
       await expect(client.kickBot("alpha")).resolves.not.toThrow();
     });
   });
+
+  // ── uploadTeamBot slices ──────────────────────────────────────────────────
+
+  const SAMPLE_WASM = new Uint8Array([0x00, 0x61, 0x73, 0x6d, 0x01, 0x00]);
+
+  // Slice 13 — uploadTeamBot builds POST to correct path with auth header + binary body
+  describe("uploadTeamBot request building", () => {
+    it("sends a POST request (not GET)", async () => {
+      const { fetchFn, captured } = makeFakeFetch(200, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await client.uploadTeamBot("alpha", SAMPLE_WASM);
+      expect(captured[0].init?.method).toBe("POST");
+    });
+
+    it("sends to /admin/bots/{team}", async () => {
+      const { fetchFn, captured } = makeFakeFetch(200, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await client.uploadTeamBot("alpha", SAMPLE_WASM);
+      expect(captured[0].url).toBe(`${BASE}/admin/bots/alpha`);
+    });
+
+    it("attaches Authorization: Facilitator <password> header", async () => {
+      const { fetchFn, captured } = makeFakeFetch(200, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await client.uploadTeamBot("alpha", SAMPLE_WASM);
+      const headers = captured[0].init?.headers as Record<string, string>;
+      expect(headers["Authorization"]).toBe(`Facilitator ${PASSWORD}`);
+    });
+
+    it("passes the binary body through to fetch", async () => {
+      const { fetchFn, captured } = makeFakeFetch(200, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await client.uploadTeamBot("alpha", SAMPLE_WASM);
+      expect(captured[0].init?.body).toBe(SAMPLE_WASM);
+    });
+
+    it("sets Content-Type: application/octet-stream", async () => {
+      const { fetchFn, captured } = makeFakeFetch(200, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await client.uploadTeamBot("alpha", SAMPLE_WASM);
+      const headers = captured[0].init?.headers as Record<string, string>;
+      expect(headers["Content-Type"]).toBe("application/octet-stream");
+    });
+  });
+
+  // Slice 14 — uploadTeamBot response mapping (200/400/401/other; no throws)
+  describe("uploadTeamBot response mapping", () => {
+    it("returns { ok: true, badRequest: false, unauthorized: false } on 200", async () => {
+      const { fetchFn } = makeFakeFetch(200, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      const result = await client.uploadTeamBot("alpha", SAMPLE_WASM);
+      expect(result).toEqual({ ok: true, badRequest: false, unauthorized: false });
+    });
+
+    it("returns { ok: false, badRequest: true, unauthorized: false } on 400", async () => {
+      const { fetchFn } = makeFakeFetch(400, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      const result = await client.uploadTeamBot("alpha", SAMPLE_WASM);
+      expect(result).toEqual({ ok: false, badRequest: true, unauthorized: false });
+    });
+
+    it("returns { ok: false, badRequest: false, unauthorized: true } on 401", async () => {
+      const { fetchFn } = makeFakeFetch(401, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      const result = await client.uploadTeamBot("alpha", SAMPLE_WASM);
+      expect(result).toEqual({ ok: false, badRequest: false, unauthorized: true });
+    });
+
+    it("returns { ok: false, badRequest: false, unauthorized: false } on 500", async () => {
+      const { fetchFn } = makeFakeFetch(500, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      const result = await client.uploadTeamBot("alpha", SAMPLE_WASM);
+      expect(result).toEqual({ ok: false, badRequest: false, unauthorized: false });
+    });
+
+    it("does not throw on 400 (bad WASM)", async () => {
+      const { fetchFn } = makeFakeFetch(400, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await expect(client.uploadTeamBot("alpha", SAMPLE_WASM)).resolves.not.toThrow();
+    });
+
+    it("does not throw on 401", async () => {
+      const { fetchFn } = makeFakeFetch(401, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await expect(client.uploadTeamBot("alpha", SAMPLE_WASM)).resolves.not.toThrow();
+    });
+  });
+
+  // Slice 15 — disableBot builds POST to correct path, no body
+  describe("disableBot request building", () => {
+    it("sends a POST request", async () => {
+      const { fetchFn, captured } = makeFakeFetch(200, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await client.disableBot("alpha");
+      expect(captured[0].init?.method).toBe("POST");
+    });
+
+    it("sends to /admin/bots/{team}/disable", async () => {
+      const { fetchFn, captured } = makeFakeFetch(200, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await client.disableBot("alpha");
+      expect(captured[0].url).toBe(`${BASE}/admin/bots/alpha/disable`);
+    });
+
+    it("attaches Authorization: Facilitator <password> header", async () => {
+      const { fetchFn, captured } = makeFakeFetch(200, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await client.disableBot("alpha");
+      const headers = captured[0].init?.headers as Record<string, string>;
+      expect(headers["Authorization"]).toBe(`Facilitator ${PASSWORD}`);
+    });
+
+    it("sends no body", async () => {
+      const { fetchFn, captured } = makeFakeFetch(200, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await client.disableBot("alpha");
+      expect(captured[0].init?.body).toBeUndefined();
+    });
+  });
+
+  // Slice 16 — disableBot response mapping
+  describe("disableBot response mapping", () => {
+    it("returns { ok: true, unauthorized: false } on 200", async () => {
+      const { fetchFn } = makeFakeFetch(200, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      const result = await client.disableBot("alpha");
+      expect(result.ok).toBe(true);
+      expect(result.unauthorized).toBe(false);
+    });
+
+    it("returns { ok: false, unauthorized: true } on 401", async () => {
+      const { fetchFn } = makeFakeFetch(401, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      const result = await client.disableBot("alpha");
+      expect(result.ok).toBe(false);
+      expect(result.unauthorized).toBe(true);
+    });
+
+    it("returns { ok: false, unauthorized: false } on 500", async () => {
+      const { fetchFn } = makeFakeFetch(500, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      const result = await client.disableBot("alpha");
+      expect(result.ok).toBe(false);
+      expect(result.unauthorized).toBe(false);
+    });
+
+    it("does not throw on any HTTP status", async () => {
+      const { fetchFn } = makeFakeFetch(500, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await expect(client.disableBot("alpha")).resolves.not.toThrow();
+    });
+  });
+
+  // Slice 17 — enableBot builds POST to correct path, no body
+  describe("enableBot request building", () => {
+    it("sends a POST request", async () => {
+      const { fetchFn, captured } = makeFakeFetch(200, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await client.enableBot("alpha");
+      expect(captured[0].init?.method).toBe("POST");
+    });
+
+    it("sends to /admin/bots/{team}/enable", async () => {
+      const { fetchFn, captured } = makeFakeFetch(200, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await client.enableBot("alpha");
+      expect(captured[0].url).toBe(`${BASE}/admin/bots/alpha/enable`);
+    });
+
+    it("attaches Authorization: Facilitator <password> header", async () => {
+      const { fetchFn, captured } = makeFakeFetch(200, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await client.enableBot("alpha");
+      const headers = captured[0].init?.headers as Record<string, string>;
+      expect(headers["Authorization"]).toBe(`Facilitator ${PASSWORD}`);
+    });
+
+    it("sends no body", async () => {
+      const { fetchFn, captured } = makeFakeFetch(200, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await client.enableBot("alpha");
+      expect(captured[0].init?.body).toBeUndefined();
+    });
+  });
+
+  // Slice 18 — enableBot response mapping
+  describe("enableBot response mapping", () => {
+    it("returns { ok: true, unauthorized: false } on 200", async () => {
+      const { fetchFn } = makeFakeFetch(200, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      const result = await client.enableBot("alpha");
+      expect(result.ok).toBe(true);
+      expect(result.unauthorized).toBe(false);
+    });
+
+    it("returns { ok: false, unauthorized: true } on 401", async () => {
+      const { fetchFn } = makeFakeFetch(401, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      const result = await client.enableBot("alpha");
+      expect(result.ok).toBe(false);
+      expect(result.unauthorized).toBe(true);
+    });
+
+    it("returns { ok: false, unauthorized: false } on 500", async () => {
+      const { fetchFn } = makeFakeFetch(500, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      const result = await client.enableBot("alpha");
+      expect(result.ok).toBe(false);
+      expect(result.unauthorized).toBe(false);
+    });
+
+    it("does not throw on any HTTP status", async () => {
+      const { fetchFn } = makeFakeFetch(500, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await expect(client.enableBot("alpha")).resolves.not.toThrow();
+    });
+  });
+
+  // Slice 19 — setDefaultBot builds POST to /admin/default-bot with binary body
+  describe("setDefaultBot request building", () => {
+    it("sends a POST request", async () => {
+      const { fetchFn, captured } = makeFakeFetch(200, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await client.setDefaultBot(SAMPLE_WASM);
+      expect(captured[0].init?.method).toBe("POST");
+    });
+
+    it("sends to /admin/default-bot", async () => {
+      const { fetchFn, captured } = makeFakeFetch(200, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await client.setDefaultBot(SAMPLE_WASM);
+      expect(captured[0].url).toBe(`${BASE}/admin/default-bot`);
+    });
+
+    it("attaches Authorization: Facilitator <password> header", async () => {
+      const { fetchFn, captured } = makeFakeFetch(200, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await client.setDefaultBot(SAMPLE_WASM);
+      const headers = captured[0].init?.headers as Record<string, string>;
+      expect(headers["Authorization"]).toBe(`Facilitator ${PASSWORD}`);
+    });
+
+    it("passes the binary body through to fetch", async () => {
+      const { fetchFn, captured } = makeFakeFetch(200, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await client.setDefaultBot(SAMPLE_WASM);
+      expect(captured[0].init?.body).toBe(SAMPLE_WASM);
+    });
+
+    it("sets Content-Type: application/octet-stream", async () => {
+      const { fetchFn, captured } = makeFakeFetch(200, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await client.setDefaultBot(SAMPLE_WASM);
+      const headers = captured[0].init?.headers as Record<string, string>;
+      expect(headers["Content-Type"]).toBe("application/octet-stream");
+    });
+  });
+
+  // Slice 20 — setDefaultBot response mapping (200/400/401/other)
+  describe("setDefaultBot response mapping", () => {
+    it("returns { ok: true, badRequest: false, unauthorized: false } on 200", async () => {
+      const { fetchFn } = makeFakeFetch(200, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      const result = await client.setDefaultBot(SAMPLE_WASM);
+      expect(result).toEqual({ ok: true, badRequest: false, unauthorized: false });
+    });
+
+    it("returns { ok: false, badRequest: true, unauthorized: false } on 400", async () => {
+      const { fetchFn } = makeFakeFetch(400, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      const result = await client.setDefaultBot(SAMPLE_WASM);
+      expect(result).toEqual({ ok: false, badRequest: true, unauthorized: false });
+    });
+
+    it("returns { ok: false, badRequest: false, unauthorized: true } on 401", async () => {
+      const { fetchFn } = makeFakeFetch(401, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      const result = await client.setDefaultBot(SAMPLE_WASM);
+      expect(result).toEqual({ ok: false, badRequest: false, unauthorized: true });
+    });
+
+    it("returns { ok: false, badRequest: false, unauthorized: false } on 500", async () => {
+      const { fetchFn } = makeFakeFetch(500, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      const result = await client.setDefaultBot(SAMPLE_WASM);
+      expect(result).toEqual({ ok: false, badRequest: false, unauthorized: false });
+    });
+
+    it("does not throw on 400 (bad WASM)", async () => {
+      const { fetchFn } = makeFakeFetch(400, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await expect(client.setDefaultBot(SAMPLE_WASM)).resolves.not.toThrow();
+    });
+  });
+
+  // Slice 21 — clearDefaultBot builds DELETE to /admin/default-bot, no body
+  describe("clearDefaultBot request building", () => {
+    it("sends a DELETE request", async () => {
+      const { fetchFn, captured } = makeFakeFetch(200, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await client.clearDefaultBot();
+      expect(captured[0].init?.method).toBe("DELETE");
+    });
+
+    it("sends to /admin/default-bot", async () => {
+      const { fetchFn, captured } = makeFakeFetch(200, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await client.clearDefaultBot();
+      expect(captured[0].url).toBe(`${BASE}/admin/default-bot`);
+    });
+
+    it("attaches Authorization: Facilitator <password> header", async () => {
+      const { fetchFn, captured } = makeFakeFetch(200, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await client.clearDefaultBot();
+      const headers = captured[0].init?.headers as Record<string, string>;
+      expect(headers["Authorization"]).toBe(`Facilitator ${PASSWORD}`);
+    });
+
+    it("sends no body", async () => {
+      const { fetchFn, captured } = makeFakeFetch(200, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await client.clearDefaultBot();
+      expect(captured[0].init?.body).toBeUndefined();
+    });
+  });
+
+  // Slice 22 — clearDefaultBot response mapping
+  describe("clearDefaultBot response mapping", () => {
+    it("returns { ok: true, unauthorized: false } on 200", async () => {
+      const { fetchFn } = makeFakeFetch(200, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      const result = await client.clearDefaultBot();
+      expect(result.ok).toBe(true);
+      expect(result.unauthorized).toBe(false);
+    });
+
+    it("returns { ok: false, unauthorized: true } on 401", async () => {
+      const { fetchFn } = makeFakeFetch(401, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      const result = await client.clearDefaultBot();
+      expect(result.ok).toBe(false);
+      expect(result.unauthorized).toBe(true);
+    });
+
+    it("returns { ok: false, unauthorized: false } on 500", async () => {
+      const { fetchFn } = makeFakeFetch(500, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      const result = await client.clearDefaultBot();
+      expect(result.ok).toBe(false);
+      expect(result.unauthorized).toBe(false);
+    });
+
+    it("does not throw on any HTTP status", async () => {
+      const { fetchFn } = makeFakeFetch(500, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await expect(client.clearDefaultBot()).resolves.not.toThrow();
+    });
+  });
+
+  // Slice 23 — uploadTeamBot URL-encodes team names with special chars
+  describe("uploadTeamBot URL encoding", () => {
+    it("URL-encodes a team name containing a space", async () => {
+      const { fetchFn, captured } = makeFakeFetch(200, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await client.uploadTeamBot("team a", SAMPLE_WASM);
+      expect(captured[0].url).toBe(`${BASE}/admin/bots/team%20a`);
+    });
+
+    it("URL-encodes a team name containing a slash", async () => {
+      const { fetchFn, captured } = makeFakeFetch(200, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await client.uploadTeamBot("team/x", SAMPLE_WASM);
+      expect(captured[0].url).toBe(`${BASE}/admin/bots/team%2Fx`);
+    });
+
+    it("URL-encodes disableBot team names with special chars", async () => {
+      const { fetchFn, captured } = makeFakeFetch(200, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await client.disableBot("team a");
+      expect(captured[0].url).toBe(`${BASE}/admin/bots/team%20a/disable`);
+    });
+
+    it("URL-encodes enableBot team names with special chars", async () => {
+      const { fetchFn, captured } = makeFakeFetch(200, null);
+      const client = createAdminClient(BASE, PASSWORD, fetchFn);
+      await client.enableBot("team/x");
+      expect(captured[0].url).toBe(`${BASE}/admin/bots/team%2Fx/enable`);
+    });
+  });
 });
