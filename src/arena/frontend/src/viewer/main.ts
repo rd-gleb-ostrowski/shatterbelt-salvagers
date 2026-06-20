@@ -30,6 +30,7 @@ import { ObserverClient, defaultObserverUrl } from "./wsClient.ts";
 import { screenToWorld, worldToScreen } from "../lib/worldTransform.ts";
 import type { GodViewFrame } from "../lib/frameParser.ts";
 import type { Vec2 } from "../lib/worldTransform.ts";
+import { HudOverlay } from "./hud.ts";
 
 // ── Follow-select threshold ───────────────────────────────────────────────────
 
@@ -213,6 +214,11 @@ async function init(): Promise<void> {
   // Track the latest frame for cursor-relative zoom and click-to-follow
   let lastFrame: GodViewFrame | null = null;
 
+  // ── HUD overlay (issue 05) ───────────────────────────────────────────────
+  const hud = new HudOverlay(document.body);
+  // Fetch ladder standings on startup; silently degrades if unavailable
+  hud.fetchLadder().catch(() => undefined);
+
   // Wire camera input after renderer (and thus the PixiJS canvas) exists
   const pixiCanvas = container.querySelector("canvas");
   if (pixiCanvas instanceof HTMLCanvasElement) {
@@ -227,6 +233,11 @@ async function init(): Promise<void> {
     onFrame(frame) {
       lastFrame = frame;
       renderer.renderFrame(frame);
+      hud.update(frame);
+      // Re-fetch ladder when the match ends so standings are fresh
+      if (frame.tick >= frame.maxTicks) {
+        hud.fetchLadder().catch(() => undefined);
+      }
     },
     onStatus: setStatus,
   });

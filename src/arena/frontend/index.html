@@ -14,6 +14,69 @@
         color: #7b6fcf; font-family: monospace; font-size: 11px;
         border-top: 1px solid #2a2050;
       }
+
+      /* ── HUD overlay ──────────────────────────────────────────────────────── */
+      #hud-overlay {
+        position: fixed; inset: 0; pointer-events: none;
+        font-family: monospace; font-size: 12px; color: #e0daf8;
+        z-index: 10;
+      }
+
+      /* Timer — top-centre */
+      #hud-timer {
+        position: absolute; top: 12px; left: 50%; transform: translateX(-50%);
+        font-size: 22px; font-weight: bold; letter-spacing: 2px;
+        color: #ffe66d; text-shadow: 0 0 8px rgba(255,230,109,0.6);
+        background: rgba(10,8,30,0.7); padding: 4px 16px; border-radius: 4px;
+        border: 1px solid rgba(255,230,109,0.25);
+      }
+
+      /* Scoreboard — top-left */
+      #hud-scoreboard {
+        position: absolute; top: 12px; left: 12px;
+        background: rgba(10,8,30,0.8); padding: 8px 12px;
+        border-radius: 6px; border: 1px solid #2a2050; min-width: 160px;
+      }
+
+      /* Ladder — top-right */
+      #hud-ladder {
+        position: absolute; top: 12px; right: 12px;
+        background: rgba(10,8,30,0.8); padding: 8px 12px;
+        border-radius: 6px; border: 1px solid #2a2050; min-width: 220px;
+      }
+
+      .hud-panel-title {
+        font-size: 10px; letter-spacing: 1px; color: #7b6fcf;
+        margin-bottom: 6px; text-transform: uppercase;
+      }
+
+      /* Scoreboard rows */
+      .hud-score-row {
+        display: flex; align-items: center; gap: 6px;
+        padding: 2px 0; border-bottom: 1px solid rgba(42,32,80,0.5);
+      }
+      .hud-score-row:last-child { border-bottom: none; }
+      .hud-team-dot { font-size: 10px; flex-shrink: 0; }
+      .hud-team-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .hud-score { font-weight: bold; color: #ffe66d; min-width: 36px; text-align: right; }
+      .hud-relics { color: #4ecdc4; min-width: 32px; text-align: right; font-size: 11px; }
+
+      /* Ladder rows */
+      .hud-ladder-header, .hud-ladder-row {
+        display: grid;
+        grid-template-columns: 20px 1fr 48px 28px;
+        gap: 4px; padding: 2px 0; align-items: center;
+      }
+      .hud-ladder-header {
+        font-size: 9px; color: #7b6fcf; letter-spacing: 1px;
+        border-bottom: 1px solid #2a2050; margin-bottom: 2px;
+      }
+      .hud-ladder-row { border-bottom: 1px solid rgba(42,32,80,0.4); }
+      .hud-ladder-row:last-child { border-bottom: none; }
+      .hud-rank { color: #7b6fcf; text-align: right; padding-right: 4px; }
+      .hud-competitor { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .hud-skill { color: #a8e6cf; text-align: right; }
+      .hud-matches { color: #7b6fcf; text-align: right; font-size: 10px; }
     </style>
   </head>
   <body>
