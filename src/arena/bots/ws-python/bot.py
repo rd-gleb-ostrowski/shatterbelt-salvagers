@@ -81,7 +81,7 @@ def main() -> None:
         # 2. join (bot -> Arena): echo sessionId + present our token + a name.
         ws.send(json.dumps({"sessionId": session_id, "token": token, "name": TEAM}))
 
-        # 3. assigned (Arena -> bot): our ship id for this match.
+        # 3. assigned (Arena -> bot): our ship id for the connection.
         assigned = json.loads(ws.recv())
         assert assigned["type"] == "assigned", assigned
         print(f"[bot] assigned ship {assigned['shipId']}")
@@ -92,10 +92,10 @@ def main() -> None:
             kind = msg.get("type")
             if kind == "tick":
                 ws.send(json.dumps(decide(msg)))
+            elif kind == "matchStart":
+                print(f"[bot] matchStart")
             elif kind == "matchEnd":
                 print(f"[bot] matchEnd: {msg['results']}")
-                break
-            # matchStart and anything else need no reply.
 
     print("[bot] done")
 
