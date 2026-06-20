@@ -29,3 +29,9 @@ src/**/node_modules/
 src/**/dist/
 src/**/.vite/
 src/**/coverage/
+src/**/target/
+src/**/build/
+src/**/.gradle/
+src/**/__pycache__/
+# Compiled bot artifacts (WASM build output)
+src/arena/bots/**/*.wasm
