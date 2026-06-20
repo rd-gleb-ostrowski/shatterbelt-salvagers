@@ -143,15 +143,20 @@ Notes:
 - Enemy `mines` appear only when your ship is within the detection radius (~120 units — *balance*);
   your own mines are always listed (`own:true`).
 
-## 7. Events (in each observation)
+## 7. Events
 
 A list of what happened to **you** since the last tick, so reactive bots don't have to diff
 state. Extensible — new variants are added without breaking existing bots.
 
-**Projectile / cannon damage**
+Per-bot observations carry the events for **your** ship. The Viewer's god-mode frame (§6) carries
+the same events for **all** ships in a top-level `events` array, where each entry additionally
+includes a `ship` field naming the subject ship.
+
+**Projectile / cannon**
 
 | event                 | payload              | meaning |
 |-----------------------|----------------------|---------|
+| `cannonFired`         | `{}`                 | you fired your rune-cannon this tick (a bolt was spawned) |
 | `tookShield`          | `{ amount, by }`     | your Shield absorbed a cannon hit from ship `by` |
 | `tookHull`            | `{ amount, by }`     | after Shield was depleted (or overflow), your Hull took cannon damage from `by` |
 | `shieldDown`          | `{}`                 | your Shield reached 0 this tick |
@@ -168,8 +173,8 @@ state. Extensible — new variants are added without breaking existing bots.
 
 | event              | payload                | meaning |
 |--------------------|------------------------|---------|
-| `relicTaken`       | `{ relicId, value }`   | you picked up a Relic |
-| `relicBanked`      | `{ value, total }`     | you banked Relics at your Anchor |
+| `relicTaken`       | `{}`                   | you picked up a Relic (one event per Relic taken) |
+| `relicBanked`      | `{ value }`            | you banked carried Relics at your Anchor; `value` is the score banked this tick |
 | `relicDropped`     | `{ relicId, pos }`     | a carried Relic was dropped into the Drift when your ship was destroyed (one event per Relic) |
 | `sigilGranted`     | `{ which }`            | a Relic granted you a Sigil (only emitted when you held none before pickup) |
 | `sigilDischarged`  | `{ which }`            | your held Sigil was consumed via a discharge intent |
