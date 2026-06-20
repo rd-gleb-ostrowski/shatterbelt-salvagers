@@ -46,7 +46,7 @@ use crate::pacer::NoopPacer;
 use crate::recording::RecordingStore;
 use crate::replay::run_replay;
 use crate::resolver::WsConnectionRegistry;
-use crate::store::WasmBotStore;
+use crate::store::{DefaultBotStore, DisabledStore, WasmBotStore};
 use crate::ws::ws_bot_handler;
 
 // ── App state ─────────────────────────────────────────────────────────────────
@@ -149,6 +149,18 @@ pub struct AppState {
     /// Updated by every finished match (headless and live).  Exposed via
     /// `GET /ladder/standings` (public) and `POST /ladder/reset` (facilitator-gated).
     pub ladder: Arc<Ladder>,
+
+    /// Reversible bot-disable set (issue 13).
+    ///
+    /// Written by `POST /admin/bots/{team}/disable` and cleared by `.../enable`.
+    /// Shared with the resolver — disabled teams fall back to Default Bot.
+    pub disabled_store: Arc<DisabledStore>,
+
+    /// Custom Default Bot artifact (issue 13).
+    ///
+    /// When set, resolver Priority-3 instantiates a WASM driver from this
+    /// artifact instead of the built-in heuristic.
+    pub default_bot_store: Arc<DefaultBotStore>,
 }
 
 // ── Router configuration ──────────────────────────────────────────────────────
@@ -190,6 +202,10 @@ pub struct RouterConfig {
     /// Retain the `Arc` clone before passing to [`build_router_config`] if you
     /// need to inspect or seed the ladder in tests.
     pub ladder: Arc<Ladder>,
+    /// Reversible disabled-team set.  Defaults to a fresh [`DisabledStore`] in [`build_router`].
+    pub disabled_store: Arc<DisabledStore>,
+    /// Custom Default Bot artifact.  Defaults to a fresh (empty) [`DefaultBotStore`] in [`build_router`].
+    pub default_bot_store: Arc<DefaultBotStore>,
 }
 
 // ── Wire types ────────────────────────────────────────────────────────────────
@@ -505,6 +521,8 @@ pub fn build_router(event_password: String, registry: Arc<TokenRegistry>) -> Rou
         health_store: BotHealthStore::new(),
         dq_store: DqStore::new(),
         ladder: Ladder::new(),
+        disabled_store: DisabledStore::new(),
+        default_bot_store: DefaultBotStore::new(),
     })
 }
 
@@ -529,6 +547,8 @@ pub fn build_router_config(config: RouterConfig) -> Router {
         health_store: config.health_store,
         dq_store: config.dq_store,
         ladder: config.ladder,
+        disabled_store: config.disabled_store,
+        default_bot_store: config.default_bot_store,
     };
     Router::new()
         .route("/register", post(post_register))
@@ -560,6 +580,21 @@ pub fn build_router_config(config: RouterConfig) -> Router {
         // ── Issue 12: health & moderation ─────────────────────────────────
         .route("/admin/bots", get(admin::get_admin_bots))
         .route("/admin/bots/{team}/kick", post(admin::post_admin_kick_bot))
+        // ── Issue 13: bot/team management ─────────────────────────────────
+        .route("/admin/bots/{team}", post(admin::post_admin_upload_bot))
+        .route(
+            "/admin/bots/{team}/disable",
+            post(admin::post_admin_disable_bot),
+        )
+        .route(
+            "/admin/bots/{team}/enable",
+            post(admin::post_admin_enable_bot),
+        )
+        .route("/admin/default-bot", post(admin::post_admin_set_default_bot))
+        .route(
+            "/admin/default-bot",
+            delete(admin::delete_admin_default_bot),
+        )
         // ── Issue 10: TrueSkill ladder ────────────────────────────────────
         .route("/ladder/standings", get(get_ladder_standings))
         .route("/ladder/reset", post(post_ladder_reset))

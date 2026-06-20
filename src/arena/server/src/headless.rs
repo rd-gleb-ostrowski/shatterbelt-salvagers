@@ -41,7 +41,7 @@ use crate::pacer::NoopPacer;
 use crate::recording::{Recording, RecordingMeta, RecordingStore};
 use crate::resolver::{ConnectionResolver, Slot, WsConnectionRegistry};
 use crate::runner::{MatchOutcome, MatchRunner};
-use crate::store::WasmBotStore;
+use crate::store::{DefaultBotStore, DisabledStore, WasmBotStore};
 use crate::ws::obs_to_tick_json;
 
 // ── HeadlessResult ────────────────────────────────────────────────────────────
@@ -95,6 +95,10 @@ pub struct HeadlessRunner {
     dq_store: Option<Arc<crate::health::DqStore>>,
     /// Optional health store (issue 12): health entries are created per slot.
     health_store: Option<Arc<crate::health::BotHealthStore>>,
+    /// Optional disabled store (issue 13): disabled teams fall back to Default Bot.
+    disabled_store: Option<Arc<DisabledStore>>,
+    /// Optional custom Default Bot artifact (issue 13).
+    default_bot_store: Option<Arc<DefaultBotStore>>,
 }
 
 impl HeadlessRunner {
@@ -134,6 +138,8 @@ impl HeadlessRunner {
             seed_counter: AtomicU64::new(base_seed),
             dq_store: None,
             health_store: None,
+            disabled_store: None,
+            default_bot_store: None,
         })
     }
 
@@ -165,7 +171,28 @@ impl HeadlessRunner {
             seed_counter: AtomicU64::new(base_seed),
             dq_store: Some(dq_store),
             health_store: Some(health_store),
+            disabled_store: None,
+            default_bot_store: None,
         })
+    }
+
+    /// Attach management stores (issue 13) to an already-constructed runner.
+    ///
+    /// Consumes and returns `self` (builder pattern), so call after
+    /// [`new_with_health`](Self::new_with_health) before running matches.
+    pub fn with_management(
+        mut self: Arc<Self>,
+        disabled: Arc<DisabledStore>,
+        default_bot: Arc<DefaultBotStore>,
+    ) -> Arc<Self> {
+        // SAFETY: Arc::get_mut succeeds when there is exactly one strong
+        // reference, which is guaranteed here because we just constructed self
+        // and haven't shared it yet.
+        if let Some(inner) = Arc::get_mut(&mut self) {
+            inner.disabled_store = Some(disabled);
+            inner.default_bot_store = Some(default_bot);
+        }
+        self
     }
 
     /// Run one headless match, advancing the internal seed counter.
@@ -199,6 +226,13 @@ impl HeadlessRunner {
         // Wire moderation if stores are present (issue 12).
         if let (Some(dq), Some(hs)) = (self.dq_store.as_ref(), self.health_store.as_ref()) {
             resolver = resolver.with_moderation(Arc::clone(dq), Arc::clone(hs));
+        }
+
+        // Wire management stores if present (issue 13).
+        if let (Some(ds), Some(dbs)) =
+            (self.disabled_store.as_ref(), self.default_bot_store.as_ref())
+        {
+            resolver = resolver.with_management(Arc::clone(ds), Arc::clone(dbs));
         }
 
         // Build a temporary engine solely to extract tick-0 observations for

@@ -126,6 +126,8 @@ fn test_app(
         health_store,
         dq_store,
         ladder: arena_server::ladder::Ladder::new(),
+        disabled_store: arena_server::store::DisabledStore::new(),
+        default_bot_store: arena_server::store::DefaultBotStore::new(),
     })
 }
 

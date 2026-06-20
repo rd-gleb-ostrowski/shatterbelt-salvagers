@@ -14,6 +14,7 @@ use axum::{
     response::IntoResponse,
     Json,
 };
+use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 use uuid::Uuid;
@@ -251,6 +252,7 @@ pub async fn spawn_live_match(
         fuel_per_tick,
         DqStore::new(),
         BotHealthStore::new(),
+        None,
     );
     tokio::task::spawn_blocking(move || {
         run_live_controlled(
@@ -474,6 +476,10 @@ pub async fn post_admin_start_match(
                 seed,
                 Arc::clone(&state.dq_store),
                 Arc::clone(&state.health_store),
+            )
+            .with_management(
+                Arc::clone(&state.disabled_store),
+                Arc::clone(&state.default_bot_store),
             );
             let result = tokio::task::spawn_blocking(move || runner.run_one_seeded(seed))
                 .await
@@ -659,6 +665,7 @@ fn spawn_registered_live_match(
             10_000_000,
             Arc::clone(&state.dq_store),
             Arc::clone(&state.health_store),
+            Some(&state),
         );
         let pacer: Box<dyn TickPacer + Send> = Box::new(ControlledPacer::new(handle.clone()));
         let registry = Arc::clone(&state.match_registry);
@@ -712,9 +719,16 @@ fn resolve_drivers(
     fuel_per_tick: u64,
     dq_store: Arc<DqStore>,
     health_store: Arc<BotHealthStore>,
+    state: Option<&AppState>,
 ) -> Vec<Box<dyn BotDriver>> {
-    let resolver = ConnectionResolver::new(ws_registry, wasm_store, fuel_per_tick)
+    let mut resolver = ConnectionResolver::new(ws_registry, wasm_store, fuel_per_tick)
         .with_moderation(dq_store, health_store);
+    if let Some(s) = state {
+        resolver = resolver.with_management(
+            Arc::clone(&s.disabled_store),
+            Arc::clone(&s.default_bot_store),
+        );
+    }
     let engine0 = Engine::new(seed, params.clone(), specs.to_vec());
     let slots: Vec<Slot> = teams
         .iter()
@@ -794,4 +808,138 @@ fn default_specs(params: &Params, count: usize) -> Vec<ShipSpec> {
             }
         })
         .collect()
+}
+
+// ── Bot management handlers (issue 13) ───────────────────────────────────────
+
+/// `POST /admin/bots/{team}` — facilitator-gated WASM upload on behalf of a team.
+///
+/// Identical semantics to `POST /bots` but authenticated with the facilitator
+/// password instead of a team token.  Allows the facilitator to upload/replace
+/// a bot without needing the team's credentials.
+///
+/// # Responses
+///
+/// | Status | Meaning |
+/// |--------|---------|
+/// | **200 OK** | Artifact stored (or replaced). |
+/// | **400 Bad Request** | Body does not start with WASM magic bytes. |
+/// | **401 Unauthorized** | Wrong or absent facilitator auth. |
+pub async fn post_admin_upload_bot(
+    State(state): State<AppState>,
+    Path(team): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> impl IntoResponse {
+    if let Err(status) = check_facilitator_auth(&headers, &state.facilitator_password) {
+        return status.into_response();
+    }
+    if body.len() < 4 || &body[..4] != b"\0asm" {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "body must be a valid WASM artifact (missing magic bytes \\0asm)"})),
+        )
+            .into_response();
+    }
+    state.wasm_store.store(&team, body.to_vec());
+    StatusCode::OK.into_response()
+}
+
+/// `POST /admin/bots/{team}/disable` — reversibly disable a team's bot.
+///
+/// A disabled team's slot resolves to the Default Bot in subsequent match
+/// resolutions.  Re-enabling (via `.../enable`) restores normal priority.
+///
+/// # Responses
+///
+/// | Status | Meaning |
+/// |--------|---------|
+/// | **200 OK** | Team marked as disabled. |
+/// | **401 Unauthorized** | Wrong or absent facilitator auth. |
+pub async fn post_admin_disable_bot(
+    State(state): State<AppState>,
+    Path(team): Path<String>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(status) = check_facilitator_auth(&headers, &state.facilitator_password) {
+        return status;
+    }
+    state.disabled_store.disable(&team);
+    StatusCode::OK
+}
+
+/// `POST /admin/bots/{team}/enable` — re-enable a previously disabled team's bot.
+///
+/// Restores normal WS → WASM → Default resolution for the team.
+///
+/// # Responses
+///
+/// | Status | Meaning |
+/// |--------|---------|
+/// | **200 OK** | Team re-enabled (no-op if not disabled). |
+/// | **401 Unauthorized** | Wrong or absent facilitator auth. |
+pub async fn post_admin_enable_bot(
+    State(state): State<AppState>,
+    Path(team): Path<String>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(status) = check_facilitator_auth(&headers, &state.facilitator_password) {
+        return status;
+    }
+    state.disabled_store.enable(&team);
+    StatusCode::OK
+}
+
+/// `POST /admin/default-bot` — set/replace the custom Default Bot artifact.
+///
+/// When set, the resolver's Priority-3 (Default Bot) path instantiates a
+/// WASM driver from this artifact instead of the built-in heuristic.  On WASM
+/// instantiation failure the built-in driver is used so matches never abort.
+///
+/// # Responses
+///
+/// | Status | Meaning |
+/// |--------|---------|
+/// | **200 OK** | Artifact stored. |
+/// | **400 Bad Request** | Body does not start with WASM magic bytes. |
+/// | **401 Unauthorized** | Wrong or absent facilitator auth. |
+pub async fn post_admin_set_default_bot(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> impl IntoResponse {
+    if let Err(status) = check_facilitator_auth(&headers, &state.facilitator_password) {
+        return status.into_response();
+    }
+    if body.len() < 4 || &body[..4] != b"\0asm" {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "body must be a valid WASM artifact (missing magic bytes \\0asm)"})),
+        )
+            .into_response();
+    }
+    state.default_bot_store.set(body.to_vec());
+    StatusCode::OK.into_response()
+}
+
+/// `DELETE /admin/default-bot` — clear the custom Default Bot.
+///
+/// Future matches revert to the built-in [`crate::bot::DefaultBotDriver`]
+/// heuristic for unoccupied slots.
+///
+/// # Responses
+///
+/// | Status | Meaning |
+/// |--------|---------|
+/// | **200 OK** | Custom Default Bot cleared. |
+/// | **401 Unauthorized** | Wrong or absent facilitator auth. |
+pub async fn delete_admin_default_bot(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(status) = check_facilitator_auth(&headers, &state.facilitator_password) {
+        return status;
+    }
+    state.default_bot_store.clear();
+    StatusCode::OK
 }

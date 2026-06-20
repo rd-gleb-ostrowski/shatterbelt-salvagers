@@ -62,6 +62,8 @@ fn app_with_store() -> (axum::Router, Arc<TokenRegistry>, Arc<WasmBotStore>) {
         health_store: arena_server::health::BotHealthStore::new(),
         dq_store: arena_server::health::DqStore::new(),
         ladder: arena_server::ladder::Ladder::new(),
+        disabled_store: arena_server::store::DisabledStore::new(),
+        default_bot_store: arena_server::store::DefaultBotStore::new(),
     });
     (app, registry, store)
 }

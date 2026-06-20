@@ -49,6 +49,8 @@ fn test_app_with_ladder(ladder: Arc<Ladder>) -> axum::Router {
         health_store: arena_server::health::BotHealthStore::new(),
         dq_store: arena_server::health::DqStore::new(),
         ladder,
+        disabled_store: arena_server::store::DisabledStore::new(),
+        default_bot_store: arena_server::store::DefaultBotStore::new(),
     })
 }
 

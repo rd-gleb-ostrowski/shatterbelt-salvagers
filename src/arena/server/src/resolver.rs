@@ -32,7 +32,7 @@ use arena_engine::Params;
 use crate::bot::DefaultBotDriver;
 use crate::health::{BotHealthEntry, BotHealthStore, DqStore, ExclusionDriver};
 use crate::runner::BotDriver;
-use crate::store::WasmBotStore;
+use crate::store::{DefaultBotStore, DisabledStore, WasmBotStore};
 use crate::wasm_host::WasmBotDriver;
 
 // ── WsConnectionRegistry ─────────────────────────────────────────────────────
@@ -168,6 +168,13 @@ pub struct ConnectionResolver {
     /// Optional health store — a `BotHealthEntry` is registered per slot
     /// when this is `Some`.  When `None`, health is not tracked.
     health_store: Option<Arc<BotHealthStore>>,
+    /// Optional disabled store — teams in this set resolve to Default Bot.
+    /// When `None`, no disable check is applied (backward-compat with tests).
+    disabled_store: Option<Arc<DisabledStore>>,
+    /// Optional custom Default Bot artifact — when set, Priority-3 resolution
+    /// attempts to instantiate a WASM driver from this artifact instead of the
+    /// built-in heuristic.  When `None`, the built-in DefaultBotDriver is used.
+    default_bot_store: Option<Arc<DefaultBotStore>>,
 }
 
 impl ConnectionResolver {
@@ -189,6 +196,8 @@ impl ConnectionResolver {
             fuel_per_tick,
             dq_store: None,
             health_store: None,
+            disabled_store: None,
+            default_bot_store: None,
         }
     }
 
@@ -202,6 +211,23 @@ impl ConnectionResolver {
     pub fn with_moderation(mut self, dq: Arc<DqStore>, health: Arc<BotHealthStore>) -> Self {
         self.dq_store = Some(dq);
         self.health_store = Some(health);
+        self
+    }
+
+    /// Attach disable and default-bot management stores (issue 13).
+    ///
+    /// When set:
+    /// - Disabled teams fall back to the Default Bot (reversible; re-enabling
+    ///   restores normal WS → WASM → Default priority).
+    /// - An uploaded Default Bot artifact is used instead of the built-in
+    ///   heuristic when no team-specific WS/WASM driver is chosen.
+    pub fn with_management(
+        mut self,
+        disabled: Arc<DisabledStore>,
+        default_bot: Arc<DefaultBotStore>,
+    ) -> Self {
+        self.disabled_store = Some(disabled);
+        self.default_bot_store = Some(default_bot);
         self
     }
 
@@ -231,6 +257,15 @@ impl ConnectionResolver {
                     Arc::clone(dq),
                     health,
                 ));
+            }
+        }
+
+        // If disable management is active and team is disabled → Default Bot
+        // (reversible fallback; no ExclusionDriver wrapping so re-enabling
+        // immediately restores WASM/WS resolution for the next match).
+        if let Some(ds) = &self.disabled_store {
+            if ds.is_disabled(&slot.team) {
+                return self.make_default_bot(slot, params);
             }
         }
 
@@ -287,7 +322,47 @@ impl ConnectionResolver {
             }
         }
 
-        // Priority 3 — Default Bot: built-in fallback, field always full.
+        // Priority 3 — Default Bot: built-in fallback (or custom WASM artifact).
+        self.make_default_bot(slot, params)
+    }
+
+    /// Build the Default Bot driver for `slot`.
+    ///
+    /// If a custom Default Bot artifact is stored, attempt to instantiate a
+    /// [`WasmBotDriver`] from it.  On failure (bad bytes, wasmtime error) fall
+    /// silently back to the built-in [`DefaultBotDriver`] so the match never
+    /// aborts.
+    fn make_default_bot(&self, slot: &Slot, params: &Params) -> Box<dyn BotDriver> {
+        // Try custom WASM default bot first.
+        if let Some(dbs) = &self.default_bot_store {
+            if let Some(bytes) = dbs.get() {
+                if let Ok(driver) =
+                    WasmBotDriver::new(&bytes, &slot.tick0_obs_json, self.fuel_per_tick)
+                {
+                    // Health tracking for the custom default bot.
+                    let health = self.make_health(&slot.team, "wasm");
+                    let mut driver = driver;
+                    if let Some(h) = health {
+                        driver.set_health(Arc::clone(&h));
+                        let dq = self
+                            .dq_store
+                            .as_ref()
+                            .cloned()
+                            .unwrap_or_else(DqStore::new);
+                        return Box::new(ExclusionDriver::new(
+                            &slot.team,
+                            Box::new(driver),
+                            dq,
+                            Some(h),
+                        ));
+                    }
+                    return Box::new(driver);
+                }
+                // Fall through: bad artifact → built-in heuristic below.
+            }
+        }
+
+        // Built-in heuristic fallback.
         let health = self.make_health(&slot.team, "default");
         let inner: Box<dyn BotDriver> = Box::new(DefaultBotDriver::new(params));
         if let Some(dq) = &self.dq_store {
