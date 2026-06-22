@@ -126,7 +126,7 @@ export class SoundEngine {
           this.playLanceZap(cue.pos?.x);
           break;
         case "thrust":
-          if (cue.shipId) thrustingNow.add(cue.shipId);
+          //if (cue.shipId) thrustingNow.add(cue.shipId);
           break;
         case "matchStart":
           this.playMatchStart();
@@ -414,6 +414,10 @@ export class SoundEngine {
       osc.start(t);
       osc.stop(t + 0.45);
     });
+    for (const [id, osc] of this.thrustNodes) {
+        try { osc.stop(); } catch { /* already stopped */ }
+        this.thrustNodes.delete(id);
+    }
   }
 }
 

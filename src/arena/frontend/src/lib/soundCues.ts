@@ -151,7 +151,7 @@ export function deriveSoundCues(frame: GodViewFrame): SoundCue[] {
 
   for (const ship of frame.ships) {
     if (ship.alive && isThrusting(ship)) {
-      cues.push({ kind: "thrust", shipId: ship.id, pos: ship.pos });
+      //cues.push({ kind: "thrust", shipId: ship.id, pos: ship.pos });
     }
   }
 
