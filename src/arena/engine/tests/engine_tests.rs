@@ -182,8 +182,8 @@ fn params_carry_params_py_values() {
 
     // collisions
     assert_eq!(p.coll_threshold, 4.0_f32);
-    assert_eq!(p.k_asteroid, 5.0_f32);
-    assert_eq!(p.k_ram, 3.0_f32);
+    assert_eq!(p.k_asteroid, 10.0_f32);
+    assert_eq!(p.k_ram, 7.0_f32);
     assert_eq!(p.k_wall, 3.0_f32);
 
     // relics / scoring / respawn
@@ -201,8 +201,8 @@ fn params_carry_params_py_values() {
     assert_eq!(p.afterburner_speed_mult, 1.5_f32);
     assert_eq!(p.bulwark_immunity, 45);
     assert_eq!(p.singularity_radius, 200.0_f32);
-    assert_eq!(p.singularity_pull, 0.6_f32);
-    assert_eq!(p.singularity_dur, 60);
+    assert_eq!(p.singularity_pull, 0.8_f32);
+    assert_eq!(p.singularity_dur, 80);
     assert_eq!(p.mine_arm, 15);
     assert_eq!(p.mine_radius, 40.0_f32);
     assert_eq!(p.mine_damage, 60.0_f32);

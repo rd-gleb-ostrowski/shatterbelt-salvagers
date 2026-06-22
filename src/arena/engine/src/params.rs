@@ -121,8 +121,8 @@ impl Default for Params {
             hull_max: 100.0,
 
             coll_threshold: 4.0,
-            k_asteroid: 5.0,
-            k_ram: 3.0,
+            k_asteroid: 10.0,
+            k_ram: 7.0,
             k_wall: 3.0,
 
             relic_value: 1.0,
