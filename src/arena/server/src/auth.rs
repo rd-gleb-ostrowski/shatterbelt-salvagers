@@ -75,4 +75,8 @@ impl TokenRegistry {
     pub fn resolve(&self, token: &str) -> Option<String> {
         self.tokens.read().unwrap().get(token).cloned()
     }
+
+    pub fn registered_teams(&self) -> Vec<String> {
+        self.team_to_token.read().unwrap().keys().cloned().collect()
+    }
 }

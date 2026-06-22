@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{
         atomic::{AtomicBool, AtomicU32, Ordering},
         Arc, Condvar, Mutex,
@@ -20,16 +20,7 @@ use tokio::sync::watch;
 use uuid::Uuid;
 
 use crate::{
-    headless::HeadlessRunner,
-    health::{BotHealthStore, DqStore},
-    observer::ObserverHub,
-    pacer::NoopPacer,
-    recording::{Recording, RecordingMeta, RecordingStore},
-    resolver::{ConnectionResolver, Slot, WsConnectionRegistry},
-    routes::AppState,
-    runner::{BotDriver, MatchOutcome, MatchRunner, TickPacer},
-    store::WasmBotStore,
-    ws::{obs_to_tick_json, MatchEndMsg, MatchResultsJson, MatchStartMsg},
+    auth::TokenRegistry, headless::HeadlessRunner, health::{BotHealthStore, DqStore}, observer::ObserverHub, pacer::NoopPacer, recording::{Recording, RecordingMeta, RecordingStore}, resolver::{ConnectionResolver, Slot, WsConnectionRegistry}, routes::AppState, runner::{BotDriver, MatchOutcome, MatchRunner, TickPacer}, store::WasmBotStore, ws::{MatchEndMsg, MatchResultsJson, MatchStartMsg, obs_to_tick_json},
 };
 
 pub struct MatchControlHandle {
@@ -232,7 +223,7 @@ fn run_live_controlled_with_id(
 pub async fn spawn_live_match(
     seed: u64,
     params: Params,
-    specs: Vec<ShipSpec>,
+    mut specs: Vec<ShipSpec>,
     teams: Vec<String>,
     wasm_store: Arc<WasmBotStore>,
     ws_registry: Arc<WsConnectionRegistry>,
@@ -256,8 +247,10 @@ pub async fn spawn_live_match(
         None,
     );
     // Send matchStart envelope to every connected WS bot in this roster.
-    let match_start_json =
-        serde_json::to_string(&MatchStartMsg { type_: "matchStart" }).unwrap_or_default();
+    let match_start_json = serde_json::to_string(&MatchStartMsg {
+        type_: "matchStart",
+    })
+    .unwrap_or_default();
     for team in &teams {
         if let Some(session) = ws_registry.get(team) {
             session.try_send_envelope(match_start_json.clone());
@@ -265,6 +258,9 @@ pub async fn spawn_live_match(
     }
     let ws_reg_for_end = Arc::clone(&ws_registry);
     let teams_for_end = teams.clone();
+    for (i, team) in teams.iter().enumerate() {
+        specs[i].id = team.clone();
+    }
     tokio::task::spawn_blocking(move || {
         let result = run_live_controlled(
             seed,
@@ -327,12 +323,13 @@ pub struct ExhibitionConfig {
     pub teams: Vec<String>,
     pub wasm_store: Arc<WasmBotStore>,
     pub ws_registry: Arc<WsConnectionRegistry>,
+    pub registry: Arc<TokenRegistry>,
     pub fuel_per_tick: u64,
     pub observer_hub: ObserverHub,
     pub recording_store: Arc<RecordingStore>,
     pub tps: u32,
     pub max_matches: u32,
-    pub pacer_factory: Arc<dyn Fn() -> Box<dyn TickPacer + Send> + Send + Sync>,
+    pub pacer_factory: Arc<dyn Fn(MatchControlHandle) -> Box<dyn TickPacer + Send> + Send + Sync>,
 }
 
 pub struct ExhibitionSupervisor {
@@ -412,7 +409,8 @@ async fn exhibition_loop(
         // Recompute the roster each iteration so bots that connect later
         // are picked up by the next match.
         let teams = if config.teams.is_empty() {
-            live_teams(&config.ws_registry)
+            // live_teams(&config.ws_registry)
+            config.registry.registered_teams()
         } else {
             config.teams.clone()
         };
@@ -430,8 +428,8 @@ async fn exhibition_loop(
             config.fuel_per_tick,
             config.observer_hub.clone(),
             Arc::clone(&config.recording_store),
-            handle,
-            (config.pacer_factory)(),
+            handle.clone(),
+            (config.pacer_factory)(handle),
         )
         .await;
         let _ = join.await;
@@ -553,26 +551,39 @@ pub async fn post_admin_start_match(
             let live_roster = if explicit_teams.is_some() {
                 normalized_teams(explicit_teams)
             } else {
-                live_teams(&state.ws_registry)
+                //live_teams(&state.ws_registry)
+                state.registry.registered_teams()
             };
-            let specs = default_specs(&params, live_roster.len());
-            state
-                .match_registry
-                .register(match_id.clone(), handle.clone());
-            spawn_registered_live_match(
-                match_id.clone(),
-                state,
-                seed,
-                params,
-                specs,
-                live_roster,
-                handle,
-            );
-            Json(StartMatchResponse {
-                match_id,
-                mode: "live".to_owned(),
-            })
-            .into_response()
+            if live_roster.len() < 2 {
+                StatusCode::BAD_REQUEST.into_response()
+            } else {
+                let wasm_teams = state.wasm_store.stored_teams();
+
+                let teams_without_bot = {
+                    let exclude: HashSet<_> = wasm_teams.iter().chain(live_roster.iter()).collect();
+                    let mut registered_teams = state.registry.registered_teams();
+                    registered_teams.retain(|x| !exclude.contains(x));
+                    registered_teams
+                };
+                let specs = default_specs(&params, live_roster.len());
+                state
+                    .match_registry
+                    .register(match_id.clone(), handle.clone());
+                spawn_registered_live_match(
+                    match_id.clone(),
+                    state,
+                    seed,
+                    params,
+                    specs,
+                    live_roster,
+                    handle,
+                );
+                Json(StartMatchResponse {
+                    match_id,
+                    mode: "live".to_owned(),
+                })
+                .into_response()
+            }
         }
         _ => StatusCode::BAD_REQUEST.into_response(),
     }
@@ -680,6 +691,7 @@ pub async fn post_admin_exhibition_start(
         teams: vec![],
         wasm_store: Arc::clone(&state.wasm_store),
         ws_registry: Arc::clone(&state.ws_registry),
+        registry: Arc::clone(&state.registry),
         fuel_per_tick: 10_000_000,
         observer_hub: state.observer_hub.clone(),
         recording_store: Arc::clone(&state.recording_store),
@@ -712,14 +724,16 @@ fn spawn_registered_live_match(
     state: AppState,
     seed: u64,
     params: Params,
-    specs: Vec<ShipSpec>,
+    mut specs: Vec<ShipSpec>,
     teams: Vec<String>,
     handle: MatchControlHandle,
 ) {
     tokio::spawn(async move {
         // Send matchStart envelope to every connected WS bot in this roster.
-        let match_start_json =
-            serde_json::to_string(&MatchStartMsg { type_: "matchStart" }).unwrap_or_default();
+        let match_start_json = serde_json::to_string(&MatchStartMsg {
+            type_: "matchStart",
+        })
+        .unwrap_or_default();
         for team in &teams {
             if let Some(session) = state.ws_registry.get(team) {
                 session.try_send_envelope(match_start_json.clone());
@@ -742,7 +756,9 @@ fn spawn_registered_live_match(
         let pacer: Box<dyn TickPacer + Send> = Box::new(ControlledPacer::new(handle.clone()));
         let registry = Arc::clone(&state.match_registry);
         let id_for_remove = match_id.clone();
-
+        for (i, team) in teams.iter().enumerate() {
+            specs[i].id = team.clone();
+        }
         // Build ship→team map before specs are moved into spawn_blocking.
         let ship_to_team: HashMap<String, String> = specs
             .iter()
@@ -894,6 +910,9 @@ fn normalized_teams(teams: Option<Vec<String>>) -> Vec<String> {
 /// of 2 slots with placeholder team names ("team-a", "team-b") so the match
 /// field is always valid.  Connected bots that share a name with a placeholder
 /// are not duplicated.
+// TODO: Remove idiotic placeholder BS.
+//  Gather WS & WASM bots
+//  Resolve to actual fucking team names
 fn live_teams(ws_registry: &WsConnectionRegistry) -> Vec<String> {
     let mut teams = ws_registry.connected_teams();
     for placeholder in &["team-a", "team-b"] {
@@ -1209,7 +1228,10 @@ pub async fn get_admin_ladder_runner(
     if let Err(status) = check_facilitator_auth(&headers, &state.facilitator_password) {
         return status.into_response();
     }
-    Json(LadderRunnerStatus { running: state.ladder_runner.is_running() }).into_response()
+    Json(LadderRunnerStatus {
+        running: state.ladder_runner.is_running(),
+    })
+    .into_response()
 }
 
 /// `POST /admin/ladder/runner/start` — start the headless ladder loop (idempotent).

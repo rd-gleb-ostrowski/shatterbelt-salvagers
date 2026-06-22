@@ -65,6 +65,10 @@ impl WasmBotStore {
     pub fn get(&self, team: &str) -> Option<Vec<u8>> {
         self.artifacts.read().unwrap().get(team).cloned()
     }
+
+    pub fn stored_teams(&self)-> Vec<String> {
+        self.artifacts.read().unwrap().keys().cloned().collect()
+    }
 }
 
 // ── DisabledStore ─────────────────────────────────────────────────────────────
