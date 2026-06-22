@@ -9,7 +9,7 @@ use std::{
 
 use arena_engine::{Engine, Params, ShipClass, ShipSpec, Vec2};
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
     Json,
@@ -655,8 +655,16 @@ pub async fn get_admin_exhibition(
     .into_response()
 }
 
+#[derive(Debug, Deserialize)]
+
+pub struct ExhibitionStartQuery {
+    #[serde(default)]
+    fast: Option<bool>,
+}
+
 pub async fn post_admin_exhibition_start(
     State(state): State<AppState>,
+    Query(query): Query<ExhibitionStartQuery>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
     if let Err(status) = check_facilitator_auth(&headers, &state.facilitator_password) {
@@ -664,6 +672,8 @@ pub async fn post_admin_exhibition_start(
     }
     // `teams` is empty — the exhibition loop recomputes the roster from
     // connected bots at the start of each match iteration.
+    // TODO: add param for NoopPacer
+    let fast = query.fast.is_some_and(|x| x);
     state.exhibition.start(ExhibitionConfig {
         seed: state.match_seed,
         params: state.match_params.clone(),
@@ -675,7 +685,13 @@ pub async fn post_admin_exhibition_start(
         recording_store: Arc::clone(&state.recording_store),
         tps: 30,
         max_matches: 0,
-        pacer_factory: Arc::new(|| Box::new(NoopPacer)),
+        pacer_factory: Arc::new(move |h| {
+            if fast {
+                Box::new(NoopPacer)
+            } else {
+                Box::new(ControlledPacer::new(h))
+            }
+        }),
     });
     StatusCode::OK
 }

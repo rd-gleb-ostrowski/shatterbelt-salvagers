@@ -755,8 +755,8 @@ export function createAdminClient(
       return { ok: false, running: false, matchCount: 0, unauthorized: false };
     },
 
-    async startExhibition(): Promise<ExhibitionActionResult> {
-      const res = await post("/admin/exhibition/start");
+    async startExhibition(fast: boolean = false): Promise<ExhibitionActionResult> {
+      const res = await post(`/admin/exhibition/start?fast=${fast}`);
       return mapAction(res.status);
     },
 
