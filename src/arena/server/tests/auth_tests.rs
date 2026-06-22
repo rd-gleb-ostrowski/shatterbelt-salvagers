@@ -25,12 +25,12 @@ const EVENT_PASSWORD: &str = "test-secret";
 
 fn app() -> axum::Router {
     let registry = TokenRegistry::new();
-    build_router(EVENT_PASSWORD.to_owned(), registry)
+    build_router(EVENT_PASSWORD.to_owned(), registry, false)
 }
 
 fn app_with_registry() -> (axum::Router, std::sync::Arc<TokenRegistry>) {
     let registry = TokenRegistry::new();
-    let app = build_router(EVENT_PASSWORD.to_owned(), registry.clone());
+    let app = build_router(EVENT_PASSWORD.to_owned(), registry.clone(), false);
     (app, registry)
 }
 

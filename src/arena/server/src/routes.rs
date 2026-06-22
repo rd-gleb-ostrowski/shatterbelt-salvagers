@@ -519,7 +519,7 @@ async fn post_ladder_reset(
 ///
 /// For WS tests that need a short match or fast deadline, use
 /// [`build_router_config`] with a [`RouterConfig`] instead.
-pub fn build_router(event_password: String, registry: Arc<TokenRegistry>) -> Router {
+pub fn build_router(event_password: String, registry: Arc<TokenRegistry>, collision_enabled: bool) -> Router {
     build_router_config(RouterConfig {
         event_password,
         facilitator_password: String::new(),
@@ -528,7 +528,10 @@ pub fn build_router(event_password: String, registry: Arc<TokenRegistry>) -> Rou
         ws_registry: WsConnectionRegistry::new(),
         tick_deadline: Duration::from_millis(33),
         match_seed: 42,
-        match_params: Params::default(),
+        match_params: Params {
+            collision_enabled,
+            ..Default::default()
+        },
         observer_hub: ObserverHub::new(),
         recording_store: RecordingStore::new(),
         health_store: BotHealthStore::new(),
@@ -684,7 +687,10 @@ pub fn build_app_with_store(
         ws_registry: WsConnectionRegistry::new(),
         tick_deadline: Duration::from_millis(33),
         match_seed: 42,
-        match_params: Params::default(),
+        match_params: Params {
+            collision_enabled: true,
+            ..Default::default()
+        },
         observer_hub: ObserverHub::new(),
         recording_store,
         health_store: BotHealthStore::new(),
