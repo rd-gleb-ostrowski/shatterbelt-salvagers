@@ -8,7 +8,11 @@
 
 use std::f32::consts::PI;
 
-use arena_engine::{Intent, Observation, Params};
+use arena_engine::{
+    rand::RngExt,
+    rand_pcg::{rand_core::SeedableRng, Pcg64},
+    Intent, Observation, Params, Vec2,
+};
 
 use crate::runner::BotDriver;
 
@@ -115,29 +119,35 @@ impl BotDriver for DefaultBotDriver {
             (0.1, 1.0)
         };
 
+        let ship_target = obs.ships.iter().filter(|sh| sh.alive).min_by(|a, b| {
+            dist(a.pos.x, a.pos.y, s.pos.x, s.pos.y)
+                .partial_cmp(&dist(b.pos.x, b.pos.y, s.pos.x, s.pos.y))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         // Fire when roughly aimed at the nearest live enemy and have aether.
-        let fire = obs
-            .ships
-            .iter()
-            .filter(|sh| sh.alive)
-            .min_by(|a, b| {
-                dist(a.pos.x, a.pos.y, s.pos.x, s.pos.y)
-                    .partial_cmp(&dist(b.pos.x, b.pos.y, s.pos.x, s.pos.y))
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-            .is_some_and(|e| {
-                let d = dist(e.pos.x, e.pos.y, s.pos.x, s.pos.y);
-                let ea = (e.pos.y - s.pos.y).atan2(e.pos.x - s.pos.x);
-                let aim_err = norm_angle(ea - s.heading).abs();
-                aim_err < 0.15 && d < self.proj_range && s.aether.cur >= self.shot_cost
-            });
-
+        let fire = ship_target.is_some_and(|e| {
+            let d = dist(e.pos.x, e.pos.y, s.pos.x, s.pos.y);
+            let ea = (e.pos.y - s.pos.y).atan2(e.pos.x - s.pos.x);
+            let aim_err = norm_angle(ea - s.heading).abs();
+            aim_err < 0.15 && d < self.proj_range && s.aether.cur >= self.shot_cost
+        });
         Some(Intent {
             turn: Some(turn),
             thrust: Some(thrust),
             fire: Some(fire),
-            sigil: None,
-            sigil_target: None,
+            // Dispatch any sigil held at target, if exists, or randomly in area
+            sigil: obs.self_view.sigil.as_ref().map(|_| true),
+            sigil_target: ship_target.map(|s| s.pos).or_else(|| {
+                #[allow(clippy::cast_possible_truncation)]
+                #[allow(clippy::cast_sign_loss)]
+                let mut rng = Pcg64::seed_from_u64(
+                    obs.seed + u64::from(obs.tick) + obs.self_view.pos.x as u64 + obs.self_view.pos.y as u64 + obs.self_view.ang_vel as u64,
+                );
+                Some(Vec2::new(
+                    rng.random_range(0f32..obs.arena.width),
+                    rng.random_range(0f32..obs.arena.height),
+                ))
+            }),
         })
     }
 }
