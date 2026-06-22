@@ -33,6 +33,7 @@ export interface AdminSession {
 // ── Module-level state ────────────────────────────────────────────────────────
 
 let _session: AdminSession | null = null;
+const ADMIN_PW_KEY = "shatterbeltSalvagersAdminPw"
 
 // ── API ───────────────────────────────────────────────────────────────────────
 
@@ -45,6 +46,7 @@ let _session: AdminSession | null = null;
  */
 export function setSession(password: string, client: AdminClient): AdminSession {
   _session = { password, client };
+  localStorage.setItem(ADMIN_PW_KEY, password)
   return _session;
 }
 
@@ -65,4 +67,9 @@ export function getSession(): AdminSession | null {
  */
 export function clearSession(): void {
   _session = null;
+  localStorage.removeItem(ADMIN_PW_KEY)
+}
+
+export function getStoredPassword(): string | null {
+  return localStorage.getItem(ADMIN_PW_KEY)
 }

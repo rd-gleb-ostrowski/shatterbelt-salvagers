@@ -14,7 +14,7 @@
 
 import { createAdminClient, type BotHealthSnapshot } from "./lib/adminClient.ts";
 import type { StartMatchResult, LadderStanding, RecordingListItem } from "./lib/adminClient.ts";
-import { setSession, getSession, clearSession } from "./session.ts";
+import { setSession, getSession, clearSession, getStoredPassword } from "./session.ts";
 import {
   formatLastSeen,
   formatConnected,
@@ -1305,4 +1305,25 @@ function getApp(): HTMLElement {
   return app;
 }
 
-renderSignIn();
+try {
+  const pw = getStoredPassword()
+  if (pw !== null) {
+    const client = createAdminClient(BASE_URL, pw);
+    const result = await client.verifyAuth();
+    if (!result.ok) {
+      const msg = result.unauthorized
+        ? "Stall password cleared — access denied."
+        : "Could not reach the server. Cleared stored password";
+      clearSession();
+      renderSignIn(msg);
+    } else {
+      setSession(pw, client);
+      renderDashboard();
+    }
+  } else {
+    renderSignIn();
+  }
+} catch {
+  clearSession();
+  renderSignIn("Network error — could not connect to the server.");
+}
