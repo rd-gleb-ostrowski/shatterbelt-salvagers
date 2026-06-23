@@ -387,30 +387,32 @@ pub async fn consume_headless_results(
     teams: &[String],
 ) {
     while let Some(result) = rx.recv().await {
-        let teams_snapshot = teams.to_vec();
+        // let teams_snapshot = teams.to_vec();
         // Build a ship→competitor map from the runner's teams list.
         // specs[i].id corresponds to teams[i]; the HeadlessResult's
         // outcome.scores are in the same order as specs.
-        let scores_with_competitors: Vec<(ShipId, f32)> =
-            result.outcome.scores.clone();
+        // let scores_with_competitors: Vec<(ShipId, f32)> =
+            // result.outcome.scores.clone();
 
         // We can't access specs directly here; instead we use the fact that
         // outcome.scores is in the same slot order as HeadlessRunner::specs
         // (and therefore HeadlessRunner::teams).  We build the mapping by
         // position: scores[i].0 (ShipId) → teams[i].
-        let ship_to_competitor_map: HashMap<String, String> = scores_with_competitors
-            .iter()
-            .enumerate()
-            .filter_map(|(i, (ship_id, _))| {
-                teams_snapshot.get(i).map(|team| (ship_id.to_string(), team.clone()))
-            })
-            .collect();
+        // let ship_to_competitor_map: HashMap<String, String> = scores_with_competitors
+        //     .iter()
+        //     .enumerate()
+        //     .filter_map(|(i, (ship_id, _))| {
+        //         teams_snapshot.get(i).map(|team| (ship_id.to_string(), team.clone()))
+        //     })
+        //     .collect();
 
         ladder.update_from_match(&result.outcome, |ship_id| {
-            ship_to_competitor_map
-                .get(&ship_id.to_string())
-                .cloned()
-                .unwrap_or_else(|| ship_id.to_string())
+            // Ship_id is team name for now
+            ship_id.to_owned()
+            // ship_to_competitor_map
+            //     .get(&ship_id.to_string())
+            //     .cloned()
+            //     .unwrap_or_else(|| ship_id.to_string())
         });
     }
 }
