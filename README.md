@@ -9,13 +9,13 @@ Bot starters (WASM & WebSocket) can be found in [./src/arena/bots](./src/arena/b
 To register a team and get a token for WS connection/WASM uploading:
 
 ```sh
-curl -XPOST $HOST/register -H 'Content-Type: application/json' -d '{"password":"$PASSWORD","team":"the-rippers"}'
+curl -XPOST https://shatterbelt.echoshell.xyz:18889/register -H 'Content-Type: application/json' -d '{"password":"$PASSWORD","team":"the-rippers"}'
 ```
 
-WS bots connect to `$HOST/ws`, WASM bots upload the payload to
+WS bots connect to `https://shatterbelt.echoshell.xyz:18889/ws`, WASM bots upload the payload to
 
 ```sh
-curl -X POST $HOST/bots -H "Authorization: Bearer $TOKEN_FROM_REGISTER" --data-binary @bot.wasm
+curl -X POST https://shatterbelt.echoshell.xyz:18889/bots -H "Authorization: Bearer $TOKEN_FROM_REGISTER" --data-binary @bot.wasm
 ```
 
 Potential useful endpoints for bot development:
