@@ -70,7 +70,6 @@ fun decide(obs: JSONObject): String {
 class BotListener(private val token: String, private val done: CountDownLatch) : WebSocket.Listener {
     private val buf = StringBuilder()
     private var sessionId = ""
-    @Volatile private var finished = false
 
     override fun onOpen(ws: WebSocket) {
         ws.request(Long.MAX_VALUE) // deliver all frames; no manual re-request
@@ -94,19 +93,17 @@ class BotListener(private val token: String, private val done: CountDownLatch) :
                 "tick" -> ws.sendText(decide(msg), true)
                 "matchEnd" -> {
                     println("[bot] matchEnd: ${msg.getJSONObject("results")}")
-                    finished = true
-                    ws.sendClose(WebSocket.NORMAL_CLOSURE, "done")
-                    done.countDown()
                 }
-                // matchStart and anything else need no reply.
+                "matchStart" -> {
+                    println("[bot] matchStart")
+                }
             }
         }
         return null
     }
 
     override fun onError(ws: WebSocket, error: Throwable) {
-        // After matchEnd the server closes the socket; ignore the resulting reset.
-        if (!finished) System.err.println("[bot] websocket error: ${error.message}")
+        System.err.println("[bot] websocket error: ${error.message}")
         done.countDown()
     }
 
