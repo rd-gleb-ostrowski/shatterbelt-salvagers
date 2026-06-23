@@ -2,6 +2,9 @@
 
 Arena bot shooter & collector source code.
 
+Highly experimental - it _seems_ to work somewhat, but it might or might not break in lots of ways.
+If you don't mind chaos, feel free to try & let the agent develop (a) bot(s) for it!
+
 [PROTOCOL.md](./src/arena/PROTOCOL.md) gives an overview about what is needed to know to write a bot.
 
 Bot starters (WASM & WebSocket) can be found in [./src/arena/bots](./src/arena/bots/).
