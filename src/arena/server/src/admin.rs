@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     sync::{
         atomic::{AtomicBool, AtomicU32, Ordering},
         Arc, Condvar, Mutex,
@@ -20,7 +20,17 @@ use tokio::sync::watch;
 use uuid::Uuid;
 
 use crate::{
-    auth::TokenRegistry, headless::HeadlessRunner, health::{BotHealthStore, DqStore}, observer::ObserverHub, pacer::NoopPacer, recording::{Recording, RecordingMeta, RecordingStore}, resolver::{ConnectionResolver, Slot, WsConnectionRegistry}, routes::AppState, runner::{BotDriver, MatchOutcome, MatchRunner, TickPacer}, store::WasmBotStore, ws::{MatchEndMsg, MatchResultsJson, MatchStartMsg, obs_to_tick_json},
+    auth::TokenRegistry,
+    headless::HeadlessRunner,
+    health::{BotHealthStore, DqStore},
+    observer::ObserverHub,
+    pacer::NoopPacer,
+    recording::{Recording, RecordingMeta, RecordingStore},
+    resolver::{ConnectionResolver, Slot, WsConnectionRegistry},
+    routes::AppState,
+    runner::{BotDriver, MatchOutcome, MatchRunner, TickPacer},
+    store::WasmBotStore,
+    ws::{obs_to_tick_json, MatchEndMsg, MatchResultsJson, MatchStartMsg},
 };
 
 pub struct MatchControlHandle {
@@ -409,12 +419,16 @@ async fn exhibition_loop(
         // Recompute the roster each iteration so bots that connect later
         // are picked up by the next match.
         let teams = if config.teams.is_empty() {
-            // live_teams(&config.ws_registry)
             config.registry.registered_teams()
         } else {
             config.teams.clone()
         };
-        let specs = default_specs(&config.params, teams.len());
+        if teams.len() < 2 {
+            eprintln!("Not enough teams to start exhibition match, trying again in a few...");
+            tokio::time::sleep(tokio::time::Duration::from_mins(1)).await;
+            continue;
+        }
+        let specs = default_specs(&config.params, &teams);
 
         let handle = MatchControlHandle::new(config.tps);
         *current_handle.lock().await = Some(handle.clone());
@@ -496,9 +510,19 @@ pub async fn post_admin_start_match(
     if let Some(max_ticks) = body.max_ticks {
         params.max_ticks = max_ticks;
     }
-    let explicit_teams = body.teams;
-    let teams = normalized_teams(explicit_teams.clone());
-    let specs = default_specs(&params, teams.len());
+    let teams = body
+        .teams
+        .unwrap_or_else(|| state.registry.registered_teams());
+    let specs = default_specs(&params, &teams);
+    if teams.len() < 2 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "At least 2 registered teams needed."
+            })),
+        )
+            .into_response();
+    }
 
     match body.mode.as_str() {
         "headless" => {
@@ -545,45 +569,23 @@ pub async fn post_admin_start_match(
             let tps = body.tps.unwrap_or(30);
             let handle = MatchControlHandle::new(tps);
             let match_id = Uuid::new_v4().to_string();
-            // For live matches, build the roster from connected WS bots when
-            // no explicit teams list is provided; fall back to placeholders so
-            // the field always has ≥ 2 slots.
-            let live_roster = if explicit_teams.is_some() {
-                normalized_teams(explicit_teams)
-            } else {
-                //live_teams(&state.ws_registry)
-                state.registry.registered_teams()
-            };
-            if live_roster.len() < 2 {
-                StatusCode::BAD_REQUEST.into_response()
-            } else {
-                let wasm_teams = state.wasm_store.stored_teams();
-
-                let teams_without_bot = {
-                    let exclude: HashSet<_> = wasm_teams.iter().chain(live_roster.iter()).collect();
-                    let mut registered_teams = state.registry.registered_teams();
-                    registered_teams.retain(|x| !exclude.contains(x));
-                    registered_teams
-                };
-                let specs = default_specs(&params, live_roster.len());
-                state
-                    .match_registry
-                    .register(match_id.clone(), handle.clone());
-                spawn_registered_live_match(
-                    match_id.clone(),
-                    state,
-                    seed,
-                    params,
-                    specs,
-                    live_roster,
-                    handle,
-                );
-                Json(StartMatchResponse {
-                    match_id,
-                    mode: "live".to_owned(),
-                })
-                .into_response()
-            }
+            state
+                .match_registry
+                .register(match_id.clone(), handle.clone());
+            spawn_registered_live_match(
+                match_id.clone(),
+                state,
+                seed,
+                params,
+                specs,
+                teams,
+                handle,
+            );
+            Json(StartMatchResponse {
+                match_id,
+                mode: "live".to_owned(),
+            })
+            .into_response()
         }
         _ => StatusCode::BAD_REQUEST.into_response(),
     }
@@ -683,7 +685,6 @@ pub async fn post_admin_exhibition_start(
     }
     // `teams` is empty — the exhibition loop recomputes the roster from
     // connected bots at the start of each match iteration.
-    // TODO: add param for NoopPacer
     let fast = query.fast.is_some_and(|x| x);
     state.exhibition.start(ExhibitionConfig {
         seed: state.match_seed,
@@ -757,7 +758,7 @@ fn spawn_registered_live_match(
         let registry = Arc::clone(&state.match_registry);
         let id_for_remove = match_id.clone();
         for (i, team) in teams.iter().enumerate() {
-            specs[i].id = team.clone();
+            specs[i].id.clone_from(team);
         }
         // Build ship→team map before specs are moved into spawn_blocking.
         let ship_to_team: HashMap<String, String> = specs
@@ -805,7 +806,7 @@ fn spawn_registered_live_match(
                 ship_to_team
                     .get(ship_id.as_str())
                     .cloned()
-                    .unwrap_or_else(|| ship_id.to_string())
+                    .unwrap_or_else(|| ship_id.clone())
             });
         }
 
@@ -895,15 +896,6 @@ pub async fn post_admin_kick_bot(
     StatusCode::OK
 }
 
-fn normalized_teams(teams: Option<Vec<String>>) -> Vec<String> {
-    let teams = teams.unwrap_or_else(|| vec!["team-a".to_owned(), "team-b".to_owned()]);
-    if teams.is_empty() {
-        vec!["team-a".to_owned(), "team-b".to_owned()]
-    } else {
-        teams
-    }
-}
-
 /// Build a live-match roster from currently-connected WS bots.
 ///
 /// Starts with `ws_registry.connected_teams()`, then fills up to a minimum
@@ -927,12 +919,14 @@ fn live_teams(ws_registry: &WsConnectionRegistry) -> Vec<String> {
     teams
 }
 
-fn default_specs(params: &Params, count: usize) -> Vec<ShipSpec> {
-    (0..count)
-        .map(|idx| {
-            let fraction = (idx + 1) as f32 / (count + 1) as f32;
+fn default_specs(params: &Params, teams: &[String]) -> Vec<ShipSpec> {
+    teams
+        .iter()
+        .enumerate()
+        .map(|(idx, t)| {
+            let fraction = (idx + 1) as f32 / (teams.len() + 1) as f32;
             ShipSpec {
-                id: format!("ship-{idx}"),
+                id: t.clone(),
                 class: ShipClass::Skiff,
                 anchor_pos: Vec2::new(params.arena_w * fraction, params.arena_h * 0.5),
             }
@@ -1133,9 +1127,8 @@ impl LadderRunner {
             return;
         }
 
-        // Fixed two-team roster (mirrors normalized_teams(None)).
-        let teams = vec!["team-a".to_owned(), "team-b".to_owned()];
-        let specs = default_specs(&state.match_params, teams.len());
+        let teams = state.registry.registered_teams();
+        let specs = default_specs(&state.match_params, &teams);
 
         let runner = HeadlessRunner::new_with_health(
             Arc::clone(&state.wasm_store),

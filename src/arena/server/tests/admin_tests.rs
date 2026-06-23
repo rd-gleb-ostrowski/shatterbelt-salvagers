@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::Duration};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use arena_engine::{Params, ShipClass, ShipSpec, Vec2};
 use arena_server::{
@@ -14,6 +14,7 @@ use arena_server::{
     store::WasmBotStore,
 };
 use axum::body::Body;
+use futures_util::future::join_all;
 use http::{Method, Request, StatusCode};
 use http_body_util::BodyExt;
 use serde_json::Value;
@@ -98,6 +99,24 @@ async fn request_json(
     app.oneshot(builder.body(body).unwrap()).await.unwrap()
 }
 
+async fn register_teams(app: axum::Router, teams: &[String]) -> HashMap<String, String> {
+    join_all(teams.iter().map(async |team| {
+        let r = request_json(
+            app.clone(),
+            Method::POST,
+            "/register",
+            None,
+            Some(serde_json::json!({ "password": EVENT_PASSWORD, "team": team })),
+        )
+        .await;
+        let token = response_json(r).await.get("token").unwrap().to_string();
+        (team.clone(), token)
+    }))
+    .await
+    .into_iter()
+    .collect()
+}
+
 async fn post_admin_matches(
     app: axum::Router,
     auth: Option<&str>,
@@ -138,7 +157,8 @@ async fn admin_endpoint_rejects_absent_facilitator_password() {
 async fn start_headless_match_returns_match_id() {
     let recording_store = RecordingStore::new();
     let app = test_app(recording_store.clone(), ObserverHub::new());
-
+    let teams = teams();
+    register_teams(app.clone(), &teams).await;
     let resp = post_admin_matches(
         app,
         Some(&format!("Facilitator {FACILITATOR_PASSWORD}")),
@@ -161,7 +181,8 @@ async fn start_live_match_returns_match_id_and_feeds_observer() {
     let observer_hub = ObserverHub::new();
     let mut observer_rx = observer_hub.subscribe();
     let app = test_app(recording_store, observer_hub);
-
+    let teams = teams();
+    register_teams(app.clone(), &teams).await;
     let resp = post_admin_matches(
         app,
         Some(&format!("Facilitator {FACILITATOR_PASSWORD}")),
@@ -246,6 +267,8 @@ async fn abort_stops_live_match() {
             ..Params::default()
         },
     );
+    let teams = teams();
+    register_teams(app.clone(), &teams).await;
 
     let start = post_admin_matches(
         app.clone(),
@@ -291,12 +314,13 @@ async fn exhibition_supervisor_restarts_match_on_completion() {
         teams: teams(),
         wasm_store: WasmBotStore::new(),
         ws_registry: WsConnectionRegistry::new(),
+        registry: TokenRegistry::new(),
         fuel_per_tick: 10_000_000,
         observer_hub: ObserverHub::new(),
         recording_store: RecordingStore::new(),
         tps: 0,
         max_matches: 2,
-        pacer_factory: Arc::new(|| Box::new(NoopPacer)),
+        pacer_factory: Arc::new(|_| Box::new(NoopPacer)),
     });
 
     tokio::time::timeout(Duration::from_millis(500), supervisor.join())
@@ -333,6 +357,8 @@ async fn event_password_does_not_grant_admin_access() {
 
 /// Run a headless match via the HTTP API and return the match_id.
 async fn run_headless_match(app: axum::Router) -> String {
+    let teams = teams();
+    register_teams(app.clone(), &teams).await;
     let resp = post_admin_matches(
         app,
         Some(&format!("Facilitator {FACILITATOR_PASSWORD}")),
@@ -372,7 +398,10 @@ async fn download_returns_full_recording_json() {
     assert!(body["specs"].is_array(), "specs must be present");
     assert!(body["intent_log"].is_array(), "intent_log must be present");
     assert!(body["meta"].is_object(), "meta must be present");
-    assert!(body["meta"]["tick_count"].is_number(), "meta.tick_count must be present");
+    assert!(
+        body["meta"]["tick_count"].is_number(),
+        "meta.tick_count must be present"
+    );
 }
 
 #[tokio::test]
@@ -442,17 +471,14 @@ async fn import_stores_recording_and_appears_in_listing() {
         Some(recording_json),
     )
     .await;
-    assert_eq!(import_resp.status(), StatusCode::OK, "import must return 200");
+    assert_eq!(
+        import_resp.status(),
+        StatusCode::OK,
+        "import must return 200"
+    );
 
     // Step 3: verify it appears in GET /recordings.
-    let list_resp = request_json(
-        fresh_app,
-        Method::GET,
-        "/recordings",
-        None,
-        None,
-    )
-    .await;
+    let list_resp = request_json(fresh_app, Method::GET, "/recordings", None, None).await;
     assert_eq!(list_resp.status(), StatusCode::OK);
     let list = response_json(list_resp).await;
     let ids: Vec<&str> = list
@@ -461,7 +487,10 @@ async fn import_stores_recording_and_appears_in_listing() {
         .iter()
         .filter_map(|item| item["matchId"].as_str())
         .collect();
-    assert!(ids.contains(&match_id.as_str()), "imported match_id must be in GET /recordings");
+    assert!(
+        ids.contains(&match_id.as_str()),
+        "imported match_id must be in GET /recordings"
+    );
 
     // Step 4: verify store.get() returns it.
     assert!(
@@ -531,7 +560,11 @@ async fn import_malformed_body_returns_400() {
     )
     .await;
 
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "malformed body must return 400");
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "malformed body must return 400"
+    );
 }
 
 #[tokio::test]
@@ -572,7 +605,10 @@ async fn download_import_replay_round_trip() {
 
     // Sanity-check the artifact shape before round-tripping it.
     assert!(artifact["intent_log"].is_array());
-    assert!(!artifact["intent_log"].as_array().unwrap().is_empty(), "intent_log must not be empty");
+    assert!(
+        !artifact["intent_log"].as_array().unwrap().is_empty(),
+        "intent_log must not be empty"
+    );
 
     // Phase B: import the artifact into a COMPLETELY FRESH app (simulates
     // a different server instance receiving the artifact via HTTP).
@@ -587,17 +623,14 @@ async fn download_import_replay_round_trip() {
         Some(artifact),
     )
     .await;
-    assert_eq!(import_resp.status(), StatusCode::OK, "import into fresh server must succeed");
+    assert_eq!(
+        import_resp.status(),
+        StatusCode::OK,
+        "import into fresh server must succeed"
+    );
 
     // Phase C: verify listing.
-    let list_resp = request_json(
-        fresh_app.clone(),
-        Method::GET,
-        "/recordings",
-        None,
-        None,
-    )
-    .await;
+    let list_resp = request_json(fresh_app.clone(), Method::GET, "/recordings", None, None).await;
     let list = response_json(list_resp).await;
     let listed_ids: Vec<&str> = list
         .as_array()
@@ -605,7 +638,10 @@ async fn download_import_replay_round_trip() {
         .iter()
         .filter_map(|v| v["matchId"].as_str())
         .collect();
-    assert!(listed_ids.contains(&match_id.as_str()), "artifact must be listed after import");
+    assert!(
+        listed_ids.contains(&match_id.as_str()),
+        "artifact must be listed after import"
+    );
 
     // Phase D: replay must succeed (proves the artifact is genuinely portable).
     let replay_resp = request_json(

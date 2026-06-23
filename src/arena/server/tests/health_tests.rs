@@ -25,6 +25,7 @@ use arena_server::{
     store::WasmBotStore,
 };
 use axum::body::Body;
+use futures_util::future::join_all;
 use http::{Method, Request, StatusCode};
 use http_body_util::BodyExt;
 use serde_json::Value;
@@ -194,6 +195,20 @@ async fn register_and_upload_wasm(
     app
 }
 
+async fn register_teams(app: axum::Router) {
+    join_all(["health-team-1", "health-team-2"].map(async |t| {
+        http(
+            app.clone(),
+            Method::POST,
+            "/register",
+            None,
+            Some(serde_json::json!({ "password": EVENT_PASSWORD, "team": t })),
+        )
+        .await;
+    }))
+    .await;
+}
+
 async fn start_headless_match(app: axum::Router) -> http::Response<Body> {
     http(
         app,
@@ -255,6 +270,7 @@ async fn get_admin_bots_returns_health_list_after_headless() {
     );
 
     // Start a headless match so the resolver populates health entries.
+    register_teams(app.clone()).await;
     let match_resp = start_headless_match(app.clone()).await;
     assert_eq!(match_resp.status(), StatusCode::OK);
 
@@ -291,6 +307,7 @@ async fn wasm_fuel_exhaustion_shows_skipped_ticks_and_crashes() {
         short_params(),
     );
 
+    register_teams(app.clone()).await;
     // Register team-a with the fuel-bomb WASM bot.
     let app =
         register_and_upload_wasm(app, "team-a", wat_to_wasm(FUEL_BOMB_WAT)).await;
@@ -343,6 +360,7 @@ async fn wasm_log_bytes_captured_in_health() {
         short_params(),
     );
 
+    register_teams(app.clone()).await;
     // Register team-a with the log bot.
     let app = register_and_upload_wasm(app, "team-a", wat_to_wasm(LOG_BOT_WAT)).await;
 
@@ -506,34 +524,35 @@ async fn kick_returns_ok_and_marks_connected_false() {
     );
 
     // Run a headless match to populate health entries.
+    register_teams(app.clone()).await;
     let resp = start_headless_match(app.clone()).await;
     assert_eq!(resp.status(), StatusCode::OK);
 
     // Verify team-a exists and is connected.
-    let entry_before = health_store.get("team-a").expect("team-a entry present");
-    assert!(entry_before.snapshot().connected, "team-a should be connected before kick");
+    let entry_before = health_store.get("health-team-1").expect("health-team-1 entry present");
+    assert!(entry_before.snapshot().connected, "health-team-1 should be connected before kick");
 
     // Kick team-a.
-    let kick_resp = kick_bot(app.clone(), "team-a", Some(FACILITATOR)).await;
+    let kick_resp = kick_bot(app.clone(), "health-team-1", Some(FACILITATOR)).await;
     assert_eq!(kick_resp.status(), StatusCode::OK, "kick should return 200");
 
     // Check health shows connected=false.
     let bots_resp = get_bots(app, Some(FACILITATOR)).await;
     let bots = json_body(bots_resp).await;
     let arr = bots.as_array().unwrap();
-    let team_a = arr
+    let health_team_1 = arr
         .iter()
-        .find(|b| b["team"] == "team-a")
-        .expect("team-a health entry");
+        .find(|b| b["team"] == "health-team-1")
+        .expect("health-team-1 health entry");
     assert_eq!(
-        team_a["connected"], false,
-        "team-a should be disconnected after kick; got: {team_a}"
+        health_team_1["connected"], false,
+        "health-team-1 should be disconnected after kick; got: {health_team_1}"
     );
 
     // DqStore must contain team-a.
     assert!(
-        dq_store.is_disqualified("team-a"),
-        "team-a should be in DqStore after kick"
+        dq_store.is_disqualified("health-team-1"),
+        "health-team-1 should be in DqStore after kick"
     );
 }
 

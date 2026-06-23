@@ -20,7 +20,9 @@ use std::time::Duration;
 
 use arena_server::recording::RecordingStore;
 use arena_server::routes::{build_app, build_app_with_store};
+use futures_util::future::join_all;
 use futures_util::StreamExt;
+use reqwest::Client;
 use serde_json::Value;
 use tokio_tungstenite::{connect_async, tungstenite::Message as WsMsg};
 
@@ -31,9 +33,8 @@ const FACILITATOR_PASSWORD: &str = "e2e-facilitator";
 
 // ── Type alias ────────────────────────────────────────────────────────────────
 
-type WsStream = tokio_tungstenite::WebSocketStream<
-    tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
->;
+type WsStream =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
 // ── Server helpers ────────────────────────────────────────────────────────────
 
@@ -44,7 +45,11 @@ async fn start_api_server() -> (String, u16, tokio::task::JoinHandle<()>) {
         .await
         .expect("ephemeral bind");
     let port = listener.local_addr().unwrap().port();
-    let router = build_app(EVENT_PASSWORD.to_owned(), FACILITATOR_PASSWORD.to_owned(), None);
+    let router = build_app(
+        EVENT_PASSWORD.to_owned(),
+        FACILITATOR_PASSWORD.to_owned(),
+        None,
+    );
     let handle = tokio::spawn(async move {
         axum::serve(listener, router).await.ok();
     });
@@ -115,11 +120,6 @@ async fn collect_god_view_frames(ws: &mut WsStream, n: usize) -> Vec<Value> {
 ///    array.
 /// 4. `tick` strictly increases across the collected frames.
 ///
-/// ## No registered bots needed
-///
-/// The resolver fills all empty team slots with Default Bots; the match streams
-/// immediately even with zero registered participants.
-///
 /// ## Hang prevention
 ///
 /// Uses `flavor = "multi_thread"` so the spawn_blocking match loop and the
@@ -139,11 +139,15 @@ async fn e2e_spectator_watches_live_match() {
         .expect("WS handshake failed");
 
     // Start a live match with a short cap (60 ticks ≈ 2 s).
-    // Default Bots fill all slots — no /register needed.
     let c = http_client();
+    register_teams(&c, &base_url).await;
+
     let resp = c
         .post(format!("{base_url}/admin/matches"))
-        .header("Authorization", format!("Facilitator {FACILITATOR_PASSWORD}"))
+        .header(
+            "Authorization",
+            format!("Facilitator {FACILITATOR_PASSWORD}"),
+        )
         .json(&serde_json::json!({"mode": "live", "seed": 42, "maxTicks": 60}))
         .send()
         .await
@@ -151,21 +155,24 @@ async fn e2e_spectator_watches_live_match() {
     assert_eq!(resp.status(), 200, "POST /admin/matches must return 200");
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body["mode"], "live", "response mode must be 'live'");
-    let match_id = body["matchId"].as_str().expect("matchId must be present in response").to_owned();
+    let match_id = body["matchId"]
+        .as_str()
+        .expect("matchId must be present in response")
+        .to_owned();
 
     // Collect godView frames, bounded to 5 s.  At 30 TPS, 5 frames ≈ 167 ms.
-    let frames = tokio::time::timeout(
-        Duration::from_secs(5),
-        collect_god_view_frames(&mut ws, 5),
-    )
-    .await
-    .expect("timed out waiting for godView frames from /observe");
+    let frames = tokio::time::timeout(Duration::from_secs(5), collect_god_view_frames(&mut ws, 5))
+        .await
+        .expect("timed out waiting for godView frames from /observe");
 
     // Abort the live match so the spawn_blocking thread exits quickly
     // (prevents the multi-thread runtime from waiting up to 2 s for it).
     let _ = c
         .delete(format!("{base_url}/admin/matches/{match_id}"))
-        .header("Authorization", format!("Facilitator {FACILITATOR_PASSWORD}"))
+        .header(
+            "Authorization",
+            format!("Facilitator {FACILITATOR_PASSWORD}"),
+        )
         .send()
         .await;
     // Allow up to 50 ms for the blocking thread to observe the abort flag.
@@ -193,6 +200,17 @@ async fn e2e_spectator_watches_live_match() {
         "tick must increase: first={first_tick} last={last_tick}"
     );
     _handle.abort();
+}
+
+async fn register_teams(c: &Client, base_url: &str) {
+    join_all(["e2e-team-1", "e2e-team-2"].map(async |t| {
+        c.post(format!("{base_url}/register"))
+            .json(&serde_json::json!({"password":EVENT_PASSWORD,"team":t}))
+            .send()
+            .await
+            .expect("POST /register failed")
+    }))
+    .await;
 }
 
 // ── E2E-2: Recordings survive a server restart ────────────────────────────────
@@ -225,19 +243,29 @@ async fn e2e_recordings_survive_restart() {
     // ── Server #1 ─────────────────────────────────────────────────────────────
     let (base_url1, handle1) = start_server_with_store(tmp_path.clone()).await;
     let c = http_client();
-
+    register_teams(&c, &base_url1).await;
     // Run a headless match.  The handler blocks until the match finishes and
     // the recording has been written to disk, then returns.
     let resp = c
         .post(format!("{base_url1}/admin/matches"))
-        .header("Authorization", format!("Facilitator {FACILITATOR_PASSWORD}"))
+        .header(
+            "Authorization",
+            format!("Facilitator {FACILITATOR_PASSWORD}"),
+        )
         .json(&serde_json::json!({"mode": "headless", "seed": 7}))
         .send()
         .await
         .expect("POST /admin/matches (headless) request failed");
-    assert_eq!(resp.status(), 200, "POST /admin/matches (headless) must return 200");
+    assert_eq!(
+        resp.status(),
+        200,
+        "POST /admin/matches (headless) must return 200"
+    );
     let body: Value = resp.json().await.unwrap();
-    let match_id = body["matchId"].as_str().expect("matchId in response").to_owned();
+    let match_id = body["matchId"]
+        .as_str()
+        .expect("matchId in response")
+        .to_owned();
 
     // Verify recording is immediately listed on server #1.
     let resp = c
