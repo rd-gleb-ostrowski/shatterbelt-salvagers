@@ -891,29 +891,6 @@ pub async fn post_admin_kick_bot(
     StatusCode::OK
 }
 
-/// Build a live-match roster from currently-connected WS bots.
-///
-/// Starts with `ws_registry.connected_teams()`, then fills up to a minimum
-/// of 2 slots with placeholder team names ("team-a", "team-b") so the match
-/// field is always valid.  Connected bots that share a name with a placeholder
-/// are not duplicated.
-// TODO: Remove idiotic placeholder BS.
-//  Gather WS & WASM bots
-//  Resolve to actual fucking team names
-fn live_teams(ws_registry: &WsConnectionRegistry) -> Vec<String> {
-    let mut teams = ws_registry.connected_teams();
-    for placeholder in &["team-a", "team-b"] {
-        if teams.len() >= 2 {
-            break;
-        }
-        let p = (*placeholder).to_owned();
-        if !teams.contains(&p) {
-            teams.push(p);
-        }
-    }
-    teams
-}
-
 fn default_specs(params: &Params, teams: &[String]) -> Vec<ShipSpec> {
     teams
         .iter()
@@ -1274,63 +1251,6 @@ pub async fn post_admin_ladder_runner_stop(
     StatusCode::OK
 }
 
-// ── Recording download handler ────────────────────────────────────────────────
-
-/// `GET /admin/recordings/{id}/download` — download a recording as a full JSON artifact.
-///
-/// Returns the complete [`Recording`] serialised as JSON — a re-importable
-/// artifact containing `match_id`, `seed`, `params`, `specs`, `intent_log`,
-/// and `meta`.  This artifact can be fed directly to
-/// `POST /admin/recordings/import` on any server instance to restore the
-/// recording and make it replayable.
-///
-/// ## Response shape
-///
-/// ```json
-/// {
-///   "match_id": "…",
-///   "seed": 42,
-///   "params": { … },
-///   "specs": [ … ],
-///   "intent_log": [ … ],
-///   "meta": {
-///     "match_id": "…",
-///     "seed": 42,
-///     "tick_count": 30,
-///     "winner": "ship-0",
-///     "scores": [["ship-0", 1.5], ["ship-1", 0.0]]
-///   }
-/// }
-/// ```
-///
-/// # Auth
-///
-/// ```text
-/// Authorization: Facilitator <facilitator_password>
-/// ```
-///
-/// | Status | Meaning |
-/// |--------|---------|
-/// | **200 OK** | Full recording returned as JSON. |
-/// | **401 Unauthorized** | Missing, malformed, or wrong facilitator password. |
-/// | **404 Not Found** | No recording with the given `id`. |
-pub async fn get_admin_recording_download(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-    headers: HeaderMap,
-) -> impl IntoResponse {
-    if let Err(status) = check_facilitator_auth(&headers, &state.facilitator_password) {
-        return status.into_response();
-    }
-    match state.recording_store.get(&id) {
-        None => (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": "recording not found"})),
-        )
-            .into_response(),
-        Some(rec) => Json(rec).into_response(),
-    }
-}
 
 // ── Recording import handler ──────────────────────────────────────────────────
 

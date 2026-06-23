@@ -28,7 +28,7 @@
 use arena_engine::harness::{MatchResult, replay_match};
 use arena_engine::Engine;
 
-use crate::observer::ObserverHub;
+use crate::observer::{GodViewFrameJson, ObserverHub, god_view_to_json};
 use crate::recording::Recording;
 use crate::runner::TickPacer;
 
@@ -87,4 +87,25 @@ pub fn run_replay(
         recording.seed,
         &recording.intent_log,
     )
+}
+
+pub fn collect_replay_god_frames(
+    recording: &Recording,
+    mut pacer: Box<dyn TickPacer>,
+) -> Vec<GodViewFrameJson> {
+    // Reconstruct the engine and step tick-by-tick so we can publish
+    // each intermediate god-view frame to the hub before moving on.
+    let mut engine = Engine::new(
+        recording.seed,
+        recording.params.clone(),
+        recording.specs.clone(),
+    );
+    let mut god_frames = Vec::with_capacity(3600);
+
+    for frame in &recording.intent_log {
+        let events = engine.step(frame.clone());
+        god_frames.push(god_view_to_json(&engine.god_view(), &events));
+        pacer.wait_for_next_tick();
+    }
+    god_frames
 }

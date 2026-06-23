@@ -539,7 +539,7 @@ fn god_view_to_json_empty_events_has_events_array() {
     engine.step(vec![]);
     let gv = engine.god_view();
 
-    let json_str = god_view_to_json(&gv, &[]);
+    let json_str = serde_json::to_string(&god_view_to_json(&gv, &[])).unwrap_or_default();
     let frame: Value = serde_json::from_str(&json_str).expect("valid JSON");
 
     assert_eq!(frame["type"], "godView");
@@ -578,7 +578,7 @@ fn god_view_to_json_includes_died_event_tagged_with_ship() {
         ("s0".to_string(), vec![Event::Died { by: None }]),
     ];
 
-    let json_str = god_view_to_json(&gv, &events);
+    let json_str = serde_json::to_string(&god_view_to_json(&gv, &[])).unwrap_or_default();
     let frame: Value = serde_json::from_str(&json_str).expect("valid JSON");
 
     let evts = frame["events"].as_array().expect("events is array");
@@ -622,6 +622,8 @@ fn god_view_to_json_multi_ship_multi_event() {
     ];
 
     let json_str = god_view_to_json(&gv, &events);
+    let json_str = serde_json::to_string(&god_view_to_json(&gv, &[])).unwrap_or_default();
+
     let frame: Value = serde_json::from_str(&json_str).expect("valid JSON");
 
     let evts = frame["events"].as_array().expect("events array");

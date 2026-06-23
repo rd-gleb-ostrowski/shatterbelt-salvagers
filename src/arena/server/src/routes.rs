@@ -37,9 +37,9 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use tower_http::services::{ServeDir, ServeFile};
 
-use arena_engine::Params;
+use arena_engine::{Params, ShipId};
 
-use crate::admin::{self, ExhibitionSupervisor, LadderRunner, MatchRegistry};
+use crate::{admin::{self, ExhibitionSupervisor, LadderRunner, MatchRegistry}, replay::collect_replay_god_frames};
 use crate::auth::TokenRegistry;
 use crate::health::{BotHealthStore, DqStore};
 use crate::ladder::Ladder;
@@ -346,6 +346,7 @@ struct RecordingListItem {
     seed: u64,
     tick_count: u32,
     winner: Option<String>,
+    scores: Vec<(ShipId, f32)>,
 }
 
 /// `GET /recordings` — list all finished-match recordings.
@@ -366,6 +367,7 @@ async fn get_recordings(State(state): State<AppState>) -> impl IntoResponse {
             seed: m.seed,
             tick_count: m.tick_count,
             winner: m.winner,
+            scores: m.scores
         })
         .collect();
     (StatusCode::OK, Json(items))
@@ -404,6 +406,74 @@ async fn post_replay(
     };
     run_replay(&recording, &state.observer_hub, Box::new(NoopPacer));
     StatusCode::OK.into_response()
+}
+
+async fn get_replay_god_frames(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let recording = match state.recording_store.get(&id) {
+        Some(r) => r,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "recording not found"})),
+            )
+                .into_response();
+        }
+    };
+    let result = collect_replay_god_frames(&recording, Box::new(NoopPacer));
+    (
+        StatusCode::OK,
+        Json(result)
+    ).into_response()
+}
+
+// ── Recording download handler ────────────────────────────────────────────────
+
+/// `GET /recordings/{id}/download` — download a recording as a full JSON artifact.
+///
+/// Returns the complete [`Recording`] serialised as JSON — a re-importable
+/// artifact containing `match_id`, `seed`, `params`, `specs`, `intent_log`,
+/// and `meta`.  This artifact can be fed directly to
+/// `POST /admin/recordings/import` on any server instance to restore the
+/// recording and make it replayable.
+///
+/// ## Response shape
+///
+/// ```json
+/// {
+///   "match_id": "…",
+///   "seed": 42,
+///   "params": { … },
+///   "specs": [ … ],
+///   "intent_log": [ … ],
+///   "meta": {
+///     "match_id": "…",
+///     "seed": 42,
+///     "tick_count": 30,
+///     "winner": "ship-0",
+///     "scores": [["ship-0", 1.5], ["ship-1", 0.0]]
+///   }
+/// }
+/// ```
+///
+/// | Status | Meaning |
+/// |--------|---------|
+/// | **200 OK** | Full recording returned as JSON. |
+/// | **404 Not Found** | No recording with the given `id`. |
+pub async fn get_recording_download(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    match state.recording_store.get(&id) {
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "recording not found"})),
+        )
+            .into_response(),
+        Some(rec) => Json(rec).into_response(),
+    }
 }
 
 /// Extract a Bearer token from the `Authorization` header.
@@ -575,6 +645,8 @@ pub fn build_router_config(config: RouterConfig) -> Router {
         .route("/observe", any(ws_viewer_handler))
         .route("/recordings", get(get_recordings))
         .route("/recordings/{id}/replay", post(post_replay))
+        .route("/recordings/{id}/download/frames", get(get_replay_god_frames))
+        .route("/recordings/{id}/download", get(get_recording_download))
         .route("/admin/matches", post(admin::post_admin_start_match))
         .route(
             "/admin/matches/{id}/pause",
@@ -621,7 +693,6 @@ pub fn build_router_config(config: RouterConfig) -> Router {
         .route("/admin/ladder/runner/start", post(admin::post_admin_ladder_runner_start))
         .route("/admin/ladder/runner/stop", post(admin::post_admin_ladder_runner_stop))
         // ── Issue 12/admin: recording download + import ───────────────────
-        .route("/admin/recordings/{id}/download", get(admin::get_admin_recording_download))
         .route("/admin/recordings/import", post(admin::post_admin_recording_import))
         .with_state(state)
 }

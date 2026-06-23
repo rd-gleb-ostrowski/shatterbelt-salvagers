@@ -111,7 +111,7 @@ impl ObserverHub {
 
     /// Serialise `gv` to a `"godView"` JSON frame and publish it.
     pub fn publish_god_view(&self, gv: &GodView, events: &[(ShipId, Vec<Event>)]) {
-        self.publish(god_view_to_json(gv, events));
+        self.publish(serde_json::to_string(&god_view_to_json(gv, events)).unwrap_or_default());
     }
 
     /// Subscribe to the god-mode frame stream.
@@ -233,7 +233,7 @@ fn god_ship_to_json(s: &arena_engine::GodShipView) -> GodShipViewJson {
 /// Events for which [`event_to_json`] returns `None` are silently skipped.
 ///
 /// Public so tests can call it directly without going through the hub.
-pub fn god_view_to_json(gv: &GodView, events: &[(ShipId, Vec<Event>)]) -> String {
+pub fn god_view_to_json(gv: &GodView, events: &[(ShipId, Vec<Event>)]) -> GodViewFrameJson {
     let god_events: Vec<GodEventJson> = events
         .iter()
         .flat_map(|(ship_id, ship_events)| {
@@ -246,7 +246,7 @@ pub fn god_view_to_json(gv: &GodView, events: &[(ShipId, Vec<Event>)]) -> String
         })
         .collect();
 
-    let frame = GodViewFrameJson {
+    GodViewFrameJson {
         type_: "godView",
         tick: gv.tick,
         max_ticks: gv.max_ticks,
@@ -261,8 +261,7 @@ pub fn god_view_to_json(gv: &GodView, events: &[(ShipId, Vec<Event>)]) -> String
         mines: gv.mines.iter().map(mine_to_json).collect(),
         scores: gv.scores.clone(),
         events: god_events,
-    };
-    serde_json::to_string(&frame).unwrap_or_default()
+    }
 }
 
 // ── axum WS handler ───────────────────────────────────────────────────────────
