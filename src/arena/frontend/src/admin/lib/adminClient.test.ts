@@ -1153,7 +1153,7 @@ describe("createAdminClient", () => {
     it("sends POST to /admin/exhibition/start", async () => {
       const { fetchFn, captured } = makeFakeFetch(200, null);
       const client = createAdminClient(BASE, PASSWORD, fetchFn);
-      await client.startExhibition();
+      await client.startExhibition(30);
       expect(captured[0].init?.method).toBe("POST");
       expect(captured[0].url).toBe(`${BASE}/admin/exhibition/start`);
     });
@@ -1161,7 +1161,7 @@ describe("createAdminClient", () => {
     it("attaches auth header", async () => {
       const { fetchFn, captured } = makeFakeFetch(200, null);
       const client = createAdminClient(BASE, PASSWORD, fetchFn);
-      await client.startExhibition();
+      await client.startExhibition(30);
       const headers = captured[0].init?.headers as Record<string, string>;
       expect(headers["Authorization"]).toBe(`Facilitator ${PASSWORD}`);
     });
@@ -1169,14 +1169,14 @@ describe("createAdminClient", () => {
     it("sends no body", async () => {
       const { fetchFn, captured } = makeFakeFetch(200, null);
       const client = createAdminClient(BASE, PASSWORD, fetchFn);
-      await client.startExhibition();
+      await client.startExhibition(30);
       expect(captured[0].init?.body).toBeUndefined();
     });
 
     it("returns { ok: true, unauthorized: false } on 200", async () => {
       const { fetchFn } = makeFakeFetch(200, null);
       const client = createAdminClient(BASE, PASSWORD, fetchFn);
-      const result = await client.startExhibition();
+      const result = await client.startExhibition(30);
       expect(result.ok).toBe(true);
       expect(result.unauthorized).toBe(false);
     });
@@ -1184,7 +1184,7 @@ describe("createAdminClient", () => {
     it("returns { ok: false, unauthorized: true } on 401", async () => {
       const { fetchFn } = makeFakeFetch(401, null);
       const client = createAdminClient(BASE, PASSWORD, fetchFn);
-      const result = await client.startExhibition();
+      const result = await client.startExhibition(30);
       expect(result.ok).toBe(false);
       expect(result.unauthorized).toBe(true);
     });
@@ -1192,7 +1192,7 @@ describe("createAdminClient", () => {
     it("does not throw on any HTTP status", async () => {
       const { fetchFn } = makeFakeFetch(500, null);
       const client = createAdminClient(BASE, PASSWORD, fetchFn);
-      await expect(client.startExhibition()).resolves.not.toThrow();
+      await expect(client.startExhibition(30)).resolves.not.toThrow();
     });
   });
 

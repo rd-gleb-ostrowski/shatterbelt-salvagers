@@ -510,7 +510,7 @@ function renderMatchControlPanel(): void {
         <input type="number" id="match-max-ticks" name="maxTicks" placeholder="leave blank for server default" min="1" />
 
         <label for="match-tps">TPS <span class="hint">(live only, optional, default 30)</span></label>
-        <input type="number" id="match-tps" name="tps" placeholder="30" min="1" max="200" />
+        <input type="number" id="match-tps" name="tps" placeholder="30" min="1" max="400" />
 
         <label for="match-teams">Teams <span class="hint">(optional, comma-separated)</span></label>
         <input type="text" id="match-teams" name="teams" placeholder="alpha, beta, gamma …" />
@@ -538,7 +538,7 @@ function renderMatchControlPanel(): void {
       </div>
       <div class="tps-row">
         <label for="match-tps-input">Change TPS</label>
-        <input type="number" id="match-tps-input" value="30" min="1" max="200" style="width:5em" />
+        <input type="number" id="match-tps-input" value="30" min="1" max="400" style="width:5em" />
         <button id="set-tps-btn" class="btn-secondary">Set TPS</button>
       </div>
       <p id="live-match-status" class="status-line" hidden></p>
@@ -556,6 +556,8 @@ function renderMatchControlPanel(): void {
         <button id="start-exhibition-btn" class="btn-primary">▶ Start Exhibition</button>
         <button id="stop-exhibition-btn" class="btn-secondary">⏹ Stop Exhibition</button>
         <button id="refresh-exhibition-btn" class="btn-secondary">↺ Refresh Status</button>
+        <label for="exhibition-tps">TPS <span class="hint">(optional, default 30)</span></label>
+        <input type="number" id="exhibition-tps" name="tps" placeholder="30" min="1" max="400" />
       </div>
       <p id="exhibition-status" class="status-line">Status: unknown</p>
     </div>
@@ -739,7 +741,8 @@ function wireExhibitionControls(): void {
   const stopBtn = document.getElementById("stop-exhibition-btn") as HTMLButtonElement | null;
   const refreshBtn = document.getElementById("refresh-exhibition-btn") as HTMLButtonElement | null;
   const statusEl = document.getElementById("exhibition-status") as HTMLElement | null;
-  if (!startBtn || !stopBtn || !refreshBtn || !statusEl) return;
+  const tpsEl = document.getElementById("exhibition-tps") as HTMLInputElement;
+  if (!startBtn || !stopBtn || !refreshBtn || !statusEl || !tpsEl) return;
 
   async function refreshStatus(): Promise<void> {
     const session = getSession();
@@ -761,9 +764,10 @@ function wireExhibitionControls(): void {
   startBtn.addEventListener("click", async () => {
     const session = getSession();
     if (!session) return;
+    const tps = (tpsEl.value.trim()) ? Number(tpsEl.value) : 30;
     startBtn.disabled = true;
     try {
-      const r = await session.client.startExhibition();
+      const r = await session.client.startExhibition(tps);
       statusEl.textContent = r.ok ? "Status: ▶ Exhibition started." : r.unauthorized ? "Status: ⚠ Denied." : "Status: ⚠ Error starting exhibition.";
       if (r.ok) await refreshStatus();
     } catch { statusEl.textContent = "Status: ⚠ Network error."; }

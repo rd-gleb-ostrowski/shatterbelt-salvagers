@@ -454,7 +454,7 @@ export interface AdminClient {
    * Returns `{ ok: false, unauthorized: false }` on other errors.
    * Never throws for HTTP-level failures.
    */
-  startExhibition(): Promise<ExhibitionActionResult>;
+  startExhibition(tps: number): Promise<ExhibitionActionResult>;
 
   /**
    * Stop the exhibition loop via `POST /admin/exhibition/stop`.
@@ -755,8 +755,8 @@ export function createAdminClient(
       return { ok: false, running: false, matchCount: 0, unauthorized: false };
     },
 
-    async startExhibition(fast: boolean = false): Promise<ExhibitionActionResult> {
-      const res = await post(`/admin/exhibition/start?fast=${fast}`);
+    async startExhibition(tps: number = 30): Promise<ExhibitionActionResult> {
+      const res = await post(`/admin/exhibition/start?tps=${tps}`);
       return mapAction(res.status);
     },
 

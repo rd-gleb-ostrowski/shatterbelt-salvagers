@@ -24,7 +24,6 @@ use crate::{
     headless::HeadlessRunner,
     health::{BotHealthStore, DqStore},
     observer::ObserverHub,
-    pacer::NoopPacer,
     recording::{Recording, RecordingMeta, RecordingStore},
     resolver::{ConnectionResolver, Slot, WsConnectionRegistry},
     routes::AppState,
@@ -672,7 +671,7 @@ pub async fn get_admin_exhibition(
 
 pub struct ExhibitionStartQuery {
     #[serde(default)]
-    fast: Option<bool>,
+    tps: Option<u32>,
 }
 
 pub async fn post_admin_exhibition_start(
@@ -685,7 +684,7 @@ pub async fn post_admin_exhibition_start(
     }
     // `teams` is empty — the exhibition loop recomputes the roster from
     // connected bots at the start of each match iteration.
-    let fast = query.fast.is_some_and(|x| x);
+    let tps = query.tps.unwrap_or(30);
     state.exhibition.start(ExhibitionConfig {
         seed: state.match_seed,
         params: state.match_params.clone(),
@@ -696,14 +695,10 @@ pub async fn post_admin_exhibition_start(
         fuel_per_tick: 10_000_000,
         observer_hub: state.observer_hub.clone(),
         recording_store: Arc::clone(&state.recording_store),
-        tps: 30,
+        tps,
         max_matches: 0,
         pacer_factory: Arc::new(move |h| {
-            if fast {
-                Box::new(NoopPacer)
-            } else {
                 Box::new(ControlledPacer::new(h))
-            }
         }),
     });
     StatusCode::OK
